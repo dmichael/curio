@@ -9,6 +9,7 @@ from resolver.seed import (
     SeedJob,
     _eth_contract_items,
     _tezos_contract_items,
+    _tezos_created_items,
     _tezos_published_items,
     classify_wallet,
     list_wallet_tokens,
@@ -229,6 +230,88 @@ async def test_published_scope_is_tezos_only():
     async with client:
         with pytest.raises(ValueError, match="tezos-only"):
             await start_seed(ETH_ADDR, SETTINGS, client, scope="published")
+
+
+def _created_net() -> tuple[httpx.AsyncClient, list[str]]:
+    """A wallet that authored two tokens on one contract: token 1 has 1 of 3
+    editions burned (keep), token 2 has its only edition burned (fully burned).
+    creators carries both; authors carries none."""
+    creators = [
+        {"contract": {"address": "KT1c"}, "tokenId": "1",
+         "metadata": {"artifactUri": "ipfs://one"}, "totalSupply": "3"},
+        {"contract": {"address": "KT1c"}, "tokenId": "2",
+         "metadata": {"artifactUri": "ipfs://two"}, "totalSupply": "1"},
+    ]
+    log: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        log.append(url)
+        if "/tokens/balances" in url:
+            # burn-address holdings: token 1 partial (1/3), token 2 full (1/1)
+            return httpx.Response(200, json=[
+                {"tokenId": "1", "balance": "1"},
+                {"tokenId": "2", "balance": "1"},
+            ])
+        first_page = "offset=0" in url
+        if "creators" in url:
+            return httpx.Response(200, json=creators if first_page else [])
+        if "authors" in url:
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler)), log
+
+
+async def test_created_unions_creators_and_authors_and_drops_fully_burned():
+    client, log = _created_net()
+    async with client:
+        items = [item async for item in _tezos_created_items(TZ_ADDR, SETTINGS, client)]
+    # Both creators and authors indexes are queried…
+    assert any("creators" in u for u in log) and any("authors" in u for u in log)
+    # …and the fully-burned token 2 is dropped, the partly-burned token 1 kept.
+    assert [item["tokenId"] for item in items] == ["1"]
+    assert items[0]["metadata"]["artifactUri"] == "ipfs://one"
+
+
+async def test_created_include_burned_keeps_everything_and_skips_burn_query():
+    client, log = _created_net()
+    async with client:
+        items = [
+            item async for item in _tezos_created_items(
+                TZ_ADDR, SETTINGS, client, include_burned=True
+            )
+        ]
+    assert sorted(item["tokenId"] for item in items) == ["1", "2"]
+    # include_burned must not spend a burn-detection round-trip.
+    assert not any("/tokens/balances" in u for u in log)
+
+
+async def test_created_scope_is_tezos_only():
+    client, _ = fake_net({})
+    async with client:
+        with pytest.raises(ValueError, match="tezos-only"):
+            await start_seed(ETH_ADDR, SETTINGS, client, scope="created")
+
+
+async def test_created_and_published_jobs_coalesce_separately():
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await release.wait()
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        published = await start_seed(TZ_ADDR, SETTINGS, client, scope="published")
+        created = await start_seed(TZ_ADDR, SETTINGS, client, scope="created")
+        assert published is not None and created is not None
+        assert created is not published
+        assert created.scope == "created"
+        again = await start_seed(TZ_ADDR, SETTINGS, client, scope="created")
+        assert again is created
+        release.set()
+        await wait_done(published)
+        await wait_done(created)
 
 
 async def test_held_and_published_jobs_coalesce_separately():

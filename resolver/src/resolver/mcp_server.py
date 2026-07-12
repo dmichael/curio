@@ -90,6 +90,7 @@ async def wallet_tokens(
     pin: bool = False,
     scope: str = "held",
     status: bool = False,
+    include_burned: bool = False,
 ) -> dict[str, Any]:
     """List a wallet's NFTs live from the public indexers (browse/pick step).
 
@@ -100,29 +101,41 @@ async def wallet_tokens(
     job for the wallet (same as seed_wallet, honoring limit and scope) — the
     response gains pin_job; poll it with seed_status. scope="published"
     (Tezos only) lists the works the wallet FIRST-MINTED — its published
-    catalog — instead of its holdings. scope="contract" lists every token
-    of a token-contract address (ref must be the literal 0x…/KT1… contract
-    address, both chains) — the way to sweep a publication contract on ETH,
-    where no keyless creator index exists. status=true is the AUDIT view:
-    every token's primary_ref is resolved and classified in place — status
-    is 'ok', 'substituted' (already repaired via the override registry),
-    'unreachable' (dead content), 'unresolvable', or 'no-ref' — plus a
-    status_counts summary. Use it to find rot without a per-token loop;
-    expect the call to take roughly the probe timeout when dead refs exist.
+    catalog — instead of its holdings. scope="created" (Tezos only) lists
+    what the wallet AUTHORED — tokens crediting it in creators/authors
+    metadata — the robust authorship index (first-minter over-captures
+    collected fxhash editions and under-captures collector-minted editions);
+    fully-burned creations are dropped unless include_burned=true, since a
+    work burned to nothing was destroyed on purpose. ETH has no keyless
+    creator index, so created is Tezos-only. scope="contract" lists every
+    token of a token-contract address (ref must be the literal 0x…/KT1…
+    contract address, both chains) — the way to sweep a publication contract
+    on ETH. status=true is the AUDIT view: every token's primary_ref is
+    resolved and classified in place — status is 'ok', 'substituted' (already
+    repaired via the override registry), 'unreachable' (dead content),
+    'unresolvable', or 'no-ref' — plus a status_counts summary. Use it to
+    find rot without a per-token loop; expect the call to take roughly the
+    probe timeout when dead refs exist.
     """
     result = await list_wallet_tokens(
-        ref, get_settings(), _require_client(), limit=limit, scope=scope, status=status
+        ref, get_settings(), _require_client(),
+        limit=limit, scope=scope, status=status, include_burned=include_burned,
     )
     if result is None:
         raise ValueError("not a wallet-shaped reference (want 0x…, name.eth, tz1…, or name.tez)")
     if pin:
-        job = await start_seed(ref, get_settings(), _require_client(), limit=limit, scope=scope)
+        job = await start_seed(
+            ref, get_settings(), _require_client(),
+            limit=limit, scope=scope, include_burned=include_burned,
+        )
         result["pin_job"] = job.as_dict() if job else None
     return result
 
 
 @mcp.tool()
-async def seed_wallet(ref: str, limit: int | None = None, scope: str = "held") -> dict[str, Any]:
+async def seed_wallet(
+    ref: str, limit: int | None = None, scope: str = "held", include_burned: bool = False
+) -> dict[str, Any]:
     """Seed the box's caches from a wallet (background job).
 
     Pins every IPFS ref the wallet's NFTs carry onto the box's Kubo, warms
@@ -133,12 +146,18 @@ async def seed_wallet(ref: str, limit: int | None = None, scope: str = "held") -
     the failures. Use limit for a partial/test run. scope="published" (Tezos
     only) seeds the works the wallet FIRST-MINTED rather than its holdings —
     published works you no longer hold are the most rot-prone corner of a
-    collection, since holdings-seeding never touches them. scope="contract"
+    collection, since holdings-seeding never touches them. scope="created"
+    (Tezos only) seeds what the wallet AUTHORED — creators/authors metadata,
+    the robust authorship index — dropping fully-burned creations unless
+    include_burned=true (they were destroyed on purpose). scope="contract"
     seeds every token of a token-contract address (ref must be the literal
     0x…/KT1… contract address, both chains) — the way to sweep a publication
     contract on ETH, where no keyless creator index exists.
     """
-    job = await start_seed(ref, get_settings(), _require_client(), limit=limit, scope=scope)
+    job = await start_seed(
+        ref, get_settings(), _require_client(),
+        limit=limit, scope=scope, include_burned=include_burned,
+    )
     if job is None:
         raise ValueError("not a wallet-shaped reference (want 0x…, name.eth, tz1…, or name.tez)")
     return job.as_dict()

@@ -29,6 +29,17 @@ locally servable, now."
 Published works the wallet no longer holds are the rot-prone corner a
 holdings seed never touches.
 
+`scope=created` is the robust authorship index: everything crediting the
+address in TZIP-21 `creators`/`authors` metadata — what it actually *made*.
+First-minter is a leaky proxy for this: it over-captures (fxhash editions the
+address minted-but-didn't-author list it as first minter) and under-captures
+(an edition minted by a collector is first-minted by them, not the author).
+Fully-burned creations — every edition sent to a burn address — are dropped
+by default: they were destroyed on purpose, the lowest preservation priority,
+not the highest. `include_burned=1` keeps them. Tezos only; Ethereum has no
+keyless creator index at all (mint events say who minted, not who authored),
+which is the genuinely unsolved corner.
+
 `scope=contract` enumerates every token of one token contract (both chains;
 the ref must be the literal contract address). This is how an ETH publication
 sweep is done: name the contract the works were minted on, since no keyless
@@ -59,6 +70,16 @@ from .resolve import arweave_txid, external_url_ok, ipfs_parts, pick_media_field
 _ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _TEZOS_ADDRESS_RE = re.compile(r"^(tz[123]|KT1)[1-9A-HJ-NP-Za-km-z]{33}$")
 
+# Editions transferred here are burned — destroyed on purpose. A created work
+# whose entire supply sits at a burn address is retracted, not preserved. On
+# Tezos a burn is an ordinary transfer, so totalSupply is unchanged and the
+# burned editions still show up in balances; "fully burned" = burn-held >=
+# supply. Batching keeps a work minted on a shared contract (hic et nunc,
+# versum) from dragging that contract's entire burn ledger back.
+_TEZOS_BURN_ADDRESSES = ("tz1burnburnburnburnburnburnburjAYjjX",)
+_TEZOS_PAGE = 1000
+_TEZOS_ID_BATCH = 50
+
 # Every field that may carry media; seeding wants all of them, not a winner.
 _MEDIA_FIELDS = (
     "image", "image_url", "imageUrl", "image_original_url",
@@ -76,7 +97,8 @@ class SeedJob:
     id: str
     ref: str
     chain: str  # "ethereum" | "tezos"
-    scope: str = "held"  # "held" | "published" (first-minted, tezos) | "contract" (whole contract)
+    scope: str = "held"  # "held" | "published" (first-minted) | "created" (authored) | "contract"
+    include_burned: bool = False  # created scope: keep fully-burned creations too
     status: str = "running"  # "running" | "done" | "failed"
     address: str | None = None
     tokens: int = 0
@@ -124,18 +146,29 @@ class TooManySeedJobs(Exception):
 def _check_scope(ref: str, chain: str, scope: str) -> None:
     """Reject scopes we can't enumerate. Every message contains "scope" —
     the routes key on that to answer 400 (caller mistake) instead of 502."""
-    if scope not in ("held", "published", "contract"):
-        raise ValueError(f"unknown scope: {scope!r} (want 'held', 'published', or 'contract')")
-    if scope == "published" and chain == "ethereum":
-        raise ValueError("published scope is tezos-only (no keyless ETH creator index)")
+    if scope not in ("held", "published", "created", "contract"):
+        raise ValueError(
+            f"unknown scope: {scope!r} (want 'held', 'published', 'created', or 'contract')"
+        )
+    if scope in ("published", "created") and chain == "ethereum":
+        raise ValueError(f"{scope} scope is tezos-only (no keyless ETH creator index)")
     if scope == "contract" and not (_ETH_ADDRESS_RE.match(ref) or _TEZOS_ADDRESS_RE.match(ref)):
         # A name resolves to an account, never to a contract.
         raise ValueError(f"contract scope needs a literal contract address, not a name: {ref}")
 
 
-def _enumerator(chain: str, scope: str):
+def _enumerator(chain: str, scope: str, include_burned: bool = False):
     if scope == "published":
         return _tezos_published_items  # _check_scope already ruled out eth
+    if scope == "created":  # _check_scope already ruled out eth
+
+        async def created(
+            address: str, settings: Settings, client: httpx.AsyncClient
+        ) -> AsyncIterator[dict[str, Any]]:
+            async for item in _tezos_created_items(address, settings, client, include_burned):
+                yield item
+
+        return created
     if scope == "contract":
         return _eth_contract_items if chain == "ethereum" else _tezos_contract_items
     return _eth_items if chain == "ethereum" else _tezos_items
@@ -147,6 +180,7 @@ async def start_seed(
     client: httpx.AsyncClient,
     limit: int | None = None,
     scope: str = "held",
+    include_burned: bool = False,
 ) -> SeedJob | None:
     """Kick off a background seed of `ref`. None when it isn't wallet-shaped.
 
@@ -158,7 +192,9 @@ async def start_seed(
     (TooManySeedJobs otherwise). Finished-job history is bounded.
 
     scope="published" seeds the works the wallet first-minted (Tezos only)
-    instead of its holdings; scope="contract" seeds every token a token
+    instead of its holdings; scope="created" seeds what the wallet authored
+    (creators/authors metadata, Tezos only), dropping fully-burned works
+    unless include_burned; scope="contract" seeds every token a token
     contract ever issued (ref must be the literal contract address — the
     contract/account distinction is the caller's assertion). Jobs with
     different scopes for the same address are different jobs and may run
@@ -172,7 +208,12 @@ async def start_seed(
 
     running = [job for job in _JOBS.values() if job.status == "running"]
     for job in running:
-        if job.ref == ref and job.chain == chain and job.scope == scope:
+        if (
+            job.ref == ref
+            and job.chain == chain
+            and job.scope == scope
+            and job.include_burned == include_burned
+        ):
             return job  # same spelling — duplicate without resolving
 
     # Contract refs are already the address to enumerate; a name lookup
@@ -182,6 +223,7 @@ async def start_seed(
         if (
             job.chain == chain
             and job.scope == scope
+            and job.include_burned == include_burned
             and job.address is not None
             and _same_address(chain, job.address, address)
         ):
@@ -195,6 +237,7 @@ async def start_seed(
         ref=ref,
         chain=chain,
         scope=scope,
+        include_burned=include_burned,
         address=address,
         started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
@@ -253,7 +296,7 @@ async def _run_seed_inner(
     limit: int | None = None,
 ) -> None:
     # job.address was resolved by start_seed, before admission control.
-    items = _enumerator(job.chain, job.scope)
+    items = _enumerator(job.chain, job.scope, job.include_burned)
     cids: dict[str, list[str]] = {}  # cid -> HTTP source URLs (ordered de-dupe)
     txids: dict[str, None] = {}
     captures: dict[str, None] = {}  # unhashed HTTP media (ordered de-dupe)
@@ -359,13 +402,21 @@ async def _tezos_items(
 
 
 async def _tezos_tokens(
-    filters: dict[str, str], settings: Settings, client: httpx.AsyncClient
+    filters: dict[str, str],
+    settings: Settings,
+    client: httpx.AsyncClient,
+    extra_select: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """TzKT /tokens under a filter, all pages, normalized to the shape
     _tezos_items yields (`contract` selects to an object here, not a bare
-    address)."""
+    address). `extra_select` requests one more column (e.g. totalSupply) and
+    carries it onto the yielded item when present — kept off the default
+    select so published/contract queries are byte-for-byte unchanged."""
     page_size = 200
     offset = 0
+    select = "contract,tokenId,metadata"
+    if extra_select:
+        select = f"{select},{extra_select}"
     while True:
         response = await client.get(
             f"{settings.tzkt_base}/tokens",
@@ -373,18 +424,21 @@ async def _tezos_tokens(
                 **filters,
                 "offset": str(offset),
                 "limit": str(page_size),
-                "select": "contract,tokenId,metadata",
+                "select": select,
             },
         )
         response.raise_for_status()
         page = response.json()
         for item in page:
             contract = item.get("contract") or {}
-            yield {
+            record = {
                 "contract": contract.get("address"),
                 "tokenId": item.get("tokenId"),
                 "metadata": item.get("metadata") or {},
             }
+            if extra_select and extra_select in item:
+                record[extra_select] = item[extra_select]
+            yield record
         if len(page) < page_size:
             return
         offset += page_size
@@ -396,6 +450,93 @@ def _tezos_published_items(
     """TzKT tokens the address first-minted — its published catalog, whoever
     holds the works now."""
     return _tezos_tokens({"firstMinter": address}, settings, client)
+
+
+# TZIP-21 authorship lives in `creators` (most platforms) or `authors`
+# (fxhash); a work counts as created if the address is in either. Queried as
+# JSON array-containment filters, which TzKT indexes directly.
+_TEZOS_CREATOR_FIELDS = ("metadata.creators.[*]", "metadata.authors.[*]")
+
+
+async def _tezos_created_items(
+    address: str,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    include_burned: bool = False,
+) -> AsyncIterator[dict[str, Any]]:
+    """Tokens crediting `address` in creators/authors metadata — what it
+    actually authored, not merely first-minted. Fully-burned creations are
+    dropped unless include_burned: destroyed on purpose, they are the lowest
+    preservation priority. totalSupply rides along for the burn check."""
+    seen: dict[tuple[str | None, Any], dict[str, Any]] = {}
+    for field_name in _TEZOS_CREATOR_FIELDS:
+        async for item in _tezos_tokens(
+            {field_name: address}, settings, client, extra_select="totalSupply"
+        ):
+            seen.setdefault((item["contract"], item["tokenId"]), item)
+    tokens = list(seen.values())
+    if not include_burned:
+        burned = await _tezos_fully_burned(tokens, settings, client)
+        tokens = [t for t in tokens if (t["contract"], t["tokenId"]) not in burned]
+    for item in tokens:
+        yield item
+
+
+async def _tezos_fully_burned(
+    tokens: list[dict[str, Any]], settings: Settings, client: httpx.AsyncClient
+) -> set[tuple[str | None, Any]]:
+    """The (contract, tokenId) keys whose entire supply sits at a burn address.
+
+    Burn holdings are queried per contract, filtered to just these token ids,
+    so a work minted on a shared contract doesn't pull that contract's whole
+    burn ledger. A token whose supply is zero (burned down to nothing, or
+    never live) counts as burned; unknown supply is left in — we don't guess.
+    """
+    supply: dict[tuple[str | None, Any], int | None] = {}
+    ids_by_contract: dict[str, list[str]] = {}
+    for token in tokens:
+        key = (token["contract"], token["tokenId"])
+        raw = token.get("totalSupply")
+        supply[key] = int(raw) if raw is not None else None
+        if token["contract"] is not None:
+            ids_by_contract.setdefault(token["contract"], []).append(str(token["tokenId"]))
+
+    burn_held: dict[tuple[str | None, Any], int] = {}
+    account = ",".join(_TEZOS_BURN_ADDRESSES)
+    for contract, token_ids in ids_by_contract.items():
+        for start in range(0, len(token_ids), _TEZOS_ID_BATCH):
+            batch = token_ids[start : start + _TEZOS_ID_BATCH]
+            offset = 0
+            while True:
+                response = await client.get(
+                    f"{settings.tzkt_base}/tokens/balances",
+                    params={
+                        "account.in": account,
+                        "token.contract": contract,
+                        "token.tokenId.in": ",".join(batch),
+                        "balance.gt": "0",
+                        "offset": str(offset),
+                        "limit": str(_TEZOS_PAGE),
+                        "select": "token.tokenId as tokenId,balance",
+                    },
+                )
+                response.raise_for_status()
+                page = response.json()
+                for row in page:
+                    key = (contract, str(row["tokenId"]))
+                    burn_held[key] = burn_held.get(key, 0) + int(row["balance"])
+                if len(page) < _TEZOS_PAGE:
+                    break
+                offset += _TEZOS_PAGE
+
+    burned: set[tuple[str | None, Any]] = set()
+    for key, total in supply.items():
+        if total is None:
+            continue
+        held = burn_held.get((key[0], str(key[1])), 0)
+        if total <= 0 or held >= total:
+            burned.add(key)
+    return burned
 
 
 def _tezos_contract_items(
@@ -440,6 +581,7 @@ async def list_wallet_tokens(
     limit: int | None = None,
     scope: str = "held",
     status: bool = False,
+    include_burned: bool = False,
 ) -> dict[str, Any] | None:
     """Live, normalized inventory of a wallet's NFTs — the browse/pick step.
 
@@ -447,7 +589,9 @@ async def list_wallet_tokens(
     database); each token carries its media refs so a consumer can hand the
     chosen one straight to /resolve. None when `ref` isn't wallet-shaped.
     scope="published" lists the works the wallet first-minted (Tezos only)
-    instead of its holdings; scope="contract" lists every token a token
+    instead of its holdings; scope="created" lists what the wallet authored
+    (creators/authors metadata, Tezos only), dropping fully-burned works
+    unless include_burned; scope="contract" lists every token a token
     contract ever issued (ref must be the literal contract address).
 
     status=True additionally resolves each token's primary_ref and classifies
@@ -461,7 +605,7 @@ async def list_wallet_tokens(
         return None
     _check_scope(ref, chain, scope)
     address = ref if scope == "contract" else await _resolve_wallet(ref, chain, settings, client)
-    items = _enumerator(chain, scope)
+    items = _enumerator(chain, scope, include_burned)
     tokens: list[dict[str, Any]] = []
     async for item in items(address, settings, client):
         tokens.append(_token_record(chain, item))

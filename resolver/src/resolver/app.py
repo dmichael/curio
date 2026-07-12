@@ -124,12 +124,14 @@ async def wallet(
     ref: str = Query(..., description="Wallet address or name: 0x…, name.eth, tz1…, name.tez"),
     limit: int | None = Query(None, ge=1, description="Stop after this many tokens"),
     pin: bool = Query(False, description="Also pin everything listed (starts a seed job)"),
-    scope: str = Query("held", description="'held' = holdings; 'published' = works the wallet first-minted (Tezos only); 'contract' = every token of a token-contract address (both chains)"),
+    scope: str = Query("held", description="'held' = holdings; 'published' = works the wallet first-minted (Tezos only); 'created' = works the wallet authored, i.e. creators/authors metadata, fully-burned dropped (Tezos only); 'contract' = every token of a token-contract address (both chains)"),
     status: bool = Query(False, description="Also resolve each primary_ref and classify it (ok/substituted/unreachable/unresolvable/no-ref) — the audit view"),
+    include_burned: bool = Query(False, description="created scope only: keep fully-burned creations (default drops them — destroyed on purpose)"),
 ):
     try:
         result = await list_wallet_tokens(
-            ref, get_settings(), app.state.client, limit=limit, scope=scope, status=status
+            ref, get_settings(), app.state.client,
+            limit=limit, scope=scope, status=status, include_burned=include_burned,
         )
     except (httpx.HTTPError, ValueError) as exc:
         return _wallet_error(exc)
@@ -143,7 +145,10 @@ async def wallet(
         # control, recovery, and capture instead of a bare pin loop. The
         # browse result still returns even when the job is refused.
         try:
-            job = await start_seed(ref, get_settings(), app.state.client, limit=limit, scope=scope)
+            job = await start_seed(
+                ref, get_settings(), app.state.client,
+                limit=limit, scope=scope, include_burned=include_burned,
+            )
             result["pin_job"] = job.as_dict() if job else None
         except (TooManySeedJobs, httpx.HTTPError, ValueError) as exc:
             result["pin_job"] = None
@@ -155,10 +160,14 @@ async def wallet(
 async def seed(
     ref: str = Query(..., description="Wallet address or name: 0x…, name.eth, tz1…, name.tez"),
     limit: int | None = Query(None, ge=1, description="Stop after this many tokens (for testing/incremental runs)"),
-    scope: str = Query("held", description="'held' = holdings; 'published' = works the wallet first-minted (Tezos only); 'contract' = every token of a token-contract address (both chains)"),
+    scope: str = Query("held", description="'held' = holdings; 'published' = works the wallet first-minted (Tezos only); 'created' = works the wallet authored, i.e. creators/authors metadata, fully-burned dropped (Tezos only); 'contract' = every token of a token-contract address (both chains)"),
+    include_burned: bool = Query(False, description="created scope only: keep fully-burned creations (default drops them — destroyed on purpose)"),
 ):
     try:
-        job = await start_seed(ref, get_settings(), app.state.client, limit=limit, scope=scope)
+        job = await start_seed(
+            ref, get_settings(), app.state.client,
+            limit=limit, scope=scope, include_burned=include_burned,
+        )
     except TooManySeedJobs as exc:
         return JSONResponse({"error": str(exc)}, status_code=429)
     except (httpx.HTTPError, ValueError) as exc:

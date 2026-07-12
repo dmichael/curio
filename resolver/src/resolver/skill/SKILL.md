@@ -40,7 +40,15 @@ appear with schemas; this file rides along as the server instructions.
   for the wallet (honoring `limit` and `scope`), returned as `pin_job` — poll
   it at `GET /seed/{id}`.
 - `&scope=published` (Tezos only) lists the works the wallet *first-minted* —
-  its published catalog — instead of what it currently holds.
+  instead of what it currently holds. A leaky proxy for authorship: it counts
+  fxhash editions the wallet collected (it's their first minter) and misses
+  editions a collector minted of the wallet's own work.
+- `&scope=created` (Tezos only) is the robust authorship index: works crediting
+  the wallet in `creators`/`authors` metadata — what it actually *made*.
+  Fully-burned creations (every edition at a burn address) are dropped by
+  default — destroyed on purpose, they are the lowest preservation priority;
+  `&include_burned=1` keeps them. ETH has no keyless creator index at all (mint
+  events name the minter, not the author), so `created` is Tezos-only.
 - `&scope=contract` lists every token of one token contract, both chains
   (`ref` must be the literal `0x…`/`KT1…` contract address, not a name) — how
   an ETH publication is swept, since ETH has no keyless creator index.
@@ -105,6 +113,10 @@ Caveats:
 - `scope=published` (Tezos only) seeds what the wallet *first-minted* instead
   of what it holds. Published works you no longer hold are the most rot-prone
   corner of a collection — holdings-seeding never touches them.
+- `scope=created` (Tezos only) seeds what the wallet *authored*
+  (`creators`/`authors` metadata) — the robust version of the published sweep,
+  without the collected-fxhash noise. Fully-burned creations are skipped unless
+  `include_burned=1` (they were destroyed on purpose).
 - `scope=contract` seeds every token of one token contract, both chains
   (`ref` must be the literal `0x…`/`KT1…` contract address). This is the ETH
   publication sweep: name the contract the works were minted on.
