@@ -54,7 +54,7 @@ from urllib.parse import urlparse
 import httpx
 
 from .config import Settings
-from .resolve import arweave_txid, external_url_ok, ipfs_parts, pick_media_field
+from .resolve import arweave_txid, external_url_ok, ipfs_parts, pick_media_field, resolve_ref
 
 _ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _TEZOS_ADDRESS_RE = re.compile(r"^(tz[123]|KT1)[1-9A-HJ-NP-Za-km-z]{33}$")
@@ -439,6 +439,7 @@ async def list_wallet_tokens(
     client: httpx.AsyncClient,
     limit: int | None = None,
     scope: str = "held",
+    status: bool = False,
 ) -> dict[str, Any] | None:
     """Live, normalized inventory of a wallet's NFTs — the browse/pick step.
 
@@ -448,6 +449,11 @@ async def list_wallet_tokens(
     scope="published" lists the works the wallet first-minted (Tezos only)
     instead of its holdings; scope="contract" lists every token a token
     contract ever issued (ref must be the literal contract address).
+
+    status=True additionally resolves each token's primary_ref and classifies
+    it (see _token_status), so an audit is one call instead of a client-side
+    loop. Alive local content answers in milliseconds; each genuinely dead
+    ref costs up to the probe timeout, bounded by _STATUS_CONCURRENCY.
     """
     ref = ref.strip()
     chain = classify_wallet(ref)
@@ -461,7 +467,7 @@ async def list_wallet_tokens(
         tokens.append(_token_record(chain, item))
         if limit is not None and len(tokens) >= limit:
             break
-    return {
+    result: dict[str, Any] = {
         "ref": ref,
         "chain": chain,
         "address": address,
@@ -469,6 +475,62 @@ async def list_wallet_tokens(
         "count": len(tokens),
         "tokens": tokens,
     }
+    if status:
+        sem = asyncio.Semaphore(_STATUS_CONCURRENCY)
+        await asyncio.gather(*(_token_status(t, settings, client, sem) for t in tokens))
+        counts: dict[str, int] = {}
+        for token in tokens:
+            counts[token["status"]] = counts.get(token["status"], 0) + 1
+        result["status_counts"] = counts
+    return result
+
+
+# Probes for alive content hit the local gateway (milliseconds); only dead
+# refs are slow (probe timeout), so a wide semaphore keeps a big audit's
+# wall-clock near max(dead refs) rather than their sum.
+_STATUS_CONCURRENCY = 16
+
+
+async def _token_status(
+    token: dict[str, Any],
+    settings: Settings,
+    client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+) -> None:
+    """Classify a token's primary_ref in place:
+
+      ok           resolves, no failure detected (for probed refs this means
+                   the bytes are fetchable; direct URLs with trusted
+                   extensions are not probed — resolution, not proof)
+      substituted  served via the override registry (already repaired)
+      unreachable  recognized but the gateway can't fetch it (dead CID) or
+                   resolution errored
+      unresolvable resolver recognized the ref and gave up (resolved: false)
+      no-ref       token carries no primary media reference
+    """
+    ref = token.get("primary_ref")
+    if not ref:
+        token["status"] = "no-ref"
+        return
+    async with sem:
+        try:
+            result = await resolve_ref(ref, settings, client)
+        except Exception:
+            token["status"] = "unreachable"
+            return
+    if result.substituted:
+        token["status"] = "substituted"
+    elif not result.resolved:
+        token["status"] = "unresolvable"
+    elif result.note and "probe failed" in result.note:
+        # resolve.py degrades gracefully: a bare CID whose gateway probe
+        # failed still "resolves" mechanically, with this note. That is the
+        # dead-CID signature; the substring is pinned by a test.
+        token["status"] = "unreachable"
+    else:
+        token["status"] = "ok"
+    if result.resolved:
+        token["resolved_url"] = result.resolved_url
 
 
 def _token_record(chain: str, item: dict[str, Any]) -> dict[str, Any]:
@@ -485,6 +547,10 @@ def _token_record(chain: str, item: dict[str, Any]) -> dict[str, Any]:
         formats = metadata.get("formats") or []
         mime = formats[0].get("mimeType") if formats and isinstance(formats[0], dict) else None
         name = metadata.get("name")
+    # TZIP-21 creators — lets a published-catalog consumer split authored
+    # works from first-minted collects (fxhash editions list the collector
+    # as first minter) without re-fetching metadata.
+    creators = metadata.get("creators")
     refs = _media_refs(item)
     return {
         "chain": chain,
@@ -492,6 +558,7 @@ def _token_record(chain: str, item: dict[str, Any]) -> dict[str, Any]:
         "token_id": token_id,
         "name": name if isinstance(name, str) else None,
         "mime": mime if isinstance(mime, str) else None,
+        "creators": creators if isinstance(creators, list) else None,
         "primary_ref": pick_media_field(metadata) or (refs[0] if refs else None),
         "refs": refs,
     }

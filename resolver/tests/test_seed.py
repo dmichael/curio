@@ -702,3 +702,74 @@ async def test_limit_stops_enumeration():
     assert job.status == "done", job.errors
     assert job.tokens == 1
     assert job.pinned == 1
+
+
+# --- status=1: the audit view -----------------------------------------------
+
+
+async def test_token_status_classification(monkeypatch):
+    from resolver import seed as seed_module
+    from resolver.resolve import Resolved
+
+    outcomes = {
+        "ipfs://bafyOK/art.png": Resolved(
+            "r", "http://box:8080/ipfs/bafyOK/art.png", "play", "ipfs", True
+        ),
+        "ipfs://bafyDEAD": Resolved(
+            "r", "http://box:8080/ipfs/bafyDEAD", "play", "ipfs", True,
+            note="gateway probe failed; no filename hint",
+        ),
+        "ipfs://bafyGONE/x": Resolved(
+            "r", "http://box:8080/ipfs/bafySUB/m.png", "play", "ipfs", True,
+            substituted=True, substituted_ref="ipfs://bafyGONE/x",
+            substitution_status="alternate-master",
+        ),
+        "not a ref": Resolved("r", "not a ref", "play", None, False, note="unrecognized reference"),
+    }
+
+    async def fake_resolve(ref, settings, client, _depth=0):
+        return outcomes[ref]
+
+    monkeypatch.setattr(seed_module, "resolve_ref", fake_resolve)
+    tokens = [{"primary_ref": ref} for ref in outcomes] + [{"primary_ref": None}]
+    sem = asyncio.Semaphore(4)
+    await asyncio.gather(
+        *(seed_module._token_status(t, SETTINGS, None, sem) for t in tokens)
+    )
+    assert [t["status"] for t in tokens] == [
+        "ok", "unreachable", "substituted", "unresolvable", "no-ref"
+    ]
+    # resolved tokens carry the playable URL; the substituted one points at
+    # the replacement, which is exactly what a repair audit wants to see
+    assert tokens[0]["resolved_url"] == "http://box:8080/ipfs/bafyOK/art.png"
+    assert tokens[2]["resolved_url"] == "http://box:8080/ipfs/bafySUB/m.png"
+
+
+async def test_wallet_status_audit_and_creators():
+    routes = {
+        published_url(0): {
+            "status_code": 200,
+            "json": [
+                {
+                    "contract": {"alias": "objkt", "address": "KT1abc"},
+                    "tokenId": "7",
+                    "metadata": {
+                        "name": "Temple VII",
+                        # known extension resolves mechanically — no probe
+                        "artifactUri": "ipfs://bafyART/work.png",
+                        "creators": [TZ_ADDR],
+                    },
+                }
+            ],
+        },
+    }
+    client, _ = fake_net(routes)
+    async with client:
+        result = await list_wallet_tokens(
+            TZ_ADDR, SETTINGS, client, scope="published", status=True
+        )
+    token = result["tokens"][0]
+    assert token["status"] == "ok"
+    assert token["creators"] == [TZ_ADDR]
+    assert token["resolved_url"].endswith("/ipfs/bafyART/work.png")
+    assert result["status_counts"] == {"ok": 1}

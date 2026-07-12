@@ -44,6 +44,11 @@ appear with schemas; this file rides along as the server instructions.
 - `&scope=contract` lists every token of one token contract, both chains
   (`ref` must be the literal `0x…`/`KT1…` contract address, not a name) — how
   an ETH publication is swept, since ETH has no keyless creator index.
+- `&status=1` is the **audit view**: each token's `primary_ref` is resolved
+  and classified in place — `ok` / `substituted` (already repaired) /
+  `unreachable` (dead content) / `unresolvable` / `no-ref` — plus a
+  `status_counts` summary. One call replaces a per-token resolve loop; when
+  dead refs exist, expect the call to take about one probe timeout.
 
 ## Play anything on a renderer (e.g. a Feral File FF1)
 

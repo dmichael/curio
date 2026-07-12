@@ -85,7 +85,11 @@ async def resolve(ref: str, pin: bool = False) -> dict[str, Any]:
 
 @mcp.tool()
 async def wallet_tokens(
-    ref: str, limit: int | None = None, pin: bool = False, scope: str = "held"
+    ref: str,
+    limit: int | None = None,
+    pin: bool = False,
+    scope: str = "held",
+    status: bool = False,
 ) -> dict[str, Any]:
     """List a wallet's NFTs live from the public indexers (browse/pick step).
 
@@ -99,9 +103,16 @@ async def wallet_tokens(
     catalog — instead of its holdings. scope="contract" lists every token
     of a token-contract address (ref must be the literal 0x…/KT1… contract
     address, both chains) — the way to sweep a publication contract on ETH,
-    where no keyless creator index exists.
+    where no keyless creator index exists. status=true is the AUDIT view:
+    every token's primary_ref is resolved and classified in place — status
+    is 'ok', 'substituted' (already repaired via the override registry),
+    'unreachable' (dead content), 'unresolvable', or 'no-ref' — plus a
+    status_counts summary. Use it to find rot without a per-token loop;
+    expect the call to take roughly the probe timeout when dead refs exist.
     """
-    result = await list_wallet_tokens(ref, get_settings(), _require_client(), limit=limit, scope=scope)
+    result = await list_wallet_tokens(
+        ref, get_settings(), _require_client(), limit=limit, scope=scope, status=status
+    )
     if result is None:
         raise ValueError("not a wallet-shaped reference (want 0x…, name.eth, tz1…, or name.tez)")
     if pin:

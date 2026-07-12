@@ -125,9 +125,12 @@ async def wallet(
     limit: int | None = Query(None, ge=1, description="Stop after this many tokens"),
     pin: bool = Query(False, description="Also pin everything listed (starts a seed job)"),
     scope: str = Query("held", description="'held' = holdings; 'published' = works the wallet first-minted (Tezos only); 'contract' = every token of a token-contract address (both chains)"),
+    status: bool = Query(False, description="Also resolve each primary_ref and classify it (ok/substituted/unreachable/unresolvable/no-ref) — the audit view"),
 ):
     try:
-        result = await list_wallet_tokens(ref, get_settings(), app.state.client, limit=limit, scope=scope)
+        result = await list_wallet_tokens(
+            ref, get_settings(), app.state.client, limit=limit, scope=scope, status=status
+        )
     except (httpx.HTTPError, ValueError) as exc:
         return _wallet_error(exc)
     if result is None:
