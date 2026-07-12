@@ -13,7 +13,7 @@
   DELETE /favorites?ref=         -> remove a favorite
   POST /store                   -> multipart upload -> Kubo (pinned) + provenance
   GET  /library                 -> cross-plane library status (pins, warm cache, registry)
-  GET  /skill                   -> agent instructions (SKILL.md), self-served
+  GET  /skill[/<name>]          -> agent instructions + shipped skills, self-served
   GET  /healthz                 -> on-box gateway reachability
   /mcp                          -> MCP (streamable HTTP): same capabilities as tools
 
@@ -378,14 +378,34 @@ async def library():
     return JSONResponse(await library_status(get_settings(), app.state.client))
 
 
-_SKILL_PATH = Path(__file__).parent / "skill" / "SKILL.md"
+_SKILL_DIR = Path(__file__).parent / "skill"
+# Whitelist built at import — the API skill plus any skills shipped inside
+# the package (skill/<name>/SKILL.md). Serving only dict members (never the
+# raw request path) forecloses path traversal.
+_SKILL_FILES = {
+    "SKILL.md": _SKILL_DIR / "SKILL.md",
+    **{f"{p.parent.name}/SKILL.md": p for p in sorted(_SKILL_DIR.glob("*/SKILL.md"))},
+}
 
 
 @app.get("/skill")
-@app.get("/skill/SKILL.md")
 async def skill():
     """Agent instructions for this service, served by the service itself."""
-    return FileResponse(_SKILL_PATH, media_type="text/markdown")
+    return FileResponse(_SKILL_FILES["SKILL.md"], media_type="text/markdown")
+
+
+@app.get("/skill/{name:path}")
+async def skill_file(name: str):
+    """Skills shipped with the service — e.g. /skill/nft-preservation.
+    No ecosystem convention for distributing skills exists yet; this box's
+    convention is that it serves its own."""
+    path = _SKILL_FILES.get(name) or _SKILL_FILES.get(f"{name}/SKILL.md")
+    if path is None:
+        return JSONResponse(
+            {"error": "unknown skill", "available": sorted(_SKILL_FILES)},
+            status_code=404,
+        )
+    return FileResponse(path, media_type="text/markdown")
 
 
 @app.get("/healthz")

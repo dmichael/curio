@@ -16,6 +16,11 @@ so they always match the running service. The machine-readable API schema is at
 `GET /openapi.json` (interactive: `/docs`). Prefer this file for *how to use*
 the service; prefer the schema for exact parameter shapes.
 
+**Shipped skills:** the box also serves the collector's preservation playbook
+— triage, the recovery ladder, provenance tiers, sweeps, runtime works — at
+`GET /skill/nft-preservation`. Fetch it before repairing or auditing works;
+an unknown `/skill/<name>` 404s with the list of what's available.
+
 **MCP:** the same capabilities are exposed as MCP tools (streamable HTTP) at
 `/mcp` — connect the sidecar as an MCP server (`"url": "http://<sidecar-ip>:8090/mcp"`)
 and the tools `resolve`, `wallet_tokens`, `seed_wallet`, `seed_status`,
