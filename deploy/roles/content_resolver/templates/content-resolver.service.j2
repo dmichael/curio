@@ -1,0 +1,24 @@
+{{ ansible_managed | comment }}
+[Unit]
+Description=content-resolver (media resolver for the content sidecar)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ resolver_user }}
+Group={{ resolver_group }}
+EnvironmentFile={{ resolver_home }}/resolver.env
+ExecStart={{ resolver_venv }}/bin/content-resolver
+Restart=on-failure
+RestartSec=3
+
+# hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths={{ resolver_home }}
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,141 @@
+"""Route-level tests for override CRUD and /store.
+
+All tests share the session-scoped TestClient from conftest (the MCP session
+manager in the lifespan is start-once-per-process); settings vary per test
+via env + lru_cache clearing.
+"""
+
+import json
+import tomllib
+
+import httpx
+import pytest
+
+from resolver import app as app_module
+from resolver.config import get_settings
+from resolver.overrides import get_registry
+
+ENTRY = {
+    "ref": "ipfs://bafyDEAD/art.png",
+    "replacement": "ipfs://bafyALT/master.png",
+    "status": "alternate-master",
+    "token": "eip155:1/erc721:0xabc/0",
+}
+
+
+@pytest.fixture
+def client(http_client, tmp_path, monkeypatch):
+    """The shared client, pointed at a tmp registry/capture dir. Teardown
+    clears the caches again; the monkeypatch env restore lands after, so the
+    next get_settings() rebuilds from the clean environment."""
+    monkeypatch.setenv("RESOLVER_OVERRIDES_PATH", str(tmp_path / "overrides.toml"))
+    monkeypatch.setenv("RESOLVER_SEED_CAPTURE_DIR", str(tmp_path / "captures"))
+    monkeypatch.setenv("RESOLVER_IPFS_PUBLIC_BASE", "http://box:8080")
+    get_settings.cache_clear()
+    get_registry.cache_clear()
+    yield http_client
+    get_settings.cache_clear()
+    get_registry.cache_clear()
+
+
+def test_override_crud_round_trip(client):
+    created = client.post("/override", json=ENTRY)
+    assert created.status_code == 201
+    body = created.json()
+    assert body["canonical_key"] == "ipfs://bafyDEAD/art.png"
+    assert body["replaced"] is False
+    # disclosure: the (mechanical, no-network) replacement resolves
+    assert body["replacement_resolved"] is True
+    assert body["replacement_resolved_url"] == "http://box:8080/ipfs/bafyALT/master.png"
+
+    listed = client.get("/override").json()
+    assert listed["count"] == 1
+    assert listed["entries"][0]["ref"] == ENTRY["ref"]
+
+    raw = client.get("/override", params={"raw": 1})
+    assert raw.status_code == 200
+    assert tomllib.loads(raw.text)["override"][0]["replacement"] == ENTRY["replacement"]
+
+    # the registry is live immediately: the dead ref resolves via the override
+    resolved = client.get(
+        "/resolve", params={"ref": "https://ipfs.io/ipfs/bafyDEAD/art.png"}
+    ).json()
+    assert resolved["substituted"] is True
+    assert resolved["substitution_status"] == "alternate-master"
+    assert resolved["resolved_url"] == "http://box:8080/ipfs/bafyALT/master.png"
+
+    removed = client.request("DELETE", "/override", params={"ref": "/ipfs/bafyDEAD/art.png"})
+    assert removed.status_code == 200
+    assert removed.json()["removed"]["ref"] == ENTRY["ref"]
+    assert client.get("/override").json()["count"] == 0
+
+
+def test_override_duplicate_conflicts_unless_replace(client):
+    assert client.post("/override", json=ENTRY).status_code == 201
+    dup = {**ENTRY, "ref": "https://ipfs.io/ipfs/bafyDEAD/art.png"}  # same content, respelled
+    conflict = client.post("/override", json=dup)
+    assert conflict.status_code == 409
+    assert "replace" in conflict.json()["error"]
+    replaced = client.post("/override", json={**dup, "replace": True})
+    assert replaced.status_code == 201
+    assert replaced.json()["replaced"] is True
+    assert client.get("/override").json()["count"] == 1
+
+
+def test_override_bad_status_and_absent_ref(client):
+    bad = client.post("/override", json={**ENTRY, "status": "definitely-not"})
+    assert bad.status_code == 400
+    assert "not one of" in bad.json()["error"]
+
+    gone = client.request("DELETE", "/override", params={"ref": "ipfs://bafyNOPE/x"})
+    assert gone.status_code == 404
+
+    # nothing was ever written, so there is no file to snapshot
+    assert client.get("/override", params={"raw": 1}).status_code == 404
+
+
+def test_override_endpoints_disabled_without_path(http_client, monkeypatch):
+    monkeypatch.delenv("RESOLVER_OVERRIDES_PATH", raising=False)
+    get_settings.cache_clear()
+    try:
+        responses = (
+            http_client.get("/override"),
+            http_client.post("/override", json=ENTRY),
+            http_client.request("DELETE", "/override", params={"ref": "x"}),
+        )
+        for response in responses:
+            assert response.status_code == 503
+            assert "RESOLVER_OVERRIDES_PATH" in response.json()["error"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_store_route_uploads_and_records(client, tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v0/add"
+        return httpx.Response(200, json={"Hash": "bafySTORED", "Name": "m.png"})
+
+    real = app_module.app.state.client
+    app_module.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        response = client.post("/store", files={"file": ("m.png", b"png-bytes", "image/png")})
+    finally:
+        app_module.app.state.client = real
+    assert response.status_code == 201
+    body = response.json()
+    assert body["cid"] == "bafySTORED"
+    assert body["resolved_url"] == "http://box:8080/ipfs/bafySTORED"
+    record = json.loads((tmp_path / "captures" / "captures.jsonl").read_text())
+    assert record["source"] == "upload:m.png"
+    assert record["bytes"] == len(b"png-bytes")
+
+
+def test_store_route_disabled_without_capture_dir(http_client, monkeypatch):
+    monkeypatch.delenv("RESOLVER_SEED_CAPTURE_DIR", raising=False)
+    get_settings.cache_clear()
+    try:
+        response = http_client.post("/store", files={"file": ("m.png", b"x", "image/png")})
+        assert response.status_code == 503
+        assert "RESOLVER_SEED_CAPTURE_DIR" in response.json()["error"]
+    finally:
+        get_settings.cache_clear()
