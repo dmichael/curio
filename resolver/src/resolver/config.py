@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     # retention metadata; object files are addressed by their SHA-256 digest.
     static_root: str = "/tmp/curio-media"
     static_max_bytes: int = Field(default=128_000_000, gt=0)
+    # Total disk budget for evictable public HTTP/data cache objects. Kept
+    # static media is durable library content and intentionally not charged.
+    static_cache_max_bytes: int = Field(default=1_000_000_000, gt=0)
     static_fetch_concurrency: int = Field(default=4, ge=1)
     data_max_bytes: int = Field(default=4_000_000, gt=0)
     redirect_max_hops: int = Field(default=5, ge=0)

@@ -99,7 +99,8 @@ async def mcp_same_origin_guard(request: Request, call_next):
     This runs before the mounted MCP transport.
     """
     if request.url.path.startswith("/mcp"):
-        effective = normalize_origin(request_origin(request))
+        settings = get_settings()
+        effective = effective_origin(request, settings.public_base_url, settings.trusted_proxy_cidrs)
         if effective is None:
             return JSONResponse({"error": "invalid MCP Host"}, status_code=421)
         origin = request.headers.get("origin")
@@ -109,16 +110,20 @@ async def mcp_same_origin_guard(request: Request, call_next):
 
 
 def request_origin(request: Request) -> str:
-    """The configured, trusted-forwarded, or direct public front door."""
+    """The configured, trusted-forwarded, or validated direct front door."""
     settings = get_settings()
-    return effective_origin(request, settings.public_base_url, settings.trusted_proxy_cidrs)
+    origin = effective_origin(request, settings.public_base_url, settings.trusted_proxy_cidrs)
+    if origin is None:
+        raise HTTPException(421, "invalid request Host")
+    return origin
 
 
 def _promote_static(result) -> bool:
     """Promote the source-native static object; never route HTTP/data via IPFS."""
     if result.source_kind not in {"http", "data", "upload"} or "/media/" not in result.resolved_url:
         return False
-    return StaticStore(get_settings().static_root).keep(result.resolved_url.rsplit("/", 1)[-1])
+    settings = get_settings()
+    return StaticStore(settings.static_root, settings.static_cache_max_bytes).keep(result.resolved_url.rsplit("/", 1)[-1])
 
 
 def require_curator(authorization: str | None = Header(default=None)) -> None:
@@ -471,7 +476,7 @@ async def store(
             status_code=400,
         )
     settings = get_settings()
-    store = StaticStore(settings.static_root)
+    store = StaticStore(settings.static_root, settings.static_cache_max_bytes)
     store.root.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
@@ -533,7 +538,8 @@ async def library():
 
 @app.get("/media/{file_id}")
 async def media(file_id: str):
-    item = StaticStore(get_settings().static_root).get(file_id)
+    settings = get_settings()
+    item = StaticStore(settings.static_root, settings.static_cache_max_bytes).get(file_id)
     if item is None:
         return JSONResponse({"error": "media not found"}, status_code=404)
     record, path = item
@@ -542,7 +548,7 @@ async def media(file_id: str):
     return FileResponse(path, media_type=record.get("media_type") or "application/octet-stream")
 
 
-async def _gateway_proxy(request: Request, backend: str, path: str):
+async def _gateway_proxy(request: Request, backend: str, path: str, *, retained_required: bool = False):
     """One public origin for native gateways; backend ports stay private."""
     settings = get_settings()
     base = (settings.ipfs_internal if backend == "ipfs" else
@@ -552,18 +558,32 @@ async def _gateway_proxy(request: Request, backend: str, path: str):
     url = f"{base.rstrip('/')}{upstream_path}"
     if request.url.query:
         url += f"?{request.url.query}"
-    headers = {}
+    # Request an uncompressed representation so raw proxy streaming cannot
+    # mismatch a compressed body and its headers. Still forward encoding/vary
+    # defensively for an upstream that ignores identity.
+    headers = {"accept-encoding": "identity"}
     if request.headers.get("range"):
         headers["range"] = request.headers["range"]
     # Core can retrieve a cold transaction after the normal resolver HTTP
     # deadline. Native Arweave streams get the explicit cold-read budget;
     # IPFS keeps the general client timeout.
     timeout = settings.arweave_cold_timeout if backend.startswith("arweave") else None
-    upstream = await app.state.client.send(
-        app.state.client.build_request(request.method, url, headers=headers, timeout=timeout), stream=True,
-    )
+    try:
+        upstream = await app.state.client.send(
+            app.state.client.build_request(request.method, url, headers=headers, timeout=timeout), stream=True,
+        )
+    except httpx.ConnectError:
+        return JSONResponse({"error": "native backend unavailable"}, status_code=502)
+    except httpx.HTTPError:
+        return JSONResponse({"error": "native backend request failed"}, status_code=503)
+    if retained_required and (
+        not 200 <= upstream.status_code < 300
+        or upstream.headers.get("x-cache", "").strip().lower() != "hit"
+    ):
+        await upstream.aclose()
+        return JSONResponse({"error": "retained AR.IO plane degraded"}, status_code=503)
     headers = {k: v for k, v in upstream.headers.items() if k.lower() in
-               {"content-type", "content-length", "content-range", "accept-ranges", "etag", "cache-control", "x-cache"}}
+               {"content-type", "content-length", "content-range", "accept-ranges", "etag", "cache-control", "x-cache", "content-encoding", "vary"}}
     return StreamingResponse(upstream.aiter_raw(), status_code=upstream.status_code, headers=headers,
                              background=BackgroundTask(upstream.aclose))
 
@@ -582,7 +602,7 @@ async def arweave_gateway(request: Request, path: str):
         # If the retained Core is unavailable its response is surfaced as a
         # degraded native-plane failure rather than substituted bytes.
         if retained_state(txid, retained_path, get_settings()) == "kept":
-            return await _gateway_proxy(request, "arweave-retained", path)
+            return await _gateway_proxy(request, "arweave-retained", path, retained_required=True)
     return await _gateway_proxy(request, "arweave", path)
 
 

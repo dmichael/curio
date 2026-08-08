@@ -8,7 +8,7 @@ import pytest
 
 from resolver.config import Settings
 from resolver.resolve import _fetch_allowed, external_url_ok, resolve_ref
-from resolver.seed import _JOBS, SeedJob, TooManySeedJobs, start_seed
+from resolver.seed import _JOBS, SeedJob, TooManySeedJobs, _recover_cid, start_seed
 
 SETTINGS = Settings(
     ipfs_internal="http://ipfs.internal",
@@ -75,6 +75,26 @@ async def test_dns_rebinding_target_is_refused_before_connection(monkeypatch):
         result = await resolve_ref("https://attacker.example/media.png", SETTINGS, client)
     assert result.resolved is False
     assert "internal/private" in (result.note or "")
+
+
+async def test_seed_recovery_revalidates_redirect_dns_before_contacting_it(monkeypatch):
+    def dns(host, *_args, **_kwargs):
+        address = "8.8.8.8" if host == "safe.example" else "127.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", dns)
+    contacted = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        contacted.append(str(request.url))
+        if request.url.host == "8.8.8.8":
+            return httpx.Response(302, headers={"location": "https://rebound.example/private"})
+        raise AssertionError("private redirect target must never be contacted")
+
+    job = SeedJob(id="recover", ref="x", chain="ethereum")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert not await _recover_cid("bafyCID", ["https://safe.example/media"], job, SETTINGS, client)
+    assert contacted == ["https://8.8.8.8/media"]
 
 
 async def test_direct_resolution_refuses_private_targets():

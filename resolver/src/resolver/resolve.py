@@ -27,20 +27,19 @@ from __future__ import annotations
 import asyncio
 import base64
 import html
-import ipaddress
 import json
 import re
-import socket
 import tempfile
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
+from urllib.parse import quote, unquote, urlparse, urlunparse
 
 import httpx
 
+from . import safe_fetch
 from .arweave_retention import retained_available, retained_state
 from .config import Settings
 from .fixups import (
@@ -52,7 +51,7 @@ from .fixups import (
 )
 from .overrides import get_registry
 from .refs import arweave_parts, ipfs_parts
-from .static_store import StaticStore
+from .static_store import CacheQuotaError, StaticStore
 
 __all__ = ["Resolved", "resolve_ref", "pick_media_field", "external_url_ok"]
 
@@ -132,145 +131,29 @@ class Resolved:
 
 
 def external_url_ok(url: str) -> bool:
-    """Refuse obviously-internal destinations in user/metadata-supplied URLs.
-
-    Literal-IP and localhost checks reject obvious local targets; DNS answers
-    and every redirect are separately validated before connection.
-    """
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return False
-    host = parsed.hostname
-    if host == "localhost" or host.endswith(".localhost"):
-        return False
-    try:
-        addr = ipaddress.ip_address(host)
-    except ValueError:
-        return True  # a DNS name; accepted (see trust model)
-    return addr.is_global
-
-
-def _is_internal_gateway(url: str, settings: Settings) -> bool:
-    return any(url == base.rstrip("/") or url.startswith(base.rstrip("/") + "/")
-               for base in (
-                   settings.ipfs_internal, settings.arweave_internal,
-                   settings.arweave_retained_internal,
-               ))
+    """Refuse obviously-internal destinations in user/metadata-supplied URLs."""
+    return safe_fetch.external_url_ok(url)
 
 
 async def _validated_addresses(url: str, settings: Settings) -> list[str] | None:
-    """Return DNS answers safe to connect to, rejecting mixed answers too.
-
-    The caller uses one returned numeric address as the TCP target. This is
-    intentionally more than a preflight: HTTPX never receives the hostname as
-    its connection destination, so a later resolver lookup cannot rebind it.
-    """
-    if not _fetch_allowed(url, settings):
-        return None
-    if _is_internal_gateway(url, settings) or not settings.ssrf_dns_check:
-        return []
-    parsed = urlparse(url)
-    if parsed.hostname is None:
-        return None
-    try:
-        answers = await asyncio.to_thread(
-            socket.getaddrinfo, parsed.hostname,
-            parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM,
-        )
-    except socket.gaierror:
-        return None
-    addresses: list[str] = []
-    for _, _, _, _, sockaddr in answers:
-        address = ipaddress.ip_address(sockaddr[0])
-        # is_global rejects RFC1918, loopback, link-local, CGNAT, documentation,
-        # multicast, unspecified, and other special-use ranges.
-        if not address.is_global:
-            return None
-        if str(address) not in addresses:
-            addresses.append(str(address))
-    return addresses or None
+    return await safe_fetch.validated_addresses(url, settings)
 
 
 async def _dns_fetch_allowed(url: str, settings: Settings) -> bool:
     return await _validated_addresses(url, settings) is not None
 
 
-def _pinned_url(url: str, address: str) -> str:
-    parsed = urlparse(url)
-    host = f"[{address}]" if ":" in address else address
-    netloc = f"{host}:{parsed.port}" if parsed.port else host
-    return urlunparse(parsed._replace(netloc=netloc))
-
-
-def _host_header(parsed) -> str:
-    host = parsed.hostname or ""
-    if ":" in host:  # HTTP Host syntax brackets an IPv6 literal.
-        host = f"[{host}]"
-    return f"{host}:{parsed.port}" if parsed.port else host
-
-
 @asynccontextmanager
 async def _safe_stream(
     client: httpx.AsyncClient, method: str, url: str, settings: Settings, *, timeout: float | None = None
 ):
-    """Fetch external HTTP only through a DNS-pinned connection.
-
-    HTTPS requests retain the original Host header and pass its hostname as
-    HTTP Core's SNI override, so certificate validation remains for the name
-    the user supplied. Redirects are explicit and every target is validated
-    and pinned independently.
-    """
-    current = url
-    response: httpx.Response | None = None
-    for hop in range(settings.redirect_max_hops + 1):
-        addresses = await _validated_addresses(current, settings)
-        if addresses is None:
-            raise ValueError("refusing to fetch internal/private URL")
-        parsed = urlparse(current)
-        if addresses:
-            request_url = _pinned_url(current, addresses[0])
-            # A pool keyed by numeric address could otherwise reuse a TLS
-            # connection verified for a different hostname sharing that IP.
-            # Keep Host/SNI for the original name and isolate each request.
-            headers = {"host": _host_header(parsed), "connection": "close"}
-            extensions = {"sni_hostname": parsed.hostname}
-        else:
-            request_url, headers, extensions = current, {}, {}
-        request = client.build_request(
-            method, request_url, headers=headers, extensions=extensions, timeout=timeout
-        )
-        response = await client.send(request, stream=True)
-        if response.status_code not in {301, 302, 303, 307, 308}:
-            break
-        location = response.headers.get("location")
-        await response.aclose()
-        response = None
-        if not location:
-            raise ValueError("redirect without Location")
-        if hop >= settings.redirect_max_hops:
-            raise ValueError("too many redirects")
-        current = urljoin(current, location)
-    if response is None:
-        raise ValueError("redirect failed")
-    try:
+    """Compatibility wrapper around the shared pinned untrusted stream."""
+    async with safe_fetch.safe_stream(client, method, url, settings, timeout=timeout) as response:
         yield response
-    finally:
-        await response.aclose()
 
 
 def _fetch_allowed(url: str, settings: Settings) -> bool:
-    """The resolver's own gateways are always fetchable; anything else must
-    pass the external-URL check. A URL only counts as a gateway URL when it
-    is exactly the base or a path under it — a bare prefix test would let
-    look-alike ports through (e.g. 127.0.0.1:30001 vs the :3000 gateway)."""
-    for base in (
-        settings.ipfs_internal, settings.arweave_internal,
-        settings.arweave_retained_internal,
-    ):
-        base = base.rstrip("/")
-        if url == base or url.startswith(base + "/"):
-            return True
-    return external_url_ok(url)
+    return safe_fetch.fetch_allowed(url, settings)
 
 
 async def _bounded_text(client: httpx.AsyncClient, url: str, max_bytes: int, settings: Settings) -> str:
@@ -585,7 +468,7 @@ async def _resolve_direct_fetch(
     # HTTP is copied to Curio's static backend; it is never added to Kubo.
     # Stream it to a bounded tempfile rather than collecting an attacker-sized
     # body in memory. _safe_stream pins DNS and validates every redirect hop.
-    store = StaticStore(settings.static_root)
+    store = StaticStore(settings.static_root, settings.static_cache_max_bytes)
     temporary: str | None = None
     try:
         async with _safe_stream(client, "GET", ref, settings) as response:
@@ -616,6 +499,11 @@ async def _resolve_direct_fetch(
         entry = store.put_file(Path(temporary), media_type=content_type,
                                filename=seg or None, source_ref=ref)
         temporary = None  # put_file atomically moved it
+    except CacheQuotaError as exc:
+        return Resolved(
+            ref, ref, "play", "http", False, note=f"media cache admission failed: {exc}",
+            source_kind="http", final_ref=ref,
+        )
     except (httpx.HTTPError, ValueError, OSError, json.JSONDecodeError) as exc:
         return Resolved(
             ref, ref, "play", "http", False, note=f"media fetch failed: {exc}",
@@ -733,7 +621,12 @@ async def _resolve_data_uri(
         return Resolved(ref, ref, "play", "data", False, note=f"data: URI decode failed: {exc}", final_ref=ref)
     if len(data) > settings.data_max_bytes:
         return Resolved(ref, ref, "play", "data", False, note="data: URI exceeds configured size limit", final_ref=ref)
-    entry = StaticStore(settings.static_root).put(data, media_type=mediatype, filename=None, source_ref=ref)
+    try:
+        entry = StaticStore(settings.static_root, settings.static_cache_max_bytes).put(
+            data, media_type=mediatype, filename=None, source_ref=ref,
+        )
+    except CacheQuotaError as exc:
+        return Resolved(ref, ref, "play", "data", False, note=f"media cache admission failed: {exc}", final_ref=ref)
     base = origin.rstrip("/") if origin else settings.ipfs_public_base.rstrip("/")
     method = "send" if mediatype == "text/html" else "play"
     return Resolved(ref, f"{base}/media/{entry['id']}", method, "data", True, content_type=mediatype,

@@ -90,6 +90,16 @@ def test_malformed_trusted_forwarded_origin_is_ignored(http_client, origin_env, 
     assert response.json()["media_url"] == "http://direct.example/ipfs/bafyCID/a.png"
 
 
+def test_invalid_direct_host_is_controlled_and_mcp_uses_same_boundary(http_client, origin_env):
+    response = http_client.get(
+        "http://bad_host/resolve", params={"ref": "ipfs://bafyCID/a.png"},
+    )
+    assert response.status_code == 421
+    # The mounted MCP transport has the same pre-route Host guard.
+    response = http_client.post("http://bad_host/mcp")
+    assert response.status_code == 421
+
+
 def test_public_base_precedes_trusted_forwarded_origin(http_client, origin_env):
     origin_env.setenv("RESOLVER_PUBLIC_BASE_URL", "https://configured.example")
     origin_env.setenv("RESOLVER_TRUSTED_PROXY_CIDRS", "127.0.0.0/8")

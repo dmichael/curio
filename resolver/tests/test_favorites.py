@@ -124,8 +124,8 @@ async def test_pin_resolved_pins_ipfs_target(tmp_path):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         outcome = await pin_resolved(result, PIN_SETTINGS, client)
     assert outcome == "pinned"
-    # pins the resolved target (query dropped), not the raw favorite ref
-    assert calls == [("/api/v0/pin/add", {"arg": "/ipfs/bafyFAV/art.png"})]
+    # Pin the canonical root; the resolved path remains serving/provenance.
+    assert calls == [("/api/v0/pin/add", {"arg": "/ipfs/bafyFAV"})]
 
 
 async def test_pin_resolved_warms_arweave_and_skips_unresolved(tmp_path):

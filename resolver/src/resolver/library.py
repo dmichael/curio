@@ -26,6 +26,7 @@ from .favorites import get_favorites
 from .overrides import get_registry
 from .refs import ipfs_parts
 from .resolve import Resolved
+from .safe_fetch import safe_stream
 
 _STATUS_TIMEOUT = 10.0  # per probe: status must answer even when a plane hangs
 
@@ -74,7 +75,7 @@ async def ingest_url(
     digest = hashlib.sha256() if compute_sha256 else None
     size = 0
     with tempfile.TemporaryFile() as buffer:
-        async with client.stream("GET", url, timeout=settings.seed_pin_timeout) as response:
+        async with safe_stream(client, "GET", url, settings, timeout=settings.seed_pin_timeout) as response:
             response.raise_for_status()
             content_type = response.headers.get("content-type")
             async for chunk in response.aiter_bytes(65536):
@@ -122,7 +123,9 @@ async def pin_resolved(
         cid, path = ipfs
         response = await client.post(
             f"{settings.ipfs_api}/api/v0/pin/add",
-            params={"arg": f"/ipfs/{cid}{path}"},
+            # Pin the canonical root. A path remains result provenance and
+            # serving detail, but a recursive pin of it must not omit siblings.
+            params={"arg": f"/ipfs/{cid}"},
             timeout=settings.seed_pin_timeout,
         )
         response.raise_for_status()

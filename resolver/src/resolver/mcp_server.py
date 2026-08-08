@@ -68,9 +68,14 @@ def _mcp_origin(ctx: Context | None = None) -> str:
         try:
             request = ctx.request_context.request
             settings = get_settings()
-            return effective_origin(request, settings.public_base_url, settings.trusted_proxy_cidrs)
+            origin = effective_origin(request, settings.public_base_url, settings.trusted_proxy_cidrs)
+            if origin is None:
+                raise ValueError("invalid MCP Host")
+            return origin
         except (AttributeError, ValueError):
-            pass  # direct/in-process tool invocation has no HTTP request
+            # Direct/in-process calls have no request. HTTP MCP traffic is
+            # rejected by app.py's pre-route Host guard before this fallback.
+            pass
     settings = get_settings()
     return settings.public_base_url.rstrip("/") or settings.ipfs_public_base.rstrip("/")
 
@@ -78,7 +83,8 @@ def _mcp_origin(ctx: Context | None = None) -> str:
 def _promote_static(result) -> bool:
     if result.source_kind not in {"http", "data", "upload"} or "/media/" not in result.resolved_url:
         return False
-    return StaticStore(get_settings().static_root).keep(result.resolved_url.rsplit("/", 1)[-1])
+    settings = get_settings()
+    return StaticStore(settings.static_root, settings.static_cache_max_bytes).keep(result.resolved_url.rsplit("/", 1)[-1])
 
 
 def _require_curator(token: str | None) -> None:

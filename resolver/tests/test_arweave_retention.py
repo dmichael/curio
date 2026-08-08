@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 from urllib.parse import urlparse
 
 import httpx
@@ -238,6 +239,66 @@ def test_cold_ordinary_core_proxy_uses_cold_timeout_not_envoy_504(http_client, t
         get_settings.cache_clear()
     assert response.status_code == 200 and response.content == b"cold"
     assert seen == [("ar-io-core", 1.0)]
+
+
+def test_kept_public_proxy_rejects_retained_miss_and_error(http_client, tmp_path, monkeypatch):
+    txid = "M" * 43
+    monkeypatch.setenv("RESOLVER_ARWEAVE_RETAINED_INTERNAL", "http://retained.internal")
+    monkeypatch.setenv("RESOLVER_ARWEAVE_RETENTION_DB", str(tmp_path / "r.sqlite3"))
+    get_settings.cache_clear()
+
+    async def mark_kept():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"x-cache": "HIT"}, content=b"x")
+        )) as client:
+            await keep_arweave(txid, "", get_settings(), client)
+
+    asyncio.run(mark_kept())
+    original = app_module.app.state.client
+    try:
+        for response in (httpx.Response(200, headers={"x-cache": "MISS"}, content=b"ordinary"), httpx.Response(503)):
+            app_module.app.state.client = httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda _, result=response: result)
+            )
+            result = http_client.get(f"/arweave/{txid}")
+            assert result.status_code == 503
+            assert result.json()["error"] == "retained AR.IO plane degraded"
+    finally:
+        app_module.app.state.client = original
+        get_settings.cache_clear()
+
+
+def test_native_proxy_preserves_raw_encoding_and_maps_connect_failure(http_client, monkeypatch):
+    original = app_module.app.state.client
+    seen = {}
+
+    raw = gzip.compress(b"uncompressed media")
+
+    def encoded(request: httpx.Request) -> httpx.Response:
+        seen["accept_encoding"] = request.headers["accept-encoding"]
+        return httpx.Response(
+            200, headers={"content-type": "image/png", "content-encoding": "gzip", "vary": "Accept-Encoding"},
+            stream=httpx.ByteStream(raw),
+        )
+
+    try:
+        app_module.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(encoded))
+        response = http_client.get("/ipfs/bafyCID/a.png")
+        # TestClient decodes the valid wire bytes; receiving the original
+        # payload proves the proxy did not corrupt the encoded stream.
+        assert response.content == b"uncompressed media"
+        assert response.headers["content-encoding"] == "gzip"
+        assert response.headers["vary"] == "Accept-Encoding"
+        assert seen["accept_encoding"] == "identity"
+
+        async def unavailable(_: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("down")
+
+        app_module.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(unavailable))
+        response = http_client.get("/ipfs/bafyCID/a.png")
+        assert response.status_code == 502 and response.json()["error"] == "native backend unavailable"
+    finally:
+        app_module.app.state.client = original
 
 
 def test_public_kept_txid_routes_to_retained_core(http_client, tmp_path, monkeypatch):

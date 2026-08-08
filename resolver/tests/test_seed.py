@@ -269,8 +269,11 @@ async def test_failed_pin_recovers_from_http_copy():
     }
     client, log = fake_net(routes)
     job = make_job(ETH_ADDR, "ethereum")
+    # MockTransport has no numeric DNS endpoint; DNS pinning itself is tested
+    # separately with the normal enabled setting.
+    settings = SETTINGS.model_copy(update={"ssrf_dns_check": False})
     async with client:
-        await run_seed(job, SETTINGS, client)
+        await run_seed(job, settings, client)
     assert job.status == "done", job.errors
     assert job.recovered == 1
     assert job.pinned == 0
@@ -298,8 +301,9 @@ async def test_ipfs_scheme_ref_recovers_via_public_gateway_fallback():
     }
     client, _ = fake_net(routes)
     job = make_job(ETH_ADDR, "ethereum")
+    settings = SETTINGS.model_copy(update={"ssrf_dns_check": False})
     async with client:
-        await run_seed(job, SETTINGS, client)
+        await run_seed(job, settings, client)
     assert job.status == "done", job.errors
     assert job.recovered == 1
     assert job.failed == 0

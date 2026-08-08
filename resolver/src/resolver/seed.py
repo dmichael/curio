@@ -402,7 +402,7 @@ async def _keep_ref(
         _note_error(job, f"retain {ref}: final artifact is unavailable")
         return
     if result.source_kind in {"http", "data", "upload"} and "/media/" in result.resolved_url:
-        if StaticStore(settings.static_root).keep(result.resolved_url.rsplit("/", 1)[-1]):
+        if StaticStore(settings.static_root, settings.static_cache_max_bytes).keep(result.resolved_url.rsplit("/", 1)[-1]):
             job.captured += 1
             return
     job.failed += 1

@@ -202,10 +202,10 @@ def forwarded_origin(request: Request, trusted_proxy_cidrs: str) -> str | None:
     return _origin_from_parts(proto, host)
 
 
-def effective_origin(request: Request, public_base_url: str, trusted_proxy_cidrs: str) -> str:
-    """Choose configured, trusted-forwarded, then direct request origin."""
+def effective_origin(request: Request, public_base_url: str, trusted_proxy_cidrs: str) -> str | None:
+    """Choose configured, trusted-forwarded, then a validated direct origin."""
     if public_base_url:
-        # Settings validates this value at startup; retain this fallback so a
-        # direct Settings construction cannot accidentally produce an unsafe URL.
-        return normalize_origin(public_base_url) or str(request.base_url).rstrip("/")
-    return forwarded_origin(request, trusted_proxy_cidrs) or str(request.base_url).rstrip("/")
+        # Settings validates this at startup; never substitute an untrusted
+        # request Host if a direct Settings construction bypassed validation.
+        return normalize_origin(public_base_url)
+    return forwarded_origin(request, trusted_proxy_cidrs) or normalize_origin(str(request.base_url))

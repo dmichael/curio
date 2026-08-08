@@ -1,6 +1,7 @@
 """Target media-model contracts, independent of real gateways."""
 import json
 import socket
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
@@ -52,9 +53,63 @@ def test_static_keep_survives_store_reopen(tmp_path):
 
 
 def test_data_media_is_static_not_a_data_url(tmp_path):
+    source = "data:image/svg+xml," + ("x" * 1_000_000)
     entry = StaticStore(str(tmp_path)).put(b"<svg/>", media_type="image/svg+xml", filename=None,
-                                            source_ref="data:image/svg+xml,...")
-    assert StaticStore(str(tmp_path)).get(str(entry["id"])) is not None
+                                            source_ref=source)
+    reopened = StaticStore(str(tmp_path))
+    assert reopened.get(str(entry["id"])) is not None
+    db = reopened._connection()
+    try:
+        stored = db.execute("SELECT source_ref FROM media WHERE id = ?", (entry["id"],)).fetchone()[0]
+    finally:
+        db.close()
+    assert stored == f"data:sha256:{entry['digest']}"
+
+
+def test_static_cache_evicts_lru_but_never_kept_objects(tmp_path):
+    store = StaticStore(str(tmp_path), cache_max_bytes=8)
+    first = store.put(b"aaaa", media_type=None, filename=None, source_ref="one")
+    second = store.put(b"bbbb", media_type=None, filename=None, source_ref="two")
+    # Accessing first makes second the least recently used cached object.
+    assert store.get(str(first["id"])) is not None
+    third = store.put(b"cccc", media_type=None, filename=None, source_ref="three")
+    assert store.get(str(first["id"])) is not None
+    assert store.get(str(second["id"])) is None
+    assert store.get(str(third["id"])) is not None
+    assert store.keep(str(first["id"]))
+    fourth = store.put(b"dddd", media_type=None, filename=None, source_ref="four")
+    fifth = store.put(b"eeee", media_type=None, filename=None, source_ref="five")
+    assert store.get(str(first["id"])) is not None  # kept can exceed cache quota
+    assert store.get(str(third["id"])) is None
+    assert store.get(str(fourth["id"])) is not None
+    assert store.get(str(fifth["id"])) is not None
+
+
+async def test_static_cache_refuses_unadmittable_media_honestly(tmp_path):
+    settings = Settings(static_root=str(tmp_path), static_cache_max_bytes=3, ssrf_dns_check=False)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda _: httpx.Response(200, headers={"content-type": "image/png"}, content=b"four")
+    )) as client:
+        result = await resolve_ref("https://origin.example/too-large.png", settings, client)
+    assert not result.resolved
+    assert "cache admission failed" in (result.note or "")
+
+
+def test_static_store_deduplicates_concurrent_identity_inserts(tmp_path):
+    def put() -> dict[str, object]:
+        return StaticStore(str(tmp_path), cache_max_bytes=32).put(
+            b"same", media_type="image/png", filename="x.png", source_ref="https://example/x.png",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        entries = list(pool.map(lambda _: put(), range(2)))
+    assert {entry["id"] for entry in entries} == {entries[0]["id"]}
+    store = StaticStore(str(tmp_path), cache_max_bytes=32)
+    db = store._connection()
+    try:
+        assert db.execute("SELECT COUNT(*) FROM media").fetchone()[0] == 1
+    finally:
+        db.close()
 
 
 def test_mutation_rejects_wrong_curator_token(http_client):

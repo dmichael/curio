@@ -98,6 +98,7 @@ RESOLVER_ARWEAVE_INTERNAL=http://ar-io-core:4000
 RESOLVER_ARWEAVE_RETAINED_INTERNAL=http://ar-io-retained:4000
 RESOLVER_ARWEAVE_COLD_TIMEOUT=300
 RESOLVER_STATIC_ROOT=/state/media
+RESOLVER_STATIC_CACHE_MAX_BYTES=1000000000
 RESOLVER_ARWEAVE_RETENTION_DB=/state/arweave-retained.sqlite3
 ```
 
@@ -118,9 +119,13 @@ headers. REST, MCP results, and the MCP Host/Origin guard use this same
 effective origin.
 
 HTTP, inline data, and uploads use Curio static storage and never reach IPFS
-implicitly. IPFS keeps pin the canonical DAG and seed through Kubo. Arweave
-keeps use retained Core hydration. Cache is distinct from keep. HTML runtime
-responses remain live-dependent until dependency capture/replay exists.
+implicitly. `CURIO_STATIC_CACHE_MAX_BYTES` bounds only evictable public
+HTTP/data cache objects (LRU); `RESOLVER_STATIC_MAX_BYTES` remains the
+per-object intake cap. Explicit static keeps and uploads are durable and are
+not charged to the cache quota. IPFS keeps pin the canonical CID root and seed
+through Kubo. Arweave keeps use retained Core hydration. Cache is distinct from
+keep. HTML runtime responses remain live-dependent until dependency
+capture/replay exists.
 
 Read-only routes can be public; mutations require `Authorization: Bearer
 <CURIO_CURATOR_TOKEN>`. This includes keep/pin, seed, store, and mutable
