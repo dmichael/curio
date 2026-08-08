@@ -429,13 +429,19 @@ async def _resolve_ipfs(
     seg = (path or cid).rsplit("/", 1)[-1]
     ext = extension_of(seg)
     if ext == "json":
-        return await _resolve_token_metadata(ref, internal, "ipfs", settings, client, depth)
+        return await _resolve_token_metadata(
+            ref, internal, "ipfs", settings, client, depth,
+            source_kind="ipfs", final_ref=native_ref,
+        )
 
     content_type = headers.get("content-type")
     main = _main_content_type(content_type)
 
     if main == "application/json":
-        return await _resolve_token_metadata(ref, internal, "ipfs", settings, client, depth)
+        return await _resolve_token_metadata(
+            ref, internal, "ipfs", settings, client, depth,
+            source_kind="ipfs", final_ref=native_ref,
+        )
     if headers is not None and main is None:
         # Kubo answers a directory HEAD with 200 and no Content-Type (files
         # always carry one): list the directory and descend.
@@ -446,6 +452,7 @@ async def _resolve_ipfs(
         return Resolved(
             ref, public, "send", "ipfs", True, content_type=content_type,
             source_kind="ipfs", final_ref=native_ref, keep_state="live-dependent",
+            integrity={"algorithm": "ipfs-cid", "digest": cid},
         )
 
     hinted_ext = ext_from_content_type(content_type)
@@ -456,6 +463,8 @@ async def _resolve_ipfs(
         ref, public, method, "ipfs", True, content_type=content_type,
         source_kind="ipfs", final_ref=native_ref,
         keep_state="live-dependent" if method == "send" else "cached",
+        # A CID names an IPLD graph, not necessarily one flat byte stream.
+        integrity={"algorithm": "ipfs-cid", "digest": cid},
     )
 
 
@@ -528,15 +537,20 @@ async def _resolve_arweave(
     content_type = headers.get("content-type")
     main = _main_content_type(content_type)
 
+    integrity = _arweave_integrity(headers)
     if main == "application/json":
         # The metadata identity may be retained while its final media is not;
         # recursion reports the final artifact's own keep state.
-        return await _resolve_token_metadata(ref, internal, "arweave", settings, client, depth)
+        return await _resolve_token_metadata(
+            ref, internal, "arweave", settings, client, depth,
+            source_kind="arweave", final_ref=native_ref,
+        )
     method = "send" if main == "text/html" else "play"
     return Resolved(
         ref, public, method, "arweave", True, content_type=content_type,
         source_kind="arweave", final_ref=native_ref,
         keep_state=("live-dependent" if main == "text/html" else "kept" if retained else "cached"),
+        integrity=integrity,
     )
 
 
@@ -611,17 +625,41 @@ async def _resolve_direct_fetch(
         integrity={"algorithm": "sha256", "digest": str(entry["digest"])})
 
 
+def _arweave_integrity(headers: httpx.Headers) -> dict[str, str] | None:
+    """The AR.IO data digest, when its successful response exposes one."""
+    digest = headers.get("content-digest") or headers.get("x-ar-io-digest")
+    return {"algorithm": "arweave-data-digest", "digest": digest} if digest else None
+
+
 async def _resolve_token_metadata(
-    ref: str, fetch_url: str, provider: str, settings: Settings, client, depth: int
+    ref: str,
+    fetch_url: str,
+    provider: str,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    depth: int,
+    *,
+    source_kind: str | None = None,
+    final_ref: str | None = None,
 ) -> Resolved:
+    """Resolve metadata while retaining a recognized native identity on failure."""
+    failure = {"source_kind": source_kind, "final_ref": final_ref}
     if not await _dns_fetch_allowed(fetch_url, settings):
-        return Resolved(ref, ref, "play", provider, False, note="refusing to fetch internal/private URL")
+        return Resolved(
+            ref, ref, "play", provider, False,
+            note="refusing to fetch internal/private URL", **failure,
+        )
     try:
         metadata: Any = json.loads(await _bounded_text(client, fetch_url, settings.fetch_max_bytes, settings))
     except (httpx.HTTPError, ValueError) as exc:
-        return Resolved(ref, ref, "play", provider, False, note=f"metadata fetch failed: {exc}")
+        return Resolved(
+            ref, ref, "play", provider, False,
+            note=f"metadata fetch failed: {exc}", **failure,
+        )
     if not isinstance(metadata, dict):
-        return Resolved(ref, ref, "play", provider, False, note="metadata is not a JSON object")
+        return Resolved(
+            ref, ref, "play", provider, False, note="metadata is not a JSON object", **failure,
+        )
     return await _resolve_metadata_dict(ref, metadata, provider, settings, client, depth)
 
 
@@ -753,8 +791,16 @@ async def _resolve_verse(
 
         token_uri = _extract_embedded_value(text, "tokenUri")
         if token_uri:
+            ipfs = ipfs_parts(token_uri)
+            arweave = arweave_parts(token_uri)
+            source_kind = "ipfs" if ipfs is not None else "arweave" if arweave is not None else None
+            final_ref = (
+                f"ipfs://{ipfs[0]}{ipfs[1]}" if ipfs is not None
+                else f"ar://{arweave[0]}{arweave[1]}" if arweave is not None else None
+            )
             return await _resolve_token_metadata(
-                ref, _internal_fetch_url(token_uri, settings), "verse", settings, client, depth
+                ref, _internal_fetch_url(token_uri, settings), "verse", settings, client, depth,
+                source_kind=source_kind, final_ref=final_ref,
             )
 
         iframe_url = _extract_embedded_value(text, "iframeUrl")

@@ -39,6 +39,51 @@ async def test_retained_hydration_is_transactional_and_survives_settings_reopen(
     assert retained_records(reopened)[0]["state"] == "kept"
 
 
+async def test_retained_keep_is_idempotent_only_after_exact_native_hit(tmp_path):
+    settings = Settings(
+        arweave_retained_internal="http://retained.internal",
+        arweave_retention_db=str(tmp_path / "r.sqlite3"),
+    )
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        return httpx.Response(200, headers={"x-cache": "HIT"}, content=b"kept")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await keep_arweave("I" * 43, "/exact-path", settings, client) == "kept"
+        before = retained_records(settings)[0]
+        assert await keep_arweave("I" * 43, "/exact-path", settings, client) == "kept"
+        after = retained_records(settings)[0]
+
+    # The second operation proves availability with HEAD; it never resets
+    # intent or repeats the two hydration reads.
+    assert calls == ["GET", "GET", "HEAD"]
+    assert after["requested_at"] == before["requested_at"]
+
+
+async def test_retained_keep_retries_degraded_hit_and_records_failure(tmp_path):
+    settings = Settings(
+        arweave_retained_internal="http://retained.internal",
+        arweave_retention_db=str(tmp_path / "r.sqlite3"),
+    )
+    phase = "initial"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if phase == "initial":
+            return httpx.Response(200, headers={"x-cache": "HIT"}, content=b"kept")
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"x-cache": "MISS"})
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await keep_arweave("J" * 43, "", settings, client) == "kept"
+        phase = "degraded"
+        assert await keep_arweave("J" * 43, "", settings, client) == "failed"
+
+    assert retained_records(settings)[0]["state"] == "failed"
+
+
 async def test_retained_hydration_without_native_hit_never_marks_kept(tmp_path):
     settings = Settings(arweave_retained_internal="http://retained.internal", arweave_retention_db=str(tmp_path / "r.sqlite3"))
     async with httpx.AsyncClient(transport=httpx.MockTransport(

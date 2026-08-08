@@ -109,6 +109,9 @@ async def pin_resolved(
     """Apply explicit keep intent on the source-native storage plane."""
     if not result.resolved:
         return None
+    if getattr(result, "keep_state", None) == "live-dependent":
+        # Retaining the HTML shell is not preservation of a runtime work.
+        return "live-dependent"
     # The public resolved URL may be a Curio proxy and original_ref may be a
     # metadata document. Retention always targets the final native artifact.
     # The fallback only supports older in-process callers that construct a

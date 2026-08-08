@@ -157,6 +157,7 @@ async def test_bare_cid_html_runtime_work_is_sent_without_hint():
         result = await resolve_ref("ipfs://bafyCID", SETTINGS, client)
     assert result.resolved_url == "http://box:8080/ipfs/bafyCID"
     assert result.playback_method == "send"
+    assert result.integrity == {"algorithm": "ipfs-cid", "digest": "bafyCID"}
 
 
 async def test_bare_cid_probe_failure_is_unresolved():
@@ -224,6 +225,7 @@ async def test_arweave_refs_target_the_box(ref):
     assert result.provider == "arweave"
     assert result.playback_method == "play"
     assert result.content_type == "video/mp4"
+    assert result.integrity is None
 
 
 @pytest.mark.parametrize("ref", [f"ar://{TXID}/49", f"https://arweave.net/{TXID}/49"])
@@ -246,12 +248,19 @@ async def test_arweave_query_is_preserved():
     routes = {
         f"http://ar.internal/{TXID}": {
             "status_code": 200,
-            "headers": {"content-type": "video/mp4"},
+            "headers": {
+                "content-type": "video/mp4",
+                "content-digest": "sha-256=:verified-data-digest:=",
+            },
         }
     }
     async with fake_net(routes) as client:
         result = await resolve_ref(f"https://arweave.net/{TXID}?foo=1", SETTINGS, client)
     assert result.resolved_url == f"http://box:3000/arweave/{TXID}?foo=1"
+    assert result.final_ref == f"ar://{TXID}"
+    assert result.integrity == {
+        "algorithm": "arweave-data-digest", "digest": "sha-256=:verified-data-digest:=",
+    }
     assert result.provider == "arweave"
 
 
@@ -265,13 +274,48 @@ async def test_arweave_manifest_metadata_recurses():
         },
         f"http://ar.internal/{media_txid}": {
             "status_code": 200,
-            "headers": {"content-type": "image/png"},
+            "headers": {"content-type": "image/png", "x-ar-io-digest": "ar-io-data-digest"},
         },
     }
     async with fake_net(routes) as client:
         result = await resolve_ref(f"ar://{TXID}/49", SETTINGS, client)
     assert result.resolved_url == f"http://box:3000/arweave/{media_txid}"
     assert result.title == "FV #49"
+    assert result.final_ref == f"ar://{media_txid}"
+    assert result.integrity == {"algorithm": "arweave-data-digest", "digest": "ar-io-data-digest"}
+
+
+async def test_ipfs_metadata_preserves_final_cid_integrity():
+    routes = {
+        "http://ipfs.internal/ipfs/bafyMETA": {
+            "status_code": 200,
+            "headers": {"content-type": "application/json"},
+            "json": {"image": "ipfs://bafyMEDIA/art.png"},
+        },
+        "http://ipfs.internal/ipfs/bafyMEDIA/art.png": {
+            "status_code": 200,
+            "headers": {"content-type": "image/png"},
+        },
+    }
+    async with fake_net(routes) as client:
+        result = await resolve_ref("ipfs://bafyMETA", SETTINGS, client)
+    assert result.final_ref == "ipfs://bafyMEDIA/art.png"
+    assert result.integrity == {"algorithm": "ipfs-cid", "digest": "bafyMEDIA"}
+
+
+@pytest.mark.parametrize(
+    ("ref", "url", "kind", "final_ref"),
+    [
+        ("ipfs://bafyMETA/meta.json", "http://ipfs.internal/ipfs/bafyMETA/meta.json", "ipfs", "ipfs://bafyMETA/meta.json"),
+        (f"ar://{TXID}/meta.json", f"http://ar.internal/{TXID}/meta.json", "arweave", f"ar://{TXID}/meta.json"),
+    ],
+)
+async def test_failed_native_metadata_keeps_recognized_identity(ref, url, kind, final_ref):
+    async with fake_net({url: {"status_code": 200, "headers": {"content-type": "application/json"}}}) as client:
+        result = await resolve_ref(ref, SETTINGS, client)
+    assert not result.resolved
+    assert result.source_kind == kind
+    assert result.final_ref == final_ref
 
 
 # --- tokenURI metadata (feedback_nft_largest_image) ---

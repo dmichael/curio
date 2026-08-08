@@ -1,11 +1,14 @@
 """Target media-model contracts, independent of real gateways."""
+import json
 import socket
 
 import httpx
+import pytest
 
 from resolver import app as app_module
 from resolver import mcp_server
 from resolver.config import Settings, get_settings
+from resolver.library import pin_resolved
 from resolver.resolve import Resolved, resolve_ref
 from resolver.static_store import StaticStore
 
@@ -153,12 +156,91 @@ def test_keep_does_not_lie_when_ipfs_pin_fails(http_client, monkeypatch):
     assert response.status_code == 502 and response.json()["keep_state"] == "failed"
 
 
+async def test_pin_helper_refuses_live_runtime_html(tmp_path):
+    settings = Settings(ipfs_api="http://kubo.internal")
+    runtime = Resolved(
+        "ipfs://bafyRUNTIME/index.html", "http://box/ipfs/bafyRUNTIME/index.html", "send", "ipfs", True,
+        source_kind="ipfs", final_ref="ipfs://bafyRUNTIME/index.html", keep_state="live-dependent",
+    )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: (_ for _ in ()).throw(AssertionError(f"unexpected keep: {request.url}"))
+    )) as client:
+        assert await pin_resolved(runtime, settings, client) == "live-dependent"
+
+
 def test_html_capture_is_live_dependent_and_keep_refuses(http_client, monkeypatch):
     async def html_result(*_args, **_kwargs):
         return Resolved("x", "http://testserver/media/x", "send", "http", True, source_kind="http", keep_state="live-dependent")
     monkeypatch.setattr(app_module, "resolve_ref", html_result)
     response = http_client.post("/keep", params={"ref": "https://origin.example/work.html"})
     assert response.status_code == 409 and response.json()["keep_state"] == "live-dependent"
+
+
+@pytest.mark.parametrize("source_kind", ["ipfs", "arweave"])
+def test_live_native_html_is_never_scheduled_or_kept_by_rest_actions(
+    http_client, tmp_path, monkeypatch, source_kind
+):
+    monkeypatch.setenv("RESOLVER_FAVORITES_PATH", str(tmp_path / "favorites.json"))
+    get_settings.cache_clear()
+    final_ref = "ipfs://bafyRUNTIME/index.html" if source_kind == "ipfs" else f"ar://{'H' * 43}/index.html"
+
+    async def html_result(*_args, **_kwargs):
+        return Resolved(
+            final_ref, "http://testserver/runtime", "send", source_kind, True,
+            source_kind=source_kind, final_ref=final_ref, keep_state="live-dependent",
+        )
+
+    def retention_called(*_args, **_kwargs):
+        raise AssertionError("runtime HTML must not be retained as a complete work")
+
+    monkeypatch.setattr(app_module, "resolve_ref", html_result)
+    monkeypatch.setattr(app_module, "pin_in_background", retention_called)
+    monkeypatch.setattr(app_module, "pin_resolved", retention_called)
+    response = http_client.get("/resolve", params={"ref": final_ref, "pin": "true"})
+    assert response.status_code == 200
+    assert response.json()["keep_state"] == "live-dependent"
+    assert response.json()["pin_scheduled"] is False
+    response = http_client.post("/favorites", params={"ref": final_ref})
+    assert response.status_code == 201
+    assert response.json()["keep_state"] == "live-dependent"
+    assert response.json()["pin_scheduled"] is False
+    get_settings.cache_clear()
+
+
+@pytest.mark.parametrize("source_kind", ["ipfs", "arweave"])
+async def test_mcp_live_html_is_never_scheduled_or_kept(tmp_path, monkeypatch, source_kind):
+    monkeypatch.setenv("RESOLVER_FAVORITES_PATH", str(tmp_path / "favorites.json"))
+    get_settings.cache_clear()
+    mcp_server.get_favorites.cache_clear()
+    final_ref = "ipfs://bafyRUNTIME/index.html" if source_kind == "ipfs" else f"ar://{'M' * 43}/index.html"
+
+    async def html_result(*_args, **_kwargs):
+        return Resolved(
+            final_ref, "http://testserver/runtime", "send", source_kind, True,
+            source_kind=source_kind, final_ref=final_ref, keep_state="live-dependent",
+        )
+
+    def retention_called(*_args, **_kwargs):
+        raise AssertionError("runtime HTML must not be retained as a complete work")
+
+    monkeypatch.setattr(mcp_server, "resolve_ref", html_result)
+    monkeypatch.setattr(mcp_server, "pin_in_background", retention_called)
+    monkeypatch.setattr(mcp_server, "pin_resolved", retention_called)
+    content, _ = await mcp_server.mcp.call_tool(
+        "resolve", {"ref": final_ref, "pin": True, "curator_token": "test-curator-token"},
+    )
+    resolved = json.loads(content[0].text)
+    assert resolved["keep_state"] == "live-dependent"
+    assert resolved["pin_scheduled"] is False
+    content, _ = await mcp_server.mcp.call_tool(
+        "add_favorite", {"ref": final_ref, "curator_token": "test-curator-token"},
+    )
+    favorite = json.loads(content[0].text)
+    assert favorite["keep_state"] == "live-dependent"
+    assert favorite["pin_scheduled"] is False
+    get_settings.cache_clear()
+    mcp_server.get_favorites.cache_clear()
 
 
 async def test_mcp_uses_configured_public_origin(monkeypatch):

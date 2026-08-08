@@ -100,10 +100,12 @@ def _url(txid: str, path: str, settings: Settings) -> str:
 async def keep_arweave(txid: str, path: str, settings: Settings, client: httpx.AsyncClient) -> str:
     """Hydrate then prove a fully-consumed native retained-cache hit.
 
-    The first read permits the retained Core to hydrate.  The post-hydration
-    read must be a native ``X-Cache: HIT``; two successful upstream reads do
-    not prove that the retained plane owns the artifact.
+    A previously kept *exact* identity stays kept only while the retained
+    Core still confirms its native ``X-Cache: HIT``.  Otherwise its intent is
+    retried as pending, rather than treating a stale registry row as proof.
     """
+    if retained_state(txid, path, settings) == "kept" and await retained_available(txid, path, settings, client):
+        return "kept"
     record_intent(txid, path, settings)
     try:
         url = _url(txid, path, settings)

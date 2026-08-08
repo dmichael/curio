@@ -372,6 +372,12 @@ async def _keep_ref(
     final_ref = result.final_ref
     ipfs = ipfs_parts(final_ref) if final_ref else None
     arweave = arweave_parts(final_ref) if final_ref else None
+    # Runtime HTML needs dependency capture/replay before it can honestly be
+    # called kept. Native identity alone is not enough to preserve the work.
+    if result.keep_state == "live-dependent":
+        job.failed += 1
+        _note_error(job, f"retain {ref}: HTML runtime has uncaptured dependencies")
+        return
     # A CID pin covers every file below that CID; retained Arweave paths and
     # static artifacts remain distinct identities.
     native_key = f"ipfs:{ipfs[0]}" if ipfs else final_ref
@@ -394,10 +400,6 @@ async def _keep_ref(
     if not result.resolved:
         job.failed += 1
         _note_error(job, f"retain {ref}: final artifact is unavailable")
-        return
-    if result.keep_state == "live-dependent":
-        job.failed += 1
-        _note_error(job, f"retain {ref}: HTML runtime has uncaptured dependencies")
         return
     if result.source_kind in {"http", "data", "upload"} and "/media/" in result.resolved_url:
         if StaticStore(settings.static_root).keep(result.resolved_url.rsplit("/", 1)[-1]):
