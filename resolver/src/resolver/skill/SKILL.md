@@ -1,199 +1,133 @@
 ---
 name: curio
-description: Resolve any media reference (IPFS, Arweave, NFT tokenURI, verse.works page, direct URL) into a playable URL on the request origin, and seed the box's content cache from a wallet. Fetched live from Curio itself at GET /skill/SKILL.md — the box is the source of truth for how to use it.
+description: Resolve media references into playable URLs on the Curio origin; explicitly keep selected IPFS, Arweave, HTTP, data, or uploaded works with curator authorization. Fetch this skill from GET /skill/SKILL.md on a running Curio for the service's instructions.
 ---
 
 # Curio — agent instructions
 
-**No registration, no stored state.** Resolve works on arbitrary refs with zero
-setup — unpinned content is fetched on demand and lands in the gateway cache.
-Seeding is a one-shot imperative ("make this wallet's holdings durable now"),
-not a subscription; the only state it leaves is pins. Cache = incidental,
-pins = the library.
+Curio resolves a reference to a locally served work. A successful response has
+`media_url` (and the compatibility field `resolved_url`) on the Curio origin;
+never send the caller to an upstream gateway as a successful result.
 
-These instructions are served by the Curio instance they describe (`GET /skill/SKILL.md`),
-so they always match the running service. The machine-readable API schema is at
-`GET /openapi.json` (interactive: `/docs`). Prefer this file for *how to use*
-the service; prefer the schema for exact parameter shapes.
+Use `GET /openapi.json` or `/docs` for exact schema details. This skill is
+served by the box at `GET /skill/SKILL.md`. The collector playbook is at
+`GET /skill/nft-preservation`.
 
-**Shipped skills:** the box also serves the collector's preservation playbook
-— triage, the recovery ladder, provenance tiers, sweeps, runtime works — at
-`GET /skill/nft-preservation`. Fetch it before repairing or auditing works;
-an unknown `/skill/<name>` 404s with the list of what's available.
+## Read-only resolution
 
-**MCP:** the same capabilities are exposed as MCP tools (streamable HTTP) at
-`/mcp` — connect Curio as an MCP server (`"url": "http://<curio-ip>:8090/mcp"`)
-and the tools `resolve`, `wallet_tokens`, `seed_wallet`, `seed_status`,
-`health`, `library_status`, `list_overrides`, `add_override`,
-`remove_override`, `list_favorites`, `add_favorite`, and `remove_favorite`
-appear with schemas; this file rides along as the server instructions.
+```text
+GET /resolve?ref=<reference>
+GET /c?ref=<reference>        # 302 for renderers that only accept a URL
+GET /wallet?ref=<wallet>
+GET /library
+GET /healthz
+GET /favorites
+GET /override
+```
 
-## Browse a wallet (pick something to play)
+`ref` may be an IPFS URI/path/gateway URL, `ar://txid[/path]`, an Arweave
+URL, HTTP(S), token metadata, on-chain `data:` metadata/media, or a Verse
+artwork page. `media_url` is always on the request's Curio origin for HTTP
+calls. Hand it to a renderer exactly as returned; filename query hints are
+functional for extension-sniffing renderers such as the Feral File FF1.
 
-- `GET /wallet?ref=<wallet>` (`0x…`, `name.eth`, `tz1…`, `name.tez`; optional
-  `limit=<n>`) — live, normalized NFT inventory straight from the public
-  indexers. No snapshot files: this replaces reading `*-nfts.json` exports.
-- Each token: `name`, `contract`, `token_id`, `mime`, `primary_ref` (the
-  artwork's main media reference), `refs` (all media candidates).
-- To display one: take its `primary_ref` → `GET /resolve?ref=…` → cast.
-- Add `&pin=1` to also make everything listed durable: it starts a seed job
-  for the wallet (honoring `limit` and `scope`), returned as `pin_job` — poll
-  it at `GET /seed/{id}`.
-- `&scope=published` (Tezos only) lists the works the wallet *first-minted* —
-  instead of what it currently holds. A leaky proxy for authorship: it counts
-  fxhash editions the wallet collected (it's their first minter) and misses
-  editions a collector minted of the wallet's own work.
-- `&scope=created` (Tezos only) is the robust authorship index: works crediting
-  the wallet in `creators`/`authors` metadata — what it actually *made*.
-  Fully-burned creations (every edition at a burn address) are dropped by
-  default — destroyed on purpose, they are the lowest preservation priority;
-  `&include_burned=1` keeps them. ETH has no keyless creator index at all (mint
-  events name the minter, not the author), so `created` is Tezos-only.
-- `&scope=contract` lists every token of one token contract, both chains
-  (`ref` must be the literal `0x…`/`KT1…` contract address, not a name) — how
-  an ETH publication is swept, since ETH has no keyless creator index.
-- `&status=1` is the **audit view**: each token's `primary_ref` is resolved
-  and classified in place — `ok` / `substituted` (already repaired) /
-  `unreachable` (dead content) / `unresolvable` / `no-ref` — plus a
-  `status_counts` summary. One call replaces a per-token resolve loop; when
-  dead refs exist, expect the call to take about one probe timeout.
+`playback_method: "play"` means static media; `"send"` means HTML. A runtime
+HTML result is `live-dependent`, not a claim that Curio preserved its scripts,
+assets, APIs, workers, or origin behavior. `resolved: false` means no local
+artifact could be served. `substituted: true` discloses an operator replacement
+and includes `substituted_ref` and `substitution_status`.
 
-## Play anything on a renderer (e.g. a Feral File FF1)
+Curio uses `/ipfs/<cid>/<path>` through Kubo, `/arweave/<txid>/<path>` through
+AR.IO, and `/media/<id>` for HTTP/data/uploads. HTTP, inline data, and uploads
+never enter IPFS implicitly.
 
-1. `GET /resolve?ref=<anything>` — the ref may be `ipfs://…`, `/ipfs/…`, any
-   gateway URL, `ar://<txid>[/path]`, an `arweave.net` URL, a tokenURI (JSON
-   metadata, including on-chain `data:` URIs), a `verse.works/artworks/…`
-   page, or a direct media URL.
-2. Read the response: `resolved_url` (fetchable from this request origin), `playback_method`,
-   `title`, `content_type`.
-3. Hand `resolved_url` to the renderer **exactly as returned** — query params
-   like `?filename=art.png` are functional (they fix extension-sniffing
-   renderers), not cosmetic.
-4. `playback_method` semantics: `play` = static media (image/video);
-   `send` = load as a web page (live/generative HTML works).
-5. `resolved: false` means the ref was recognized but couldn't be resolved;
-   `note` says why. Don't cast unresolved URLs.
-5b. Add `&pin=1` to also pin the resolved content onto the box (IPFS) or
-   warm its cache (Arweave), in the background — `pin_scheduled` reports it.
-   Plain resolution never pins; pass `pin` only for keep-this intent.
-6. `substituted: true` means the canonical content is gone and the operator's
-   override registry supplied a replacement — `substituted_ref` is the dead
-   canonical ref, `substitution_status` the provenance tier
-   (`canonical-recovered` / `captured-original` / `operator-attested` /
-   `alternate-master`). Renderers can just play it; anything archival should
-   record the distinction.
+## Explicit keep and authentication
 
-Caveats:
-- Resolved URLs use the request origin (or configured public base for
-  non-HTTP MCP calls); Curio never manufactures Docker-internal addresses.
-- Dumb renderers that only take a URL can be pointed at `GET /c?ref=…`
-  (302-redirects to the resolved media).
+Mutations require `Authorization: Bearer <CURIO_CURATOR_TOKEN>`. Read-only
+routes may be public. Use an explicit keep when preservation, rather than a
+cache hit, is intended:
 
-## Seed the box's cache from a wallet
+```bash
+curl -X POST -H 'Authorization: Bearer YOUR_TOKEN' --get \
+  'https://curio.example/keep' \
+  --data-urlencode 'ref=ipfs://bafy.../work.mp4'
+```
 
-- `POST /seed?ref=<wallet>` where wallet is `0x…`, `name.eth`, `tz1…`, or
-  `name.tez`. Enumerates the wallet's NFTs, pins every IPFS ref onto the box,
-  and warms the Arweave cache. Returns `202` with a job immediately.
-- Poll `GET /seed/{id}` for counts (`tokens`, `pinned`, `recovered`, `warmed`,
-  `captured`, `skipped`, `failed`); `GET /seed` lists all jobs since the last
-  restart.
-- `recovered` = CIDs whose IPFS providers are gone but whose bytes were
-  re-fetched from an HTTP copy (the gateway URL in the token metadata),
-  re-added, and pinned — only accepted when the hash round-trips to the same
-  CID. `failed` therefore means: no IPFS provider AND no faithful HTTP copy.
-- `captured` = plain-HTTP media (no content address — the refs most likely to
-  vanish) archived into Kubo while the URL still answers, with provenance
-  (source, time, size, sha256, new CID) recorded on the box. Captured copies
-  are never served automatically; they exist so the operator *can* point a
-  dead ref at them later.
-- Failures: first 20 in the job's `errors`, complete record in the service
-  journal (`journalctl -u content-resolver` on the Curio host).
-- Re-running a seed is safe and cheap — pins are idempotent, so a second pass
-  just retries the failures. `limit=<n>` runs a partial/test seed.
-- `scope=published` (Tezos only) seeds what the wallet *first-minted* instead
-  of what it holds. Published works you no longer hold are the most rot-prone
-  corner of a collection — holdings-seeding never touches them.
-- `scope=created` (Tezos only) seeds what the wallet *authored*
-  (`creators`/`authors` metadata) — the robust version of the published sweep,
-  without the collected-fxhash noise. Fully-burned creations are skipped unless
-  `include_burned=1` (they were destroyed on purpose).
-- `scope=contract` seeds every token of one token contract, both chains
-  (`ref` must be the literal `0x…`/`KT1…` contract address). This is the ETH
-  publication sweep: name the contract the works were minted on.
+`POST /keep?ref=...` returns only after its source-appropriate promotion:
 
-## Store bytes on the box
+- IPFS pins the canonical DAG in Kubo and seeds it.
+- Arweave hydrates the private retained r81 Core and verifies native retention.
+  It is not an AR.IO r81 pin API or new Arweave replication.
+- HTTP, `data:`, and uploads promote the existing Curio static object.
 
-- `POST /store` (multipart, REST only — binary doesn't travel over MCP):
-  `curl -F file=@master.mp4 'http://<curio-ip>:8090/store'` streams the file
-  into the box's Kubo, pinned, CIDv1, and records provenance (filename, size,
-  sha256, content type, time) in the capture ledger. Returns `cid`,
-  `resolved_url`, and the provenance fields.
-- Storing bytes serves nothing by itself: a stored CID matters only once an
-  override points a dead ref at it. That separation is deliberate.
-- **Canonical recovery:** add `?expect_cid=<the dead CID>` and the box pins
-  the bytes only if they reproduce that exact CID (`409` otherwise). A match
-  resurrects the original CID — it now has a provider again, and NO override
-  is needed for that ref at all.
-- A `413` means the file exceeds the single-body cap; raise
-  `RESOLVER_SEED_RECOVER_MAX_BYTES` on the box if the master really is that big.
+`GET /resolve?ref=...&pin=1` is an authenticated convenience action. For IPFS
+it schedules a background pin and reports `keep_state: "pending"`; that is not
+proof it completed. Static and Arweave promotions report their result in the
+response. Do not use `pin=1` for runtime HTML: it remains `live-dependent`.
 
-## Repair a dead work (override registry)
+Favorites are also explicit curator intent:
 
-When a work's canonical media is gone — a CID with no providers, a minted URL
-on a dead domain — the operator can point the dead ref at replacement content.
-Substitution is never silent: resolve results carry `substituted: true`, the
-dead `substituted_ref`, and a provenance tier.
+```text
+POST   /favorites?ref=<reference>&note=<optional>
+DELETE /favorites?ref=<reference>
+```
 
-1. Confirm it's dead: `GET /resolve?ref=…` → `resolved: false` (or a
-   `resolved_url` that serves nothing).
-2. Get the replacement bytes onto the box: `POST /store` for a local file
-   (use the returned `cid` as `ipfs://<cid>`), or skip if already pinned.
-3. Record the override — `add_override` tool or
-   `POST /override` with JSON `{ref, replacement, status, token?, source?,
-   captured?, note?}`. `ref` matches ANY spelling of the same content
-   (ipfs://CID, /ipfs/CID, gateway URLs, ar://txid, arweave.net). Pick the
-   honest `status`: `canonical-recovered` (bytes reproduce the recorded CID),
-   `captured-original` (fetched from the canonical URL while it answered),
-   `operator-attested` (no hash ever existed; operator stands behind the
-   copy), `alternate-master` (different bytes, e.g. a platform HR master).
-   Record `token` (e.g. CAIP-19), `source`, and `note` — provenance is the
-   point. A duplicate ref returns 409 unless `replace: true`.
-4. Verify: `GET /resolve?ref=<the dead ref>` → `substituted: true` and a
-   playable `resolved_url`. The POST response's `replacement_resolved` field
-   already told you whether the replacement resolves.
-5. Inspect or snapshot the registry: `GET /override` (JSON) or
-   `GET /override?raw=1` (the TOML file verbatim). The on-box file is the
-   source of truth and is machine-managed — hand edits work but comments
-   don't survive API writes. `remove_override` / `DELETE /override?ref=…`
-   sends a ref back to resolving (i.e. failing) as itself.
+A favorite promotes a final static or Arweave artifact immediately, schedules
+an IPFS pin, and does not make an HTML runtime preserved. Removing a favorite
+does not release bytes.
 
-## Favorites (the household's picks)
+## Wallet discovery and seeding
 
-- `GET /favorites` — the browse list, resolved and ready to play: each entry
-  carries `ref`, `title`, `note`, `added_at`, plus a live `resolved_url` and
-  `playback_method` — hand `resolved_url` straight to a renderer, no separate
-  `/resolve` call needed. `resolved: false` marks a pick whose content is
-  currently unreachable.
-- `POST /favorites?ref=<anything>&note=…` — mark a favorite; `ref` accepts any
-  spelling (ipfs://, gateway URL, ar://…) and respellings of the same content
-  count as one favorite (duplicate → `409`). An HTTP/data favorite promotes
-  its exact static artifact; an IPFS favorite schedules a pin (completion is
-  not claimed until pin success). Arweave warming is cache evidence only, not
-  selected-object retention. Browsing/resolving alone never pins.
-- `DELETE /favorites?ref=…` — unmark it (any spelling matches); nothing is
-  unpinned or deleted.
-- MCP: `list_favorites`, `add_favorite(ref, note?)`, `remove_favorite(ref)`.
+`GET /wallet?ref=<wallet>` reads live inventory. `ref` accepts `0x...`,
+`name.eth`, `tz1...`, or `name.tez`; use `scope=held|published|created|contract`
+as supported by the chain. Ethereum mainnet discovery uses Blockscout/BENS;
+Tezos mainnet uses TzKT. `published` is Tezos first-mint history, not authorship;
+`created` is Tezos creator/author metadata. Ethereum has no keyless creator
+index. Other chains are not supported for wallet discovery.
 
-## Library status
+Start an authenticated whole-wallet keep job with:
 
-- `GET /library` (MCP: `library_status`) — what the box actually holds, plane
-  by plane: IPFS pin count and repo footprint, warmed Arweave txids checked
-  live against the gateway cache, and override/favorite/capture counts
-  (`null` = that subsystem is disabled).
-- Durability is asymmetric: IPFS pins survive GC, but the ar-io cache is
-  evictable — `currently_cached` < `known_warmed` means evictions; re-seed or
-  resolve with `pin=1` to re-warm.
+```bash
+curl -X POST -H 'Authorization: Bearer YOUR_TOKEN' --get \
+  'https://curio.example/seed' \
+  --data-urlencode 'ref=name.eth' \
+  --data-urlencode 'scope=held'
+```
 
-## Health
+It returns `202` and a job id; poll `GET /seed/<id>` or list `GET /seed`.
+Seeding pins IPFS final artifacts, keeps Arweave final artifacts through the
+retained plane, and promotes ordinary HTTP/data final artifacts in static
+storage. It does not move ordinary bytes into Kubo. Job history is in memory;
+kept media survives restart, job status does not.
 
-- `GET /healthz` — reachability of the box's own IPFS and Arweave gateways.
+## Uploads, overrides, and status
+
+Upload an operator-supplied static file:
+
+```bash
+curl -X POST -H 'Authorization: Bearer YOUR_TOKEN' \
+  -F 'file=@master.mp4' 'https://curio.example/store'
+```
+
+`POST /store` returns `id`, `media_url`, SHA-256 integrity, and
+`source_kind: "upload"`; it stores the file as kept Curio static media. It does
+not produce a CID and has no `expect_cid` parameter. Adding an upload does not
+make it a replacement by itself.
+
+Manage a disclosed replacement with authenticated `POST /override` (JSON body
+with `ref`, `replacement`, and `status`) or `DELETE /override?ref=...`.
+Statuses are `canonical-recovered`, `captured-original`, `operator-attested`,
+and `alternate-master`. A replacement is never silent.
+
+`GET /library` separates Kubo pin status, retained Arweave records, ordinary
+Arweave cache diagnostics, and operator records. Cache is not keep. `/healthz`
+reports backend health plus conservative participation evidence; AR.IO public
+reachability can honestly be `unknown`.
+
+## Origin and MCP
+
+Connect streamable HTTP MCP at `/mcp`. MCP mutation tools take the curator
+token as `curator_token`; REST uses the bearer header. Direct HTTP URLs derive
+from the request origin. `CURIO_PUBLIC_BASE_URL` is the fallback for non-request
+MCP/proxy deployments. Forwarded headers are not trusted or consumed at this
+revision, so do not assume a `CURIO_TRUSTED_PROXY_HEADERS` setting exists.

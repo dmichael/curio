@@ -11,7 +11,7 @@
   GET  /favorites                -> the household's favorites (browse/pick)
   POST /favorites?ref=&note=     -> add a favorite (any spelling of the ref)
   DELETE /favorites?ref=         -> remove a favorite
-  POST /store                   -> multipart upload -> Kubo (pinned) + provenance
+  POST /store                   -> multipart upload -> Curio static storage + provenance
   GET  /library                 -> cross-plane library status (pins, warm cache, registry)
   GET  /skill[/<name>]          -> agent instructions + shipped skills, self-served
   GET  /healthz                 -> on-box gateway reachability

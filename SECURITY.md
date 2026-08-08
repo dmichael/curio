@@ -2,29 +2,48 @@
 
 ## Deployment boundary
 
-Curio 0.1 is intended for a trusted private network. It does not provide
-accounts, authentication, authorization, TLS, or CSRF protection.
+Curio can be placed behind a private-network or internet-facing front door; a
+network boundary is not authorization. Its one public HTTP origin is port
+`8090`, which serves REST, MCP, static media, and proxied IPFS/Arweave paths.
+Kubo and the ordinary and retained AR.IO planes are internal Compose services.
+Kubo swarm `4001/tcp` and `4001/udp` are separately published for IPFS
+participation, not for Curio administration.
 
-Anyone who can reach the resolver on port 8090 can start seed jobs, pin content,
-upload files, change favorites, and edit the override registry. The IPFS and
-Arweave gateways are also reachable on ports 8080 and 3000. Keep all three
-ports behind a host or network firewall and do not forward them from an
-internet-facing router.
+Read-only resolver and media routes may be public. Every mutation requires a
+bearer token: `POST /keep`, `POST /seed`, `POST /store`, mutable favorites and
+overrides, and `pin=1` actions on `/resolve` or `/wallet`. The installer writes
+a random `CURIO_CURATOR_TOKEN` to
+`$XDG_CONFIG_HOME/curio/curio.env`; protect that file (mode 0600) and send it
+as `Authorization: Bearer <token>`. An empty resolver token disables mutations.
 
-Curio follows user- and metadata-supplied HTTP URLs. It rejects literal private,
-loopback, and link-local addresses, but it does not currently pin DNS results or
-revalidate every redirect target. Treat its outbound HTTP access as trusted-LAN
-functionality, not as an isolation boundary. Do not run Curio on a network where
-untrusted users can submit requests or control NFT metadata without accepting
-that risk.
+Terminate TLS at a trusted front door or proxy. Direct requests derive returned
+Curio URLs from their request origin. `CURIO_PUBLIC_BASE_URL` can set an
+external origin for a proxy deployment or non-request MCP invocation. This
+revision does **not** trust `Forwarded` or `X-Forwarded-*` headers, despite the
+target model requiring an explicit trusted-proxy mode. Do not assume those
+headers change returned URLs.
 
-The appliance also contacts public IPFS, Arweave, Blockscout, BENS, TzKT, and
-configured recovery gateways. Their availability and privacy policies are
-outside Curio's control.
+Curio follows user- and metadata-supplied HTTP URLs. It resolves DNS before
+connecting, rejects prohibited address ranges, pins the connection to a checked
+address, and validates every redirect target. Body-size, redirect, concurrency,
+and timeout limits apply. Treat this as defense in depth: run the resolver with
+only the outbound access appropriate to its curator workload and keep Docker,
+Curio, and its dependencies updated.
+
+Kept IPFS content is pinned and Kubo is configured to participate. Kept
+Arweave content uses an isolated retained r81 Core and remains served through
+Curio's AR.IO path. Neither is proof of public reachability: `/healthz` reports
+Kubo evidence conservatively and AR.IO reachability as unknown where r81 has no
+probe. AR.IO retention is not an r81 pin API and does not create new Arweave
+replicas.
+
+The appliance contacts public IPFS peers/gateways, AR.IO upstreams, Blockscout,
+BENS, and TzKT as needed. Their availability, privacy practices, and returned
+content are outside Curio's control.
 
 ## Reporting a vulnerability
 
-Please use GitHub's private vulnerability reporting for this repository:
+Use GitHub's private vulnerability reporting:
 
 <https://github.com/dmichael/curio/security/advisories/new>
 
@@ -33,5 +52,5 @@ impact. Do not open a public issue for an unpatched vulnerability.
 
 ## Supported versions
 
-Until the first tagged release, only the current `main` branch receives
-security fixes. This policy will be updated when release branches exist.
+Until a tagged release is published, security fixes apply to the current `main`
+branch. This policy will be revised when release branches exist.

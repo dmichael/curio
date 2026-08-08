@@ -14,13 +14,9 @@ cpus: 4
 memory: 6GiB
 disk: 60GiB
 
+# Curio has one public HTTP origin. Kubo swarm is intentionally not forwarded
+# to the host; qualification checks its guest host binding directly.
 portForwards:
-  - guestPort: 3000
-    hostPort: 13000
-    static: true
-  - guestPort: 8080
-    hostPort: 13080
-    static: true
   - guestPort: 8090
     hostPort: 13090
     static: true

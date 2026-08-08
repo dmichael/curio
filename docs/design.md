@@ -1,183 +1,110 @@
-# Curio — design
+# Curio design
 
-**Target host:** a small always-on Linux machine on a trusted LAN. The reference
-resource class is four ARM64 cores, 4 GB RAM, and roughly 100 GB of storage.
+## Contract
 
-## What it is
+Curio turns a reference into locally hosted media:
 
-Curio gives renderers one local endpoint for IPFS, Arweave, NFT metadata, and
-ordinary media URLs. The resolver returns a playable URL; Kubo and AR.IO serve
-the bytes. This keeps resolution logic out of clients and routes
-content-addressed media through local pins and caches.
+```text
+reference -> work -> source-appropriate local hosting -> Curio URL
+```
 
-Curio's library is the Kubo pin set plus explicit Arweave warm records and
-operator state. Wallet lookup helps choose content, but Curio does not maintain
-a marketplace-style catalog. `/wallet` reads public indexers live, and `/seed`
-adds content only when asked.
+Every successful resolution returns `media_url` on the Curio origin. It never
+calls an upstream URL a successful playable result. One public origin routes
+`/ipfs/...` to Kubo, `/arweave/...` to AR.IO, and `/media/...` to Curio's static
+store. Internal service names and ports do not appear in consumer responses.
 
-## The three planes
+## Storage planes and retention
 
-The appliance runs three public-facing services:
+Curio does not flatten every work into IPFS.
 
-- **Kubo**: IPFS gateway on `:8080`; its RPC API on `:5001` is private to the
-  Compose network.
-- **AR.IO**: Arweave gateway and cache on `:3000`; observer work is disabled.
-- **Resolver**: FastAPI service on `:8090` for resolution, preservation jobs,
-  operator state, OpenAPI, skills, and MCP.
+- **IPFS:** resolution uses Kubo's cache and serving keeps the original
+  CID/path. Explicit keep pins the canonical DAG in Kubo, which is Curio's
+  IPFS contribution to the network.
+- **Arweave:** ordinary reads use the evictable r81 Core data plane. Explicit
+  keep records `pending`, hydrates a private retained r81 Core with independent
+  persistent state, verifies a second native cache hit, then records `kept`.
+  Kept paths route only to that retained Core; an unavailable retained plane is
+  degraded, not silently replaced with ordinary-cache bytes. This is isolated
+  native retained-plane operation, not an AR.IO r81 pin API and not new
+  replication in the Arweave storage network.
+- **HTTP, `data:`, and uploads:** Curio stores and serves bounded static files
+  under `/media/<id>`, with a SHA-256 record. They never enter Kubo implicitly.
+  Cross-protocol publication would need an explicit curator action and a new
+  identity; it is not implemented by the current API.
 
-### Why resolution belongs on the box, not in clients
+`cached` and `kept` are different states. Resolution may cache media. Explicit
+keep, favorite intent, an operator upload, or a seed promotes the final artifact
+on its own plane. Runtime HTML is `live-dependent`: capturing one response does
+not preserve dependencies, workers, APIs, or origin behavior, so keep refuses
+it rather than making a preservation claim.
 
-Client-side resolution logic normalizes references to *public* gateways, bypassing
-the box's own pins and cache, and every client has to re-learn the same quirks.
-Moving it onto Curio:
+## Resolver behavior
 
-- points every fetch at the box's local gateways, so the pins and cache are used;
-- gives one stable origin any consumer can call;
-- lets device-control clients shrink to pure device control.
+Curio recognizes IPFS and gateway spellings, Arweave transaction/manifest
+paths, HTTP(S), `data:` URIs, token metadata, UnixFS wrappers, and Verse
+artwork pages. Metadata recursion selects animation/artifact fields first and
+otherwise chooses the largest probeable image candidate. Bare CID responses may
+add a filename hint for renderers such as the Feral File FF1 that infer playback
+from URL suffixes. Static media uses `play`; HTML uses `send`.
 
-### API
+A direct HTTP media response is fetched with SSRF checks, copied into static
+storage, and returned as a Curio URL. A direct `data:` media response is decoded
+into the same store. Source bytes are not returned as a success until Curio can
+serve them locally. A failed resolution says why.
 
-- `GET /resolve?ref=<anything>` → JSON `{resolved_url, playback_method, title,
-  provider, content_type}`. Pure resolution, no bytes; `resolved_url` is a
-  box-local gateway URL the consumer fetches directly. When the override
-  registry substituted a replacement, the response additionally carries
-  `substituted: true`, `substituted_ref` (the dead canonical ref), and
-  `substitution_status` (the provenance tier).
-- `GET /c?ref=` → 302 to the resolved media (for dumb renderers); 422 when
-  resolution failed.
-- `GET /wallet?ref=` → live, normalized NFT inventory of a wallet (browse/pick).
-  `scope=held|published|created|contract`: holdings; first-minted Tezos works;
-  Tezos works attributed through creator metadata; or every token from one
-  literal contract address. Contract scope is available on both supported
-  chains.
-- `POST /seed?ref=<wallet>` → background job: pin every IPFS ref the wallet's
-  NFTs carry, warm the Arweave cache, recover vanished content from HTTP copies
-  when the bytes round-trip to the same CID. Takes the same `scope` as
-  `/wallet` — published works no longer held are what holdings-seeding misses.
-- `GET/POST/DELETE /favorites` → the household's favorites: a tiny JSON file of
-  operator state on the box, keyed by canonical ref so any spelling of the
-  same content matches. Owner-curated state in the same spirit as the override
-  registry — a handful of explicit picks, not the forbidden index.
-- `GET /library` → cross-plane library status: IPFS pin/repo counts, warmed
-  Arweave txids live-checked against the cache, operator-state counts.
-- `GET /healthz` → gateway reachability + deployed version.
-- Self-documentation: `GET /skill` (agent instructions, served by the service),
-  `/openapi.json` + `/docs` (schema), `/mcp` (the same capabilities as MCP tools
-  over streamable HTTP).
+The current resolver does not accept a chain contract/token pair as `/resolve`
+input or query a chain RPC for its token URI.
 
-### Reference types
+## Curation, provenance, and chains
 
-| Input | Resolves to |
-|---|---|
-| `ipfs://CID/path`, `/ipfs/CID`, `https://<any-gw>/ipfs/CID`, `https://<cid>.ipfs.<any-gw>/path` | box IPFS gateway URL (+ filename hint if bare) |
-| `ar://txid[/path]`, `https://arweave.net/txid[/path]` | box Arweave gateway URL (path manifests: the path is part of the identity) |
-| UnixFS directory CID | descend into the largest child and recurse |
-| tokenURI (http/ipfs/arweave JSON) | animation/artifact field, else largest image by Content-Length probe → recurse |
-| `data:application/json[;base64],…` (on-chain tokenURI) | decode inline metadata → recurse; other `data:` media passes through |
-| Verse artwork page (`verse.works/artworks/...`) | scrape tokenUri / iframeUrl / og:image → recurse |
-| direct media URL | passthrough |
-| ENS / wallet / tx / contract+tokenId | chain lookup → tokenURI → recurse — **not built: needs an RPC/indexer path chosen for the service** (input syntax: CAIP-19, with `tezos/fa2` as a documented local extension — CASA registers no Tezos asset namespace) |
+`/wallet` reads live public indexers; it is discovery, not an ownership,
+authorship, or authenticity oracle. `/seed` is an authenticated background job
+that keeps final artifacts source-appropriately. Ethereum mainnet uses
+Blockscout/BENS for ERC-721/ERC-1155 holdings, ENS, and contract listings.
+Tezos mainnet uses TzKT for FA2 holdings, `.tez` names, first-minted,
+creator-attributed, and contract listings. Tezos `published` is first-minter
+history, not authorship; `created` uses creator/author metadata. Ethereum has
+no reliable keyless creator index.
 
-### Renderer fixups the resolver owns
+An override maps a dead canonical reference to an operator-selected replacement
+and is always disclosed as `substituted` with a provenance status:
+`canonical-recovered`, `captured-original`, `operator-attested`, or
+`alternate-master`. A wallet is discovery context, not proof of creator or
+canonical bytes.
 
-Learned from driving a real FF1; harmless to other consumers:
+## Network, trust, and participation
 
-- **Bare CID → iframe bug:** renderers that sniff the file extension from the URL
-  fall back to iframe rendering for extension-less URLs. Probe the internal
-  gateway's Content-Type and append `?filename=art.<ext>`.
-- **Directory-wrapped media:** Kubo answers a directory HEAD with 200 and no
-  Content-Type; list the directory and descend rather than serving the listing.
-- **Largest image variant:** metadata field names (`image` vs `image_url`) do not
-  reliably indicate the full-size asset — probe Content-Length and pick the biggest.
-- **Playback method:** `send` for live HTML works (load as a page), `play` for
-  static media. Inferred from probed content type, falling back to URL shape.
-- **mDNS:** some renderers (the FF1 included) cannot resolve `.local` names —
-  resolved URLs always use the host's LAN IP.
+The Compose graph has one HTTP ingress, resolver port `8090`; Kubo, ordinary
+AR.IO Core, retained AR.IO Core, Redis, and Envoy gateway/admin interfaces are
+private. Kubo swarm `4001/tcp` and `4001/udp` are published for native IPFS
+participation. Kubo and AR.IO are enabled by default. `/healthz` distinguishes
+backend health from participation evidence: advertised Kubo addresses are not
+an inbound reachability probe, and r81 exposes no equivalent AR.IO reachability
+fact, so both can honestly remain `unknown`.
 
-## Dead works: the override registry and seed capture
+Read-only routes may be public. Mutations require the curator bearer token:
+keep/pin, seed, upload, favorite changes, and override changes. Source fetching
+checks literal addresses, DNS results, and each redirect target before
+connection, then applies bounded body, concurrency, and timeout limits.
 
-The purist path — resolve the token's recorded reference, serve bytes that
-verify against it — fails for works whose canonical media is genuinely gone:
-CIDs with no providers and no faithful HTTP copy, and above all works minted
-against ordinary URLs (no content hash) on domains that later died. Two
-mechanisms cover this, deliberately kept apart:
+For direct HTTP, the origin is derived from the request. A proxy deployment can
+set `CURIO_PUBLIC_BASE_URL` for its external origin. Forwarded-header trust is
+not implemented at this revision; `CURIO_TRUSTED_PROXY_HEADERS` is not a
+supported setting. The target model calls for opt-in trusted proxy handling, so
+this is an implementation gap rather than an implied security feature.
 
-**The override registry** (`overrides.py`, a TOML file, mtime-reloaded) maps a
-dead canonical *ref* to a replacement ref. It is keyed by reference, not by
-token, because dead refs are usually discovered mid-recursion — the metadata
-still resolves, its `animation_url` is dead — and because every entry point
-(token, tokenURI, raw CID, gateway URL) funnels through the same recursive
-resolver. Any spelling of the same content matches. Entries carry a provenance
-tier: `canonical-recovered` (bytes reproduce the CID), `captured-original`
-(fetched from the canonical URL while it answered, provenance recorded then),
-`operator-attested` (no hash ever existed; the operator stands behind a local
-copy), `alternate-master` (different bytes, e.g. a platform HR master).
-Substitution is never silent: responses carry `substituted`,
-`substituted_ref`, and `substitution_status`, so a renderer just plays the
-work while an archival consumer sees exactly what it got.
+## Operations
 
-This is not the index the posture forbids: an override is non-derivable owner
-knowledge — "the bytes at this dead URL are these bytes" exists nowhere else.
-The registry holds only exceptions, stays human-readable, and is expected to
-number in the dozens.
+The supported source install is per-user and no-sudo. It uses
+`$XDG_CONFIG_HOME/curio/curio.env`, `$XDG_DATA_HOME/curio/app/releases`, and
+`$XDG_DATA_HOME/curio/state` by default. The state tree contains Kubo data,
+ordinary and retained AR.IO state, static media, and operator records; back up
+those actual paths.
 
-The registry is managed live over the API: full CRUD on `/override` (REST)
-and `list/add/remove_override` (MCP), plus `POST /store` to put replacement
-bytes into Kubo — pinned, CIDv1, provenance appended to the capture ledger —
-before an override references them. The on-box TOML file is the source of
-truth. Hand edits still work through mtime reload, but API writes regenerate
-the file, so hand-written comments do not survive them. Snapshot it with
-`GET /override?raw=1`.
-
-**Seed capture** (`seed_capture_dir`) is the insurance that makes the worst
-tier avoidable in the future: `/seed` archives unhashed plain-HTTP media into
-Kubo *while the URL still answers*, recording source URL, capture time, size,
-sha256, and the new CID in `captures.jsonl`. Captured copies are never served
-automatically — promoting one into the registry (as `captured-original`) is an
-operator decision. Resolution and preservation stay separate actions.
-
-## Trust model
-
-Curio 0.1 assumes a trusted LAN and has no authentication or TLS. It limits
-accidental amplification but is not an isolation boundary:
-
-- **Seeding is admission-controlled:** duplicate wallet jobs coalesce, at most
-  `seed_max_active` jobs run at once, each job has a wall-clock cap, and job
-  history is bounded.
-- **Fetches are bounded:** any body the resolver buffers (metadata, scraped
-  pages, directory listings) is capped by `fetch_max_bytes`; recovery and
-  capture downloads are capped by `seed_recover_max_bytes`.
-- **Internal targets are refused** in user- and metadata-supplied URLs: literal
-  private/loopback/link-local IPs and `localhost` are rejected before any fetch
-  or probe. The box's own gateways are exempt (fetching them is the point).
-
-DNS names resolving to private addresses and redirect chains are not
-revalidated. Anyone who can reach the resolver can seed content, upload bytes,
-and rewrite operator state. `/c` can redirect to external URLs. These are
-constraints of the trusted-LAN design, not protections against hostile input.
-See [the security policy](../SECURITY.md) before deployment.
-
-## Optional deep-archive peer
-
-Curio is fully self-contained: public networks are its only required
-upstream. A site that also runs a larger curated archive node can make it the
-Curio's fast path — protect the connection with Kubo's `Peering.Peers` (the
-connection manager prunes unprotected peers under pin load, and server-profile
-nodes neither announce their LAN addresses nor answer mDNS), and point AR.IO's
-trusted gateway at it. That is deployment-site configuration and lives outside
-this repo; nothing here knows about any particular archive host.
-
-## Open decisions
-
-- **Serve vs redirect:** consumers fetch the raw gateway URL directly (resolver
-  in the metadata path only); `/c` exists for renderers that need a redirect.
-  Keeping Python out of the byte path is the default.
-- **AR.IO weight:** a full ar-io-node is heavy for a pure cache; a lightweight
-  Arweave proxy+cache inside the resolver may replace it if memory pressure bites.
-  The cache is also evictable and has no inventory API, so the box keeps its own
-  ledger of deliberately-warmed txids (`warmed.jsonl`, beside the capture ledger)
-  and `/library` live-checks each entry via the gateway's `X-Cache` header —
-  warmed is honestly weaker than pinned, and eviction is visible, not silent.
-- **Not built: chain lookups.** ENS/wallet/tx/contract resolution in the
-  resolve path needs an RPC/indexer path chosen for the *service* (the seeding
-  surface already uses keyless public indexers: Blockscout/BENS and TzKT).
+`curio version`, `curio update --check`, `curio update`, and
+`curio update --version vX.Y.Z` exist as operator commands. The installer uses
+an atomic `current` release symlink and restores the prior graph after failed
+health. The remote bootstrap verifies a release archive checksum before running
+it, but no release asset is currently published and the source-install update
+path does not yet fetch/select verified releases. Operators must not infer an
+automatic or already-available release updater.

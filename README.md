@@ -1,135 +1,152 @@
 <h1 align="center">Curio</h1>
 
-<p align="center"> <strong>Keep the media behind your NFTs available.</strong> </p>
+<p align="center"><strong>Keep the media behind your NFTs usable.</strong></p>
 
-<p align="center"> <a href="#install">Install</a> &bull; <a href="#resolution-coverage">Resolution</a> &bull; <a href="#chain-coverage">Chains</a> &bull; <a href="docs/design.md">Design</a> &bull; <a href="SECURITY.md">Security</a> </p>
+<p align="center"><a href="#install">Install</a> &bull; <a href="#resolution-coverage">Resolution</a> &bull; <a href="#chain-coverage">Chains</a> &bull; <a href="docs/design.md">Design</a> &bull; <a href="SECURITY.md">Security</a></p>
 
-<p align="center"> <a href="https://github.com/dmichael/curio/actions/workflows/ci.yml"> <img src="https://github.com/dmichael/curio/actions/workflows/ci.yml/badge.svg" alt="CI" /> </a> <a href="LICENSE"> <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /> </a> </p>
-
-Curio finds the media behind your NFTs and gives players on your network one place to ask for it. Give Curio a wallet, metadata document, or media reference and it finds the image, video, audio, or HTML work behind it.
-
-Use Curio to keep selected works available and to repair dead media references with explicit, provenance-labelled replacements. Browsing does not add anything to the library.
+Curio resolves a wallet, metadata document, or media reference into media served
+from one Curio origin. It follows the reference, uses the backend appropriate to
+the final work, and returns a Curio URL rather than an upstream gateway URL.
 
 ## Install
 
-You need a Linux host with Docker Engine and the Docker Compose plugin. Give the host a stable LAN address, preferably with a DHCP reservation.
+Curio is a per-user Linux appliance. It needs Docker Engine and the Docker
+Compose plugin available to that user; it does not use `sudo`, configure a LAN
+address, install Docker, or change firewall rules.
+
+There is not yet a published Curio release asset at the GitHub release URL.
+Until release assets exist, install this checkout as the intended user:
 
 ```bash
-# Optional: uncomment to skip the LAN address prompt.
-# export CURIO_LAN_ADDRESS=192.168.1.50
-
-curl -fsSL https://github.com/dmichael/curio/releases/latest/download/install.sh | bash
+git clone https://github.com/dmichael/curio.git
+cd curio
+./appliance/install.sh
 ```
 
-The bootstrap downloads the latest release archive, verifies its published SHA-256 checksum, and asks for `sudo` only when the system install begins. Set `CURIO_VERSION=vX.Y.Z` before running it to install a specific release.
+The source installer creates configuration at
+`$XDG_CONFIG_HOME/curio/curio.env` (default `~/.config/curio/curio.env`),
+immutable application copies below `$XDG_DATA_HOME/curio/app/releases`, and
+state below `$XDG_DATA_HOME/curio/state`. `CURIO_APP_ROOT` and
+`CURIO_DATA_ROOT` can select other absolute, non-root locations before the
+first install.
 
-Configuration is kept in `/etc/curio/curio.env` and state in `/var/lib/curio`. The installer is safe to rerun after an update or interrupted install. It does not install Docker or change the host firewall.
+The future release bootstrap is
+`https://github.com/dmichael/curio/releases/latest/download/install.sh`. It
+verifies `curio-appliance.tar.gz.sha256` before running the archived installer,
+but cannot succeed until a release publishes those assets. Do not treat that
+URL as an available installer today.
 
 ```bash
 curio status
 curio health
 curio logs resolver --follow
+curio version
+curio update --check
+curio update
+curio update --version vX.Y.Z
 ```
+
+`curio update` is operator-invoked and the installer rolls back `current` when
+the replacement graph fails health. The checked-in/source installer does not
+yet fetch or select verified release artifacts; `update --check` depends on a
+published `VERSION` file and `update --version` is not a release selector yet.
+Use a verified release bootstrap only once release assets are published.
 
 ## Resolution coverage
 
-In Curio, **resolution** means following a reference until it reaches the actual media, then returning a playable URL. Curio stays out of the media path; the player fetches the bytes from the IPFS gateway, Arweave gateway, or original HTTP source.
+A successful `/resolve` response includes `media_url` (also exposed as the
+legacy `resolved_url`) on the Curio origin that handled the request. Curio
+proxies native paths through that origin and serves ordinary bytes from its own
+static store.
 
-| Input | What Curio does |
+| Input | Resolution and serving |
 |---|---|
-| `ipfs://CID/path` | Returns the same content through the local IPFS gateway |
-| `/ipfs/CID` and IPFS gateway URLs | Extracts the CID and rewrites the URL to the local gateway |
-| IPFS JSON metadata | Follows animation or artifact fields, then chooses the largest image candidate |
-| UnixFS directory | Lists the directory and resolves its largest media file |
-| `ar://txid/path` | Returns the transaction or manifest path through the local Arweave gateway |
-| `arweave.net/txid/path` | Rewrites the reference to the local Arweave gateway |
-| HTTP(S) media URL | Returns the source URL with playback and content-type hints |
-| HTTP(S) JSON metadata | Reads the metadata and follows its media reference |
-| `data:application/json,...` | Decodes on-chain metadata and resolves its media |
-| other `data:` media | Returns the self-contained URI directly |
-| `verse.works/artworks/...` | Follows the page's token URI, interactive iframe, or original artwork image |
+| `ipfs://CID/path`, `/ipfs/CID`, or gateway URL | Keeps the CID/path identity and serves `/ipfs/CID/path` through Kubo |
+| IPFS JSON metadata or UnixFS directory | Follows media fields or a small directory wrapper to the final IPFS artifact |
+| `ar://txid/path` or `arweave.net/txid/path` | Keeps the transaction/manifest path and serves `/arweave/txid/path` through AR.IO |
+| HTTP(S) media | Fetches a bounded copy and serves `/media/<id>` from Curio static storage |
+| HTTP(S) JSON or `data:application/json` | Follows metadata to its final media artifact |
+| Other `data:` media | Decodes it into Curio static storage and serves `/media/<id>` |
+| `verse.works/artworks/...` | Follows token URI, iframe, or artwork image |
 
-Extensionless IPFS and HTTP references are probed for content type. HTML works use the `send` playback method; static media uses `play`. Operator overrides are checked at every metadata recursion step, so a dead nested media reference can be replaced without changing the token metadata.
+Resolution can populate an evictable cache. It does not keep a work. HTML
+runtime responses are marked `live-dependent`: saving the HTML shell does not
+preserve scripts, APIs, workers, or origin behavior.
 
-Curio does not currently accept a chain contract/token pair as a `/resolve` input or call a chain RPC to discover its token URI.
+## Keep and access control
+
+Keep is explicit and source-appropriate:
+
+- IPFS keep pins the canonical DAG in Kubo; Kubo then seeds it.
+- Arweave keep hydrates and verifies the private retained r81 Core plane. This
+  is not an AR.IO r81 pin API or a claim of new Arweave replication.
+- HTTP, `data:`, and uploads remain in Curio static storage; none enters IPFS
+  unless a future explicit publication operation says so.
+
+Use `POST /keep?ref=...` for synchronous keep, or `GET /resolve?ref=...&pin=1`
+for the existing convenience action. For IPFS that convenience action returns
+`keep_state: "pending"` and `pin_scheduled: true`; it is not completion
+proof. Arweave and static results report their completed or failed promotion.
+Wallet-wide retention is `POST /seed?ref=...`; it runs as a background job.
+
+Read-only resolver, media, library, health, and skill routes may be exposed
+publicly. Every mutation requires `Authorization: Bearer <CURIO_CURATOR_TOKEN>`:
+keep/pin, seed, upload, favorite changes, and override changes. The installer
+generates the token in `curio.env`.
+
+Examples (replace the origin and token):
+
+```bash
+curl --get 'https://curio.example/resolve' \
+  --data-urlencode 'ref=ipfs://bafy.../artwork'
+
+curl -X POST -H 'Authorization: Bearer YOUR_TOKEN' --get \
+  'https://curio.example/keep' \
+  --data-urlencode 'ref=ar://transaction-id'
+
+curl -X POST -H 'Authorization: Bearer YOUR_TOKEN' \
+  -F 'file=@master.mp4' 'https://curio.example/store'
+```
+
+OpenAPI is at `/openapi.json` and `/docs`; streamable HTTP MCP is at `/mcp`.
+The shipped agent instructions are at `/skill` and `/skill/nft-preservation`.
 
 ## Chain coverage
 
-Wallet and contract discovery currently covers two mainnets:
+Wallet and contract discovery covers two mainnets:
 
 | Chain | Sources | Supported inventory |
 |---|---|---|
-| Ethereum mainnet | Blockscout and BENS | ERC-721/ERC-1155 holdings, ENS names, and contract-wide token listings |
+| Ethereum mainnet | Blockscout and BENS | ERC-721/ERC-1155 holdings, ENS names, and contract-wide listings |
 | Tezos mainnet | TzKT | FA2 holdings, `.tez` names, first-minted works, creator-attributed works, and contract-wide listings |
 
-Ethereum creator or published-catalog lookup is not implemented because Curio does not have a reliable keyless authorship index for it. Curio also does not yet resolve a contract/token pair by querying a chain RPC directly; wallet inventory uses metadata returned by the public indexers above.
+Ethereum has no reliable keyless creator-attribution index. Curio also does not
+resolve a contract/token pair by querying a chain RPC directly. Other EVM
+networks, Solana, and other chains are not supported for wallet discovery.
 
-IPFS, Arweave, HTTP, and on-chain `data:` media references are otherwise chain-independent. Wallet discovery for other EVM networks, Solana, and other chains is not currently supported.
+## Network and provenance
 
-## Use
+Only port `8090` is Curio's public HTTP origin for REST, MCP, media, IPFS, and
+Arweave paths. Kubo and both ordinary and retained AR.IO native planes remain
+on the Compose network. Kubo additionally publishes swarm `4001/tcp` and
+`4001/udp` for participation.
 
-Find the media behind a reference:
+Direct HTTP requests derive returned URLs from the request origin. A reverse
+proxy must preserve the external Host/scheme or set `CURIO_PUBLIC_BASE_URL`.
+Forwarded headers are **not currently consumed**, so there is no trusted-proxy
+header opt-in at this revision; this remains a documented implementation gap.
 
-```bash
-curl --get 'http://192.168.1.50:8090/resolve' \
-  --data-urlencode 'ref=ipfs://bafy.../artwork'
-```
+`/healthz` reports backend reachability and participation evidence. Kubo and
+AR.IO are enabled by default, but neither a running daemon nor advertised
+addresses prove public reachability; AR.IO r81 currently reports that evidence
+as unknown.
 
-Find and keep one work:
-
-```bash
-curl --get 'http://192.168.1.50:8090/resolve' \
-  --data-urlencode 'ref=ar://transaction-id' \
-  --data-urlencode 'pin=1'
-```
-
-Inspect and seed a wallet:
-
-```bash
-curl --get 'http://192.168.1.50:8090/wallet' \
-  --data-urlencode 'ref=name.eth'
-
-curl -X POST --get 'http://192.168.1.50:8090/seed' \
-  --data-urlencode 'ref=name.eth'
-```
-
-Upload an operator-supplied file:
-
-```bash
-curl -F 'file=@master.mp4' 'http://192.168.1.50:8090/store'
-```
-
-On success, Curio returns the file's local CID and checksum. Curio will not use it as a replacement until the operator adds an override.
-
-OpenAPI documentation is available from a running resolver at `/docs`. The main endpoints are `/resolve`, `/wallet`, `/seed`, `/store`, `/override`, `/favorites`, `/library`, and `/healthz`; streamable HTTP MCP is mounted at `/mcp`.
-
-## State and provenance
-
-IPFS pins are the durable content library. Arweave payloads are cached and may be evicted, so Curio keeps a ledger of content it deliberately warmed.
-
-Overrides for dead references use one of four provenance statuses: `canonical-recovered`, `captured-original`, `operator-attested`, or `alternate-master`. Every substitution is disclosed in the resolver response.
-
-Back up both `/etc/curio` and `/var/lib/curio`. The IPFS store may contain unique uploaded or captured files, not only reproducible cache data.
-
-## Technical details
-
-The appliance publishes three services on the LAN:
-
-| Port | Service | Purpose |
-|---|---|---|
-| `3000` | Arweave gateway (AR.IO) | Fetch and cache Arweave content |
-| `8080` | IPFS gateway (Kubo) | Fetch and serve IPFS content |
-| `8090` | Curio resolver | REST, OpenAPI, skills, and MCP |
-
-The IPFS admin API and the Arweave gateway's internal services stay on the private Compose network.
-
-## Security
-
-Curio 0.1 assumes a trusted LAN and does not include authentication or TLS. Keep ports 3000, 8080, and 8090 behind your firewall and do not forward them from an internet-facing router. See [SECURITY.md](SECURITY.md) for the full deployment boundary and vulnerability-reporting process.
+Back up the actual XDG configuration and state paths. State includes Kubo pins,
+the static media store, operator records, and separate ordinary and retained
+AR.IO trees. Cache is not preservation; retained records and static/IPFS kept
+content must be backed up if their upstreams matter.
 
 ## Development
-
-The appliance installer is the supported deployment path. For resolver work:
 
 ```bash
 cd resolver
@@ -138,18 +155,16 @@ source .venv/bin/activate
 pip install -e '.[dev]'
 pytest
 ruff check .
+cd ..
+./appliance/tests/test-appliance.sh
+git diff --check
 ```
 
-The resolver requires Python 3.11 or newer. Settings use the `RESOLVER_` environment variable prefix; defaults are in [`resolver/src/resolver/config.py`](resolver/src/resolver/config.py).
-
-## Documentation
-
-- [Design and trust model](docs/design.md)
-- [Appliance specification](docs/appliance.md)
-- [Disposable-VM testing](docs/appliance-testing.md)
-- [Security policy](SECURITY.md)
-- [Contributing](CONTRIBUTING.md)
+See [docs/design.md](docs/design.md), [docs/appliance.md](docs/appliance.md),
+[docs/appliance-testing.md](docs/appliance-testing.md), and
+[SECURITY.md](SECURITY.md).
 
 ## License
 
-Curio's source is available under the [MIT License](LICENSE). The appliance pulls third-party components under their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Curio is available under the [MIT License](LICENSE). Third-party appliance
+components retain their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

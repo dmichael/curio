@@ -89,20 +89,15 @@ def _require_curator(token: str | None) -> None:
 async def resolve(
     ref: str, pin: bool = False, curator_token: str | None = None, ctx: Context = None
 ) -> dict[str, Any]:
-    """Resolve any media reference into a request-origin playable URL.
+    """Resolve a reference into a playable URL on the Curio origin.
 
-    Accepts ipfs://…, /ipfs/…, any gateway URL, ar://txid[/path],
-    arweave.net URLs, a tokenURI (JSON metadata, including on-chain data:
-    URIs), a verse.works artwork page, or a direct media URL. Returns
-    resolved_url (hand it to renderers EXACTLY as returned — query params
-    are functional), playback_method ('play' = static media, 'send' = load
-    as a web page), title, and content_type. resolved=false means the ref
-    was recognized but unresolvable; don't cast those. substituted=true
-    means the canonical content is gone and the operator's override registry
-    supplied a replacement — substitution_status is its provenance tier.
-    pin=true schedules an IPFS pin in the background; it is not completion
-    evidence. AR.IO r81 selected-object retention is unsupported, so Arweave
-    results report that state rather than pretending a cache warm is durable.
+    Accepts IPFS and Arweave spellings, metadata/data URIs, Verse pages, and
+    direct HTTP media. `media_url`/`resolved_url` is ready for a renderer;
+    `play` is static media and `send` is HTML. `resolved=false` means Curio
+    cannot serve a local artifact. `substituted=true` discloses an override.
+    pin=true requires curator_token: IPFS reports a background pending pin,
+    static media is promoted synchronously, and Arweave uses verified private
+    retained-Core hydration. Runtime HTML remains live-dependent.
     """
     result = await resolve_ref(ref, get_settings(), _require_client(), origin=_mcp_origin(ctx))
     payload = result.as_dict()
@@ -184,23 +179,14 @@ async def seed_wallet(
     ref: str, limit: int | None = None, scope: str = "held", include_burned: bool = False,
     curator_token: str | None = None,
 ) -> dict[str, Any]:
-    """Seed the box's caches from a wallet (background job).
+    """Start a source-appropriate wallet keep job (background).
 
-    Pins every IPFS ref the wallet's NFTs carry onto the box's Kubo, warms
-    the Arweave cache, recovers vanished content from HTTP copies when the
-    hash round-trips, and captures unhashed plain-HTTP media with provenance
-    (when enabled). Returns the job immediately; poll with seed_status.
-    Re-running is safe — pins are idempotent, so a second pass retries only
-    the failures. Use limit for a partial/test run. scope="published" (Tezos
-    only) seeds the works the wallet FIRST-MINTED rather than its holdings —
-    published works you no longer hold are the most rot-prone corner of a
-    collection, since holdings-seeding never touches them. scope="created"
-    (Tezos only) seeds what the wallet AUTHORED — creators/authors metadata,
-    the robust authorship index — dropping fully-burned creations unless
-    include_burned=true (they were destroyed on purpose). scope="contract"
-    seeds every token of a token-contract address (ref must be the literal
-    0x…/KT1… contract address, both chains) — the way to sweep a publication
-    contract on ETH, where no keyless creator index exists.
+    It pins final IPFS artifacts, keeps final Arweave artifacts through the
+    verified private retained Core, and promotes final HTTP/data artifacts in
+    Curio static storage. Ordinary bytes never enter IPFS implicitly. Poll
+    with seed_status. Re-running is safe; use limit for a partial run.
+    scope="published" and "created" are Tezos-only; "contract" accepts a
+    literal 0x…/KT1… contract on either supported chain.
     """
     _require_curator(curator_token)
     job = await start_seed(
@@ -258,10 +244,10 @@ async def add_override(
     decision, always disclosed in resolve results (substituted=true).
 
     ref matches ANY spelling of the same content (ipfs://CID, /ipfs/CID,
-    gateway URLs; ar://txid, arweave.net URLs). replacement should already be
-    pinned on the box — for a local file, upload it first via POST /store
-    (REST only; binary doesn't travel over MCP) and use the returned cid as
-    ipfs://<cid>. status is the provenance tier: 'canonical-recovered' (bytes
+    gateway URLs; ar://txid, arweave.net URLs). replacement must already
+    resolve through Curio — REST `POST /store` creates kept static media and
+    returns its `media_url`; binary upload is not an MCP tool. status is the
+    provenance tier: 'canonical-recovered' (bytes
     reproduce the recorded CID), 'captured-original' (fetched from the
     canonical URL while it answered), 'operator-attested' (no hash ever
     existed; operator stands behind the copy), 'alternate-master' (different
@@ -347,10 +333,10 @@ async def add_favorite(
     (enrichment only, never a gate — the response's `resolved` field says
     whether the ref resolves right now). Favoriting also makes the content
     durable where the source supports it: static records are promoted
-    synchronously and IPFS pinning is scheduled (`pin_scheduled=true`). AR.IO
-    selected-object retention is unsupported and is reported explicitly.
-    Removing a
-    favorite never unpins. Use note for why it was picked.
+    synchronously, IPFS pinning is scheduled (`pin_scheduled=true`), and
+    Arweave uses the retained Core synchronously. Runtime HTML remains
+    live-dependent. Removing a favorite never unpins. Use note for why it
+    was picked.
     """
     _require_curator(curator_token)
     favorites = _require_favorites()
@@ -410,19 +396,13 @@ async def health() -> dict[str, Any]:
 
 @mcp.tool()
 async def library_status() -> dict[str, Any]:
-    """What the box's library actually holds, plane by plane.
+    """What the box holds, plane by plane.
 
-    ipfs: `pinned` counts recursive pins on the box's Kubo — the durable
-    tier, immune to cache GC — plus the repo's size and object count.
-    arweave: `known_warmed` is every txid ever deliberately warmed through
-    the box's ar-io gateway (seed jobs);
-    `currently_cached` is how many of those the gateway reports as cache
-    HITs right now. The ar-io cache is EVICTABLE — warmed content can be
-    garbage-collected, and eviction shows as currently_cached <
-    known_warmed (a `note` flags it). Re-warm by re-seeding the wallet or
-    resolving the ref with pin=true. registry: counts of the operator's
-    overrides, favorites, and capture-ledger entries; null means that
-    subsystem is disabled on this box. Failures in one plane degrade to an
-    `error` field there instead of failing the whole call.
+    `ipfs.pinned` counts recursive Kubo pins. `arweave.retained` reports
+    pending/kept/failed private retained-Core identities and confirmed native
+    availability; it is not an r81 pin API. `known_warmed` and
+    `currently_cached` are separate, evictable ordinary-AR.IO diagnostics.
+    Registry counts cover operator state. A failed plane gets its own error
+    rather than failing the complete response.
     """
     return await _library_status(get_settings(), _require_client())
