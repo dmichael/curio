@@ -210,7 +210,9 @@ def _host_header(parsed) -> str:
 
 
 @asynccontextmanager
-async def _safe_stream(client: httpx.AsyncClient, method: str, url: str, settings: Settings):
+async def _safe_stream(
+    client: httpx.AsyncClient, method: str, url: str, settings: Settings, *, timeout: float | None = None
+):
     """Fetch external HTTP only through a DNS-pinned connection.
 
     HTTPS requests retain the original Host header and pass its hostname as
@@ -234,7 +236,9 @@ async def _safe_stream(client: httpx.AsyncClient, method: str, url: str, setting
             extensions = {"sni_hostname": parsed.hostname}
         else:
             request_url, headers, extensions = current, {}, {}
-        request = client.build_request(method, request_url, headers=headers, extensions=extensions)
+        request = client.build_request(
+            method, request_url, headers=headers, extensions=extensions, timeout=timeout
+        )
         response = await client.send(request, stream=True)
         if response.status_code not in {301, 302, 303, 307, 308}:
             break
@@ -271,7 +275,10 @@ def _fetch_allowed(url: str, settings: Settings) -> bool:
 
 async def _bounded_text(client: httpx.AsyncClient, url: str, max_bytes: int, settings: Settings) -> str:
     """GET a text body, refusing to buffer more than `max_bytes`."""
-    async with _safe_stream(client, "GET", url, settings) as response:
+    arweave_internal = url.startswith(settings.arweave_internal.rstrip("/") + "/")
+    arweave_retained = url.startswith(settings.arweave_retained_internal.rstrip("/") + "/")
+    timeout = settings.arweave_cold_timeout if arweave_internal or arweave_retained else None
+    async with _safe_stream(client, "GET", url, settings, timeout=timeout) as response:
         response.raise_for_status()
         declared = response.headers.get("content-length")
         if declared and declared.isdigit() and int(declared) > max_bytes:
@@ -514,7 +521,7 @@ async def _resolve_arweave(
         public = f"{public}?{query}"
 
     # A registry-kept identity is exclusively served from the retained Core.
-    # Do this before every probe and metadata fetch: ordinary Envoy bytes must
+    # Do this before every probe and metadata fetch: ordinary Core bytes must
     # never mask a missing retained artifact.
     state = retained_state(txid, path, settings)
     if state == "kept" and not await retained_available(txid, path, settings, client):
@@ -526,7 +533,7 @@ async def _resolve_arweave(
     retained = state == "kept"
     base = settings.arweave_retained_internal if retained else settings.arweave_internal
     internal = f"{base.rstrip('/')}/{txid}{path}"
-    headers = await probe_headers(client, internal)
+    headers = await probe_headers(client, internal, timeout=settings.arweave_cold_timeout)
     if headers is None or (retained and headers.get("x-cache", "").strip().lower() != "hit"):
         return Resolved(
             ref, public, "play", "arweave", False, source_kind="arweave", final_ref=native_ref,

@@ -299,11 +299,13 @@ async def _arweave_status(settings: Settings, client: httpx.AsyncClient) -> dict
         return {"retained": retained_status, "known_warmed": 0, "currently_cached": 0}
     async def cached(txid: str) -> bool:
         # X-Cache HIT/MISS on GET/HEAD is the only cache introspection ar-io
-        # offers. A failed HEAD counts as not-cached: it isn't servable now.
+        # offers. A cold Core may retrieve on demand, so this native
+        # availability probe gets its cold-read budget rather than the short
+        # generic status timeout.
         async with sem:
             try:
                 response = await client.head(
-                    f"{settings.arweave_internal}/{txid}", timeout=_STATUS_TIMEOUT
+                    f"{settings.arweave_internal}/{txid}", timeout=settings.arweave_cold_timeout
                 )
                 return response.headers.get("x-cache", "").upper().startswith("HIT")
             except httpx.HTTPError:

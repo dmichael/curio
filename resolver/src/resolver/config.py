@@ -16,7 +16,9 @@ class Settings(BaseSettings):
 
     # Gateways the resolver PROBES and fetches metadata from (on-box, localhost).
     ipfs_internal: str = "http://127.0.0.1:8080"
-    arweave_internal: str = "http://127.0.0.1:3000"
+    # Ordinary AR.IO Core's data API. Envoy remains Core's trusted upstream,
+    # but its short cold-route deadline must not sit in Curio's byte path.
+    arweave_internal: str = "http://127.0.0.1:4000"
     # Private native AR.IO Core used only for explicit Arweave keep intent.
     # It has separate on-disk Core state from the ordinary evictable gateway.
     arweave_retained_internal: str = "http://127.0.0.1:4001"
@@ -65,6 +67,9 @@ class Settings(BaseSettings):
     tzkt_base: str = "https://api.tzkt.io/v1"
     seed_concurrency: int = Field(default=3, ge=1)
     seed_pin_timeout: float = Field(default=300.0, gt=0)
+    # Native Core can retrieve a cold transaction on demand. Keep this separate
+    # from the short general HTTP timeout used for ordinary metadata requests.
+    arweave_cold_timeout: float = Field(default=300.0, gt=0)
     seed_max_active: int = Field(default=4, ge=1)  # concurrent seed jobs
     seed_max_seconds: float = Field(default=14_400.0, gt=0)  # wall-clock cap per job
     seed_jobs_kept: int = Field(default=100, ge=1)  # finished-job history retained

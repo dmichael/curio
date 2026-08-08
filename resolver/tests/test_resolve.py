@@ -228,6 +228,25 @@ async def test_arweave_refs_target_the_box(ref):
     assert result.integrity is None
 
 
+async def test_arweave_availability_probe_uses_cold_timeout():
+    settings = Settings(
+        arweave_internal="http://core.internal",
+        arweave_cold_timeout=300.0,
+        http_timeout=0.01,
+        arweave_retention_db=f"/tmp/curio-cold-probe-{os.getpid()}.sqlite3",
+    )
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"]["read"])
+        return httpx.Response(200, headers={"content-type": "video/mp4"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=settings.http_timeout) as client:
+        result = await resolve_ref(f"ar://{TXID}", settings, client)
+    assert result.resolved
+    assert seen == [settings.arweave_cold_timeout]
+
+
 @pytest.mark.parametrize("ref", [f"ar://{TXID}/49", f"https://arweave.net/{TXID}/49"])
 async def test_arweave_manifest_path_is_preserved(ref):
     # Path manifests resolve txid/sub to a distinct resource — dropping the

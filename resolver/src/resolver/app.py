@@ -557,8 +557,12 @@ async def _gateway_proxy(request: Request, backend: str, path: str):
     headers = {}
     if request.headers.get("range"):
         headers["range"] = request.headers["range"]
+    # Core can retrieve a cold transaction after the normal resolver HTTP
+    # deadline. Native Arweave streams get the explicit cold-read budget;
+    # IPFS keeps the general client timeout.
+    timeout = settings.arweave_cold_timeout if backend.startswith("arweave") else None
     upstream = await app.state.client.send(
-        app.state.client.build_request(request.method, url, headers=headers), stream=True,
+        app.state.client.build_request(request.method, url, headers=headers, timeout=timeout), stream=True,
     )
     headers = {k: v for k, v in upstream.headers.items() if k.lower() in
                {"content-type", "content-length", "content-range", "accept-ranges", "etag", "cache-control", "x-cache"}}
@@ -576,7 +580,7 @@ async def arweave_gateway(request: Request, path: str):
     parsed = arweave_parts(f"ar://{path}")
     if parsed is not None:
         txid, retained_path = parsed
-        # A kept identity never quietly falls back to the ordinary Envoy.
+        # A kept identity never quietly falls back to the ordinary Core.
         # If the retained Core is unavailable its response is surfaced as a
         # degraded native-plane failure rather than substituted bytes.
         if retained_state(txid, retained_path, get_settings()) == "kept":

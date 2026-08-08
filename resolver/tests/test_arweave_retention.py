@@ -205,6 +205,41 @@ async def test_kept_resolution_degrades_when_retained_hit_is_gone(tmp_path):
     assert not result.resolved and result.keep_state == "degraded"
 
 
+def test_cold_ordinary_core_proxy_uses_cold_timeout_not_envoy_504(http_client, tmp_path, monkeypatch):
+    txid = "O" * 43
+    monkeypatch.setenv("RESOLVER_ARWEAVE_INTERNAL", "http://ar-io-core:4000")
+    monkeypatch.setenv("RESOLVER_ARWEAVE_RETAINED_INTERNAL", "http://ar-io-retained:4000")
+    monkeypatch.setenv("RESOLVER_ARWEAVE_RETENTION_DB", str(tmp_path / "r.sqlite3"))
+    monkeypatch.setenv("RESOLVER_HTTP_TIMEOUT", "0.01")
+    monkeypatch.setenv("RESOLVER_ARWEAVE_COLD_TIMEOUT", "1")
+    get_settings.cache_clear()
+    seen = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.host, request.extensions["timeout"]["read"]))
+        if request.url.host == "ar-io-envoy":
+            return httpx.Response(504)
+        assert request.url.host == "ar-io-core"
+        # MockTransport does not enforce timeouts; this models a Core cold read
+        # that exceeds the generic HTTP budget and checks the explicit one.
+        await asyncio.sleep(0.02)
+        return httpx.Response(
+            200, headers={"content-type": "video/mp4"}, stream=httpx.ByteStream(b"cold")
+        )
+
+    original = app_module.app.state.client
+    app_module.app.state.client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), timeout=0.01
+    )
+    try:
+        response = http_client.get(f"/arweave/{txid}")
+    finally:
+        app_module.app.state.client = original
+        get_settings.cache_clear()
+    assert response.status_code == 200 and response.content == b"cold"
+    assert seen == [("ar-io-core", 1.0)]
+
+
 def test_public_kept_txid_routes_to_retained_core(http_client, tmp_path, monkeypatch):
     txid = "D" * 43
     monkeypatch.setenv("RESOLVER_ARWEAVE_RETAINED_INTERNAL", "http://retained.internal")

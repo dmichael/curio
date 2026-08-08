@@ -94,8 +94,10 @@ The first Compose project runs:
 
 - `resolver`: Curio's FastAPI resolver;
 - `kubo`: IPFS gateway and pin store;
-- `ar-io-core`: the ordinary, evictable AR.IO Core used by Envoy;
-- `ar-io-envoy`: the private ordinary Arweave gateway upstream;
+- `ar-io-core`: the ordinary, evictable AR.IO Core data API used directly by
+  the resolver for ordinary reads;
+- `ar-io-envoy`: Core's private trusted network/upstream and participation
+  component, retained for native AR.IO retrieval rather than the public byte path;
 - `ar-io-redis`: the ordinary Core's Redis dependency;
 - `ar-io-retained`: a private second instance of the same pinned r81 Core,
   used only by explicit Curio keep/seed hydration;
@@ -260,7 +262,8 @@ Compose supplies the internal service addresses:
 ```text
 RESOLVER_IPFS_INTERNAL=http://kubo:8080
 RESOLVER_IPFS_API=http://kubo:5001
-RESOLVER_ARWEAVE_INTERNAL=http://ar-io-envoy:3000
+RESOLVER_ARWEAVE_INTERNAL=http://ar-io-core:4000
+RESOLVER_ARWEAVE_COLD_TIMEOUT=300
 ```
 
 It derives consumer-facing gateway bases from `CURIO_LAN_ADDRESS` and maps the
@@ -336,8 +339,8 @@ A successful installation demonstrates that:
 
 - the resolver answers on `8090`;
 - the resolver can reach Kubo's gateway and RPC API;
-- the resolver can reach AR.IO Envoy;
-- AR.IO Envoy can reach core;
+- the resolver can reach the ordinary AR.IO Core data API;
+- the ordinary and retained Cores can use AR.IO Envoy as their trusted upstream;
 - returned public gateway URLs use `CURIO_LAN_ADDRESS`;
 - only the documented host ports are published.
 

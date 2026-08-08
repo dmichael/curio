@@ -61,13 +61,17 @@ def ext_from_content_type(content_type: str | None) -> str | None:
     return CONTENT_TYPE_EXT.get(content_type.split(";", 1)[0].strip().lower())
 
 
-async def probe_headers(client: httpx.AsyncClient, url: str) -> httpx.Headers | None:
+async def probe_headers(
+    client: httpx.AsyncClient, url: str, *, timeout: float | None = None
+) -> httpx.Headers | None:
     """HEAD `url` and return its headers, or None on any failure.
 
     Probes are best-effort: a down gateway degrades a fixup, never the resolve.
+    Native AR.IO callers pass their separate cold-read timeout; all other
+    probes retain the client's normal timeout.
     """
     try:
-        response = await client.head(url)
+        response = await client.head(url, timeout=timeout)
         response.raise_for_status()
     except httpx.HTTPError:
         return None

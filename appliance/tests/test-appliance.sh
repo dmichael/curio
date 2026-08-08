@@ -47,6 +47,7 @@ EOF
 import json, pathlib, sys
 c=json.loads(pathlib.Path(sys.argv[1]).read_text()); s=c['services']; data=pathlib.Path(sys.argv[2])
 assert set(s)=={'resolver','kubo','ar-io-redis','ar-io-core','ar-io-retained-redis','ar-io-retained','ar-io-observer','ar-io-envoy'}
+assert s['resolver']['depends_on']['ar-io-core']['condition']=='service_healthy'
 assert s['resolver']['depends_on']['ar-io-envoy']['condition']=='service_healthy'
 assert s['resolver']['depends_on']['ar-io-retained']['condition']=='service_healthy'
 assert s['resolver']['healthcheck']['test'][0] == 'CMD'
@@ -56,6 +57,7 @@ core=s['ar-io-core']['environment']
 for key in ('RUN_OBSERVER','TRUSTED_GATEWAYS_URLS','ON_DEMAND_RETRIEVAL_ORDER','ANS104_UNBUNDLE_FILTER','ANS104_INDEX_FILTER','CONTIGUOUS_DATA_CACHE_CLEANUP_THRESHOLD'):
     assert key in core, key
 assert core['RUN_OBSERVER']=='false' and core['ON_DEMAND_RETRIEVAL_ORDER'].split(',')[0]=='trusted-gateways'
+assert core['TRUSTED_NODE_URL']=='http://ar-io-envoy:3000'
 assert s['ar-io-core']['user'] == f'{__import__("os").getuid()}:{__import__("os").getgid()}'
 retained=s['ar-io-retained']
 assert retained['user'] == f'{__import__("os").getuid()}:{__import__("os").getgid()}'
@@ -72,8 +74,9 @@ ports=[(n,p['target']) for n,x in s.items() for p in x.get('ports',[])]
 assert ('resolver',8090) in ports and ('kubo',4001) in ports
 assert not s['kubo'].get('ports',[])[0]['target']==8080
 assert not s['ar-io-envoy'].get('ports',[])
-assert s['resolver']['environment']['RESOLVER_ARWEAVE_INTERNAL']=='http://ar-io-envoy:3000'
+assert s['resolver']['environment']['RESOLVER_ARWEAVE_INTERNAL']=='http://ar-io-core:4000'
 assert s['resolver']['environment']['RESOLVER_ARWEAVE_RETAINED_INTERNAL']=='http://ar-io-retained:4000'
+assert s['resolver']['environment']['RESOLVER_ARWEAVE_COLD_TIMEOUT']=='300'
 assert 'RESOLVER_IPFS_PUBLIC_BASE' not in s['resolver']['environment']
 PY
 else

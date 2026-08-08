@@ -129,7 +129,7 @@ async def retained_available(txid: str, path: str, settings: Settings, client: h
     if retained_state(txid, path, settings) != "kept":
         return False
     try:
-        response = await client.head(_url(txid, path, settings), timeout=10.0)
+        response = await client.head(_url(txid, path, settings), timeout=settings.arweave_cold_timeout)
         return response.is_success and _native_hit(response)
     except httpx.HTTPError:
         return False

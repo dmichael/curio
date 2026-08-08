@@ -13,8 +13,11 @@ services:
       RESOLVER_PORT: "8090"
       RESOLVER_IPFS_INTERNAL: http://kubo:8080
       RESOLVER_IPFS_API: http://kubo:5001
-      RESOLVER_ARWEAVE_INTERNAL: http://ar-io-envoy:3000
+      # Serve ordinary reads straight from Core's data API. Envoy remains
+      # Core's trusted network/upstream path, outside the cold byte stream.
+      RESOLVER_ARWEAVE_INTERNAL: http://ar-io-core:4000
       RESOLVER_ARWEAVE_RETAINED_INTERNAL: http://ar-io-retained:4000
+      RESOLVER_ARWEAVE_COLD_TIMEOUT: ${CURIO_ARWEAVE_COLD_TIMEOUT:-300}
       RESOLVER_ARWEAVE_RETENTION_DB: /state/arweave-retained.sqlite3
       RESOLVER_PUBLIC_BASE_URL: ${CURIO_PUBLIC_BASE_URL:-}
       RESOLVER_STATIC_ROOT: /state/media
@@ -29,6 +32,7 @@ services:
       - "${CURIO_PORT:-8090}:8090"
     depends_on:
       kubo: {condition: service_healthy}
+      ar-io-core: {condition: service_healthy}
       ar-io-envoy: {condition: service_healthy}
       ar-io-retained: {condition: service_healthy}
     healthcheck:

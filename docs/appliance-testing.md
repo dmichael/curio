@@ -182,8 +182,9 @@ The script performs the following sequence against real installation paths:
 11. leaves evidence under `/var/tmp/curio-appliance-test`.
 
 For release qualification, also supply a small public Arweave fixture and its
-known SHA-256 checksum. This tests cold on-demand retrieval through Envoy and
-core, not only `/ar-io/info`, and verifies the same bytes after recreation:
+known SHA-256 checksum. This tests cold on-demand retrieval through the
+ordinary Core data API (with Envoy retained as Core's trusted upstream), not
+only `/ar-io/info`, and verifies the same bytes after recreation:
 
 ```bash
 CURIO_TEST_ARWEAVE_TXID='<public-test-transaction-id>' \
