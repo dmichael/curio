@@ -28,6 +28,16 @@ async def test_http_is_static_same_origin_and_never_calls_kubo(tmp_path):
     assert calls == ["https://origin.example/piece.png"]
 
 
+def test_static_duplicate_file_consumes_temporary(tmp_path):
+    store = StaticStore(str(tmp_path))
+    first = store.put(b"same", media_type="image/png", filename="a.png", source_ref="one")
+    temporary = tmp_path / ".fetch-duplicate"
+    temporary.write_bytes(b"same")
+    second = store.put_file(temporary, media_type="image/png", filename="b.png", source_ref="two")
+    assert first["digest"] == second["digest"]
+    assert not temporary.exists()
+
+
 def test_static_keep_survives_store_reopen(tmp_path):
     store = StaticStore(str(tmp_path))
     item = store.put(b"original", media_type="image/png", filename="piece.png", source_ref="https://x")
@@ -87,6 +97,21 @@ async def test_dns_connection_is_pinned_not_independently_resolved(monkeypatch, 
     assert seen == [("https://8.8.4.4/p.png", "rebind.example", "rebind.example")]
 
 
+def test_resolve_pin_promotes_static_synchronously(http_client, tmp_path, monkeypatch):
+    monkeypatch.setenv("RESOLVER_STATIC_ROOT", str(tmp_path / "media"))
+    get_settings.cache_clear()
+    entry = StaticStore(str(tmp_path / "media")).put(b"x", media_type="image/png", filename="x.png", source_ref="x")
+    async def static_result(*_args, **_kwargs):
+        return Resolved("x", f"http://testserver/media/{entry['id']}", "play", "http", True, source_kind="http")
+    monkeypatch.setattr(app_module, "resolve_ref", static_result)
+    monkeypatch.setattr(app_module, "pin_in_background", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no background pin")))
+    response = http_client.get("/resolve", params={"ref": "https://origin.example/x.png", "pin": "true"})
+    assert response.status_code == 200
+    assert response.json()["promoted"] is True and response.json()["keep_state"] == "kept"
+    assert response.json()["pin_scheduled"] is False
+    get_settings.cache_clear()
+
+
 def test_favorite_promotes_static_and_does_not_schedule_ipfs(http_client, tmp_path, monkeypatch):
     monkeypatch.setenv("RESOLVER_FAVORITES_PATH", str(tmp_path / "favorites.json"))
     monkeypatch.setenv("RESOLVER_STATIC_ROOT", str(tmp_path / "media"))
@@ -99,6 +124,19 @@ def test_favorite_promotes_static_and_does_not_schedule_ipfs(http_client, tmp_pa
     response = http_client.post("/favorites", params={"ref": "https://origin.example/x.png"})
     assert response.status_code == 201 and response.json()["promoted"] is True
     assert StaticStore(str(tmp_path / "media")).get(str(entry["id"]))[0]["keep_state"] == "kept"
+    get_settings.cache_clear()
+
+
+def test_favorite_reports_arweave_keep_unsupported(http_client, tmp_path, monkeypatch):
+    monkeypatch.setenv("RESOLVER_FAVORITES_PATH", str(tmp_path / "favorites.json"))
+    get_settings.cache_clear()
+    async def ar_result(*_args, **_kwargs):
+        return Resolved("ar://x", "http://testserver/arweave/x", "play", "arweave", True, source_kind="arweave")
+    monkeypatch.setattr(app_module, "resolve_ref", ar_result)
+    response = http_client.post("/favorites", params={"ref": "ar://x"})
+    assert response.status_code == 201
+    assert response.json()["pin_scheduled"] is False
+    assert response.json()["keep_state"] == "unsupported"
     get_settings.cache_clear()
 
 

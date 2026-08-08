@@ -51,6 +51,29 @@ async def test_mcp_exposes_the_curated_tools():
     }
 
 
+def test_mcp_transport_uses_nonlocal_request_origin(http_client):
+    """Exercise the real streamable-HTTP transport, not call_tool()."""
+    headers = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
+    initialize = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"},
+    }}
+    previous_base = http_client.base_url
+    http_client.base_url = "http://curio.example"
+    try:
+        assert http_client.post("/mcp", headers=headers, json=initialize).status_code == 200
+        assert http_client.post("/mcp", headers=headers, json={
+            "jsonrpc": "2.0", "method": "notifications/initialized", "params": {},
+        }).status_code == 202
+        response = http_client.post("/mcp", headers=headers, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "resolve", "arguments": {"ref": "ipfs://bafyCID/a.png"}},
+        })
+    finally:
+        http_client.base_url = previous_base
+    assert response.status_code == 200
+    assert "http://curio.example/ipfs/bafyCID/a.png" in response.text
+
+
 async def test_mcp_resolve_tool_round_trips():
     async with no_net() as client:
         mcp_server.set_client(client)

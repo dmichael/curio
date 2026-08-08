@@ -1,6 +1,6 @@
 ---
 name: curio
-description: Resolve any media reference (IPFS, Arweave, NFT tokenURI, verse.works page, direct URL) into a LAN-playable URL, and seed the box's content cache from a wallet. Fetched live from Curio itself at GET /skill/SKILL.md — the box is the source of truth for how to use it.
+description: Resolve any media reference (IPFS, Arweave, NFT tokenURI, verse.works page, direct URL) into a playable URL on the request origin, and seed the box's content cache from a wallet. Fetched live from Curio itself at GET /skill/SKILL.md — the box is the source of truth for how to use it.
 ---
 
 # Curio — agent instructions
@@ -64,7 +64,7 @@ appear with schemas; this file rides along as the server instructions.
    gateway URL, `ar://<txid>[/path]`, an `arweave.net` URL, a tokenURI (JSON
    metadata, including on-chain `data:` URIs), a `verse.works/artworks/…`
    page, or a direct media URL.
-2. Read the response: `resolved_url` (LAN-fetchable), `playback_method`,
+2. Read the response: `resolved_url` (fetchable from this request origin), `playback_method`,
    `title`, `content_type`.
 3. Hand `resolved_url` to the renderer **exactly as returned** — query params
    like `?filename=art.png` are functional (they fix extension-sniffing
@@ -84,8 +84,8 @@ appear with schemas; this file rides along as the server instructions.
    record the distinction.
 
 Caveats:
-- Resolved URLs use LAN IPs, never `.local` names — renderers like the FF1
-  cannot resolve mDNS.
+- Resolved URLs use the request origin (or configured public base for
+  non-HTTP MCP calls); Curio never manufactures Docker-internal addresses.
 - Dumb renderers that only take a URL can be pointed at `GET /c?ref=…`
   (302-redirects to the resolved media).
 

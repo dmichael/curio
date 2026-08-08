@@ -78,6 +78,10 @@ class StaticStore:
             db.commit()
         finally:
             db.close()
+            # If another record already owns the digest, or this source was a
+            # duplicate, replace() was intentionally skipped. Never strand
+            # the fetch/upload temporary file in the persistent media root.
+            temporary.unlink(missing_ok=True)
         return {"id": file_id, "digest": digest, "bytes": size,
                 "media_type": media_type, "keep_state": keep_state}
 

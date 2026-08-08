@@ -22,10 +22,12 @@ Schema docs are FastAPI's stock /docs + /openapi.json.
 
 from __future__ import annotations
 
+import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from importlib import metadata
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, UploadFile
@@ -86,6 +88,27 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Curio", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def mcp_same_origin_guard(request: Request, call_next):
+    """DNS-rebinding protection for MCP with request-derived public origins.
+
+    FastMCP's built-in allow-list is static and only knows localhost. Curio
+    derives its public origin from this request, so require a syntactically
+    safe Host and, when a browser sends Origin, require that exact origin.
+    This runs before the mounted MCP transport.
+    """
+    if request.url.path.startswith("/mcp"):
+        host = request.headers.get("host", "")
+        if not host or any(c in host for c in "\r\n/@\\") or host.startswith("."):
+            return JSONResponse({"error": "invalid MCP Host"}, status_code=421)
+        origin = request.headers.get("origin")
+        if origin:
+            parsed = urlparse(origin)
+            if parsed.scheme not in {"http", "https"} or parsed.netloc != host or parsed.path not in {"", "/"}:
+                return JSONResponse({"error": "invalid MCP Origin"}, status_code=403)
+    return await call_next(request)
+
+
 def request_origin(request: Request) -> str:
     """The public front door, never an untrusted forwarded header or Docker URL."""
     configured = get_settings().public_base_url.rstrip("/")
@@ -124,14 +147,24 @@ async def resolve(
     result = await resolve_ref(ref, get_settings(), app.state.client, origin=request_origin(request))
     payload = result.as_dict()
     if pin:
-        # Opt-in only: plain resolution never pins (browsing must not grow
-        # the library); pin=1 is the caller declaring keep-this intent.
-        can_pin = result.resolved and result.source_kind != "arweave"
-        if can_pin:
+        # Static objects have a local durable store, so promote them in this
+        # request and never pretend a no-op IPFS helper was scheduled.
+        if result.source_kind in {"http", "data", "upload"}:
+            promoted = result.keep_state != "live-dependent" and _promote_static(result)
+            payload["pin_scheduled"] = False
+            payload["promoted"] = promoted
+            if promoted:
+                payload["keep_state"] = "kept"
+            elif result.keep_state != "live-dependent":
+                payload["keep_state"] = "failed"
+        elif result.resolved and result.source_kind == "ipfs":
             pin_in_background(result, get_settings(), app.state.client, why="resolve pin")
-        payload["pin_scheduled"] = can_pin
-        if result.source_kind == "arweave":
-            payload["keep_state"] = "unsupported"
+            payload["pin_scheduled"] = True
+            payload["keep_state"] = "pending"
+        else:
+            payload["pin_scheduled"] = False
+            if result.source_kind == "arweave":
+                payload["keep_state"] = "unsupported"
     return JSONResponse(payload)
 
 
@@ -376,6 +409,10 @@ async def favorite_add(
         check.keep_state = "kept" if promoted else check.keep_state
     elif pin_scheduled:
         pin_in_background(check, get_settings(), app.state.client, why="favorite")
+        check.keep_state = "pending"
+    elif check and check.resolved and check.source_kind == "arweave":
+        # A favorite is a keep intent; r81 cannot make that promise.
+        check.keep_state = "unsupported"
     return JSONResponse(
         {
             **record,
@@ -424,13 +461,30 @@ async def store(
             status_code=400,
         )
     settings = get_settings()
-    data = await file.read(settings.static_max_bytes + 1)
-    if len(data) > settings.static_max_bytes:
-        return JSONResponse({"error": f"body exceeds {settings.static_max_bytes} bytes"}, status_code=413)
-    entry = StaticStore(settings.static_root).put(
-        data, media_type=file.content_type, filename=file.filename, source_ref=f"upload:{file.filename}",
-        keep_state="kept",
-    )
+    store = StaticStore(settings.static_root)
+    store.root.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        # UploadFile may be backed by a spooled file, but read() still returns
+        # an unbounded byte string. Copy in chunks into our state filesystem so
+        # the size limit is enforced without buffering the complete upload.
+        with tempfile.NamedTemporaryFile(dir=store.root, prefix=".upload-", delete=False) as output:
+            temporary = Path(output.name)
+            size = 0
+            while chunk := await file.read(65536):
+                size += len(chunk)
+                if size > settings.static_max_bytes:
+                    return JSONResponse({"error": f"body exceeds {settings.static_max_bytes} bytes"}, status_code=413)
+                output.write(chunk)
+        entry = store.put_file(
+            temporary, media_type=file.content_type, filename=file.filename,
+            source_ref=f"upload:{file.filename}", keep_state="kept",
+        )
+        temporary = None  # put_file consumes or removes it in every path.
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        await file.close()
     return JSONResponse(
         {**entry, "filename": file.filename, "media_url": f"{request_origin(request)}/media/{entry['id']}",
          "source_kind": "upload", "integrity": {"algorithm": "sha256", "digest": entry["digest"]}},
@@ -495,7 +549,7 @@ async def _gateway_proxy(request: Request, backend: str, path: str):
         stream=True,
     )
     headers = {k: v for k, v in upstream.headers.items() if k.lower() in
-               {"content-type", "content-length", "content-range", "accept-ranges", "etag", "cache-control"}}
+               {"content-type", "content-length", "content-range", "accept-ranges", "etag", "cache-control", "x-cache"}}
     return StreamingResponse(upstream.aiter_raw(), status_code=upstream.status_code, headers=headers,
                              background=BackgroundTask(upstream.aclose))
 

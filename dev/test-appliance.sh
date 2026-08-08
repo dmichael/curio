@@ -4,6 +4,8 @@
 set -Eeuo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 MODE=${1:-}
+ARWEAVE_TXID=${CURIO_TEST_ARWEAVE_TXID:-}
+ARWEAVE_SHA256=${CURIO_TEST_ARWEAVE_SHA256:-}
 EVIDENCE_DIR=${CURIO_TEST_EVIDENCE_DIR:-"${XDG_STATE_HOME:-$HOME/.local/state}/curio-appliance-test"}
 CONFIG_HOME=${XDG_CONFIG_HOME:-"$HOME/.config"}
 DATA_HOME=${XDG_DATA_HOME:-"$HOME/.local/share"}
@@ -21,6 +23,11 @@ mkdir -p "$EVIDENCE_DIR"
 compose(){ docker compose --project-name curio --env-file "$ENV_FILE" --file "$APP_ROOT/current/compose.yaml" "$@"; }
 health(){ "$HOME/.local/bin/curio" health >"$EVIDENCE_DIR/health.latest" 2>&1; }
 wait_healthy(){ for _ in $(seq 1 120); do health && return; sleep 5; done; cat "$EVIDENCE_DIR/health.latest" >&2; fail 'Curio did not become healthy'; }
+fetch_arweave_fixture(){
+  local txid=$1 output=$2 headers=$3 code
+  code=$(curl -sS -L --max-time 600 -D "$headers" -o "$output" -w '%{http_code}' "http://127.0.0.1:8090/arweave/$txid" || true)
+  [[ $code == 200 ]] || fail "AR.IO fixture failed (HTTP ${code:-none})"
+}
 verify(){
   local id token
   token=$(awk -F= '$1=="CURIO_CURATOR_TOKEN"{print $2}' "$ENV_FILE")
@@ -30,6 +37,12 @@ verify(){
   curl -fsS http://127.0.0.1:8090/favorites | grep -F 'bafytest' >/dev/null || fail 'favorite lost'
   [[ $(sha256sum "$ENV_FILE" | awk '{print $1}') == $(<"$EVIDENCE_DIR/env.sha") ]] || fail 'configuration changed'
   [[ $(sha256sum "$DATA_ROOT/ar-io/start-height.env" | awk '{print $1}') == $(<"$EVIDENCE_DIR/height.sha") ]] || fail 'start height changed'
+  [[ -z $(find "$DATA_ROOT" -xdev \( ! -user "$(id -u)" -o ! -group "$(id -g)" \) -print -quit) ]] || fail 'container created root-owned state'
+  if [[ -f $EVIDENCE_DIR/arweave.txid ]]; then
+    fetch_arweave_fixture "$(<"$EVIDENCE_DIR/arweave.txid")" "$EVIDENCE_DIR/arweave.verify" "$EVIDENCE_DIR/arweave.headers"
+    [[ $(sha256sum "$EVIDENCE_DIR/arweave.verify" | awk '{print $1}') == $(<"$EVIDENCE_DIR/arweave.sha") ]] || fail 'AR.IO fixture bytes changed'
+    grep -Eiq '^x-cache:[[:space:]]*HIT' "$EVIDENCE_DIR/arweave.headers" || fail 'AR.IO fixture was not retained in cache'
+  fi
   compose ps --all --quiet | xargs -r docker inspect >"$EVIDENCE_DIR/containers.json"
   python3 - "$EVIDENCE_DIR/containers.json" <<'PY'
 import json, pathlib, sys
@@ -47,6 +60,14 @@ if [[ $MODE == --after-reboot ]]; then
 fi
 "$ROOT/appliance/install.sh"
 wait_healthy
+readlink "$APP_ROOT/current" >"$EVIDENCE_DIR/release.before-rerun"
+if [[ -n $ARWEAVE_TXID || -n $ARWEAVE_SHA256 ]]; then
+  [[ $ARWEAVE_TXID =~ ^[A-Za-z0-9_-]{43}$ && $ARWEAVE_SHA256 =~ ^[a-fA-F0-9]{64}$ ]] || fail 'set both valid CURIO_TEST_ARWEAVE_TXID and CURIO_TEST_ARWEAVE_SHA256'
+  fetch_arweave_fixture "$ARWEAVE_TXID" "$EVIDENCE_DIR/arweave.initial" "$EVIDENCE_DIR/arweave.initial.headers"
+  [[ $(sha256sum "$EVIDENCE_DIR/arweave.initial" | awk '{print $1}') == "${ARWEAVE_SHA256,,}" ]] || fail 'AR.IO fixture checksum mismatch'
+  printf '%s\n' "$ARWEAVE_TXID" >"$EVIDENCE_DIR/arweave.txid"
+  printf '%s\n' "${ARWEAVE_SHA256,,}" >"$EVIDENCE_DIR/arweave.sha"
+fi
 printf 'curio-persistence-%s\n' "$(date +%s)" >"$EVIDENCE_DIR/payload"
 token=$(awk -F= '$1=="CURIO_CURATOR_TOKEN"{print $2}' "$ENV_FILE")
 store=$(curl -fsS -H "Authorization: Bearer $token" -F "file=@$EVIDENCE_DIR/payload" http://127.0.0.1:8090/store)
@@ -58,7 +79,9 @@ curl -fsS -X POST -H "Authorization: Bearer $token" --get --data-urlencode "ref=
 curl -fsS -X POST -H "Authorization: Bearer $token" --get --data-urlencode 'ref=ipfs://bafytest/art.png' http://127.0.0.1:8090/favorites >/dev/null
 sha256sum "$ENV_FILE" | awk '{print $1}' >"$EVIDENCE_DIR/env.sha"
 sha256sum "$DATA_ROOT/ar-io/start-height.env" | awk '{print $1}' >"$EVIDENCE_DIR/height.sha"
-"$ROOT/appliance/install.sh"; wait_healthy; verify
+"$ROOT/appliance/install.sh"; wait_healthy
+[[ $(readlink "$APP_ROOT/current") != $(<"$EVIDENCE_DIR/release.before-rerun") ]] || fail 'rerun did not replace release pointer'
+verify
 compose up -d --force-recreate --no-build; wait_healthy; verify
 compose stop kubo
 if health; then fail 'health succeeded with Kubo stopped'; fi

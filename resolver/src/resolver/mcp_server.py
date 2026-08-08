@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from .config import get_settings
@@ -38,9 +38,10 @@ mcp = FastMCP(
     "curio",
     instructions=_SKILL_PATH.read_text(),
     stateless_http=True,
-    # The transport's DNS-rebinding protection only accepts localhost Host
-    # headers, which 421s every LAN caller. LAN-origin requests are accepted
-    # by design here (docs/design.md, Trust model).
+    # app.py applies equivalent same-origin Host/Origin validation before
+    # this mounted transport. FastMCP's static allow-list cannot represent a
+    # request-derived deployment origin, so its localhost-only policy would
+    # reject every legitimate reverse-proxy/public Host.
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
@@ -60,10 +61,14 @@ def _require_client() -> httpx.AsyncClient:
     return _client
 
 
-def _mcp_origin() -> str:
-    # FastMCP tools do not reliably expose the HTTP request. A configured
-    # public base is therefore required for a deploy; the fallback is an
-    # intentionally non-routable marker, never localhost/Docker.
+def _mcp_origin(ctx: Context | None = None) -> str:
+    """Use the actual MCP HTTP request, falling back only out of transport."""
+    if ctx is not None:
+        try:
+            request = ctx.request_context.request
+            return str(request.base_url).rstrip("/")
+        except (AttributeError, ValueError):
+            pass  # direct/in-process tool invocation has no HTTP request
     settings = get_settings()
     return settings.public_base_url.rstrip("/") or settings.ipfs_public_base.rstrip("/")
 
@@ -82,9 +87,9 @@ def _require_curator(token: str | None) -> None:
 
 @mcp.tool()
 async def resolve(
-    ref: str, pin: bool = False, curator_token: str | None = None
+    ref: str, pin: bool = False, curator_token: str | None = None, ctx: Context = None
 ) -> dict[str, Any]:
-    """Resolve any media reference into a LAN-playable URL.
+    """Resolve any media reference into a request-origin playable URL.
 
     Accepts ipfs://…, /ipfs/…, any gateway URL, ar://txid[/path],
     arweave.net URLs, a tokenURI (JSON metadata, including on-chain data:
@@ -99,16 +104,26 @@ async def resolve(
     evidence. AR.IO r81 selected-object retention is unsupported, so Arweave
     results report that state rather than pretending a cache warm is durable.
     """
-    result = await resolve_ref(ref, get_settings(), _require_client(), origin=_mcp_origin())
+    result = await resolve_ref(ref, get_settings(), _require_client(), origin=_mcp_origin(ctx))
     payload = result.as_dict()
     if pin:
         _require_curator(curator_token)
-        can_pin = result.resolved and result.source_kind != "arweave"
-        if can_pin:
+        if result.source_kind in {"http", "data", "upload"}:
+            promoted = result.keep_state != "live-dependent" and _promote_static(result)
+            payload["pin_scheduled"] = False
+            payload["promoted"] = promoted
+            if promoted:
+                payload["keep_state"] = "kept"
+            elif result.keep_state != "live-dependent":
+                payload["keep_state"] = "failed"
+        elif result.resolved and result.source_kind == "ipfs":
             pin_in_background(result, get_settings(), _require_client(), why="resolve pin")
-        payload["pin_scheduled"] = can_pin
-        if result.source_kind == "arweave":
-            payload["keep_state"] = "unsupported"
+            payload["pin_scheduled"] = True
+            payload["keep_state"] = "pending"
+        else:
+            payload["pin_scheduled"] = False
+            if result.source_kind == "arweave":
+                payload["keep_state"] = "unsupported"
     return payload
 
 
@@ -236,6 +251,7 @@ async def add_override(
     note: str | None = None,
     replace: bool = False,
     curator_token: str | None = None,
+    ctx: Context = None,
 ) -> dict[str, Any]:
     """Point a dead canonical ref at replacement content — an operator
     decision, always disclosed in resolve results (substituted=true).
@@ -271,7 +287,7 @@ async def add_override(
         raise ValueError(str(exc)) from exc
     try:
         # Disclosure, never a gate: the write already happened.
-        check = await resolve_ref(entry.replacement, get_settings(), _require_client(), origin=_mcp_origin())
+        check = await resolve_ref(entry.replacement, get_settings(), _require_client(), origin=_mcp_origin(ctx))
     except Exception:
         check = None
     return {
@@ -305,7 +321,7 @@ def _require_favorites() -> Favorites:
 
 
 @mcp.tool()
-async def list_favorites() -> dict[str, Any]:
+async def list_favorites(ctx: Context = None) -> dict[str, Any]:
     """The household's favorites: media references the owner marked as picks.
 
     This is the browse list, resolved and ready to play: each record
@@ -313,13 +329,13 @@ async def list_favorites() -> dict[str, Any]:
     playback_method — hand resolved_url straight to a renderer, no separate
     resolve call needed. resolved: false marks a favorite whose content is
     currently unreachable."""
-    records = await list_resolved(_require_favorites(), get_settings(), _require_client(), _mcp_origin())
+    records = await list_resolved(_require_favorites(), get_settings(), _require_client(), _mcp_origin(ctx))
     return {"count": len(records), "favorites": records}
 
 
 @mcp.tool()
 async def add_favorite(
-    ref: str, note: str | None = None, curator_token: str | None = None
+    ref: str, note: str | None = None, curator_token: str | None = None, ctx: Context = None
 ) -> dict[str, Any]:
     """Mark a media reference as a household favorite.
 
@@ -329,15 +345,17 @@ async def add_favorite(
     resolver is consulted once to record a title for the browse list
     (enrichment only, never a gate — the response's `resolved` field says
     whether the ref resolves right now). Favoriting also makes the content
-    durable: what the ref resolves to is pinned (IPFS) or cache-warmed
-    (Arweave) in the background — `pin_scheduled` reports it. Removing a
+    durable where the source supports it: static records are promoted
+    synchronously and IPFS pinning is scheduled (`pin_scheduled=true`). AR.IO
+    selected-object retention is unsupported and is reported explicitly.
+    Removing a
     favorite never unpins. Use note for why it was picked.
     """
     _require_curator(curator_token)
     favorites = _require_favorites()
     try:
         # Enrichment, never a gate: a resolve hiccup must not block the pick.
-        check = await resolve_ref(ref, get_settings(), _require_client(), origin=_mcp_origin())
+        check = await resolve_ref(ref, get_settings(), _require_client(), origin=_mcp_origin(ctx))
     except Exception:
         check = None
     try:
@@ -351,6 +369,9 @@ async def add_favorite(
         check.keep_state = "kept" if promoted else check.keep_state
     elif pin_scheduled:
         pin_in_background(check, get_settings(), _require_client())
+        check.keep_state = "pending"
+    elif check and check.resolved and check.source_kind == "arweave":
+        check.keep_state = "unsupported"
     return {
         **record,
         "resolved": check.resolved if check else None,
@@ -385,7 +406,7 @@ async def library_status() -> dict[str, Any]:
     ipfs: `pinned` counts recursive pins on the box's Kubo — the durable
     tier, immune to cache GC — plus the repo's size and object count.
     arweave: `known_warmed` is every txid ever deliberately warmed through
-    the box's ar-io gateway (seed jobs, favorites, resolve with pin);
+    the box's ar-io gateway (seed jobs);
     `currently_cached` is how many of those the gateway reports as cache
     HITs right now. The ar-io cache is EVICTABLE — warmed content can be
     garbage-collected, and eviction shows as currently_cached <

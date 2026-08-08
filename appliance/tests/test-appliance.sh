@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 TMP=$(mktemp -d)
-trap 'rm -rf -- "$TMP"' EXIT
+trap 'if [[ -f $TMP/pyproject.orig ]]; then cp "$TMP/pyproject.orig" "$ROOT/resolver/pyproject.toml"; fi; rm -rf -- "$TMP"' EXIT
 fail() { echo "test-appliance: $*" >&2; exit 1; }
 for command in python3 tar sha256sum; do command -v "$command" >/dev/null || fail "$command is required"; done
 
@@ -47,12 +47,16 @@ import json, pathlib, sys
 c=json.loads(pathlib.Path(sys.argv[1]).read_text()); s=c['services']; data=pathlib.Path(sys.argv[2])
 assert set(s)=={'resolver','kubo','ar-io-redis','ar-io-core','ar-io-observer','ar-io-envoy'}
 assert s['resolver']['depends_on']['ar-io-envoy']['condition']=='service_healthy'
+assert s['resolver']['healthcheck']['test'][0] == 'CMD'
 assert s['ar-io-envoy']['healthcheck']['test'] == ['CMD','curl','-fsS','http://127.0.0.1:3000/ar-io/info']
-assert s['ar-io-observer']['healthcheck']['disable'] is True
+assert s['ar-io-observer']['healthcheck']['test'] == ['CMD-SHELL', 'test -d /']
 core=s['ar-io-core']['environment']
 for key in ('RUN_OBSERVER','TRUSTED_GATEWAYS_URLS','ON_DEMAND_RETRIEVAL_ORDER','ANS104_UNBUNDLE_FILTER','ANS104_INDEX_FILTER','CONTIGUOUS_DATA_CACHE_CLEANUP_THRESHOLD'):
     assert key in core, key
 assert core['RUN_OBSERVER']=='false' and core['ON_DEMAND_RETRIEVAL_ORDER'].split(',')[0]=='trusted-gateways'
+assert s['ar-io-core']['user'] == f'{__import__("os").getuid()}:{__import__("os").getgid()}'
+assert 'user' not in s['ar-io-envoy']  # image must generate /etc/envoy config as root
+assert not next(v for v in s['ar-io-envoy']['volumes'] if v['target'] == '/data/envoy-eds').get('read_only', False)
 envoy=s['ar-io-envoy']['environment']
 for key in ('TVAL_OBSERVER_HOST','TVAL_FALLBACK_NODE_HOST','TVAL_GRAPHQL_HOST','TVAL_DATASETS_HOST','TVAL_ENABLE_ARWEAVE_PEER_EDS','TVAL_ARIO_GATEWAY_UPSTREAM_IDLE_TIMEOUT'):
     assert key in envoy, key
@@ -86,16 +90,53 @@ PATH="$TMP/kubo-bin:$PATH" KUBO_TEST_STATE="$TMP/kubo-state" CURIO_IPFS_STORAGE_
 cat >"$TMP/bin/docker" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"$CURIO_DOCKER_LOG"
-case "$*" in *'compose version'*|*' info'*|*' config --quiet'*|*' build resolver'*|*' up -d'*) exit 0;; esac
+case "$*" in
+  *'compose version'*|*' info'*|*' config --quiet'*|*' build resolver'*) exit 0;;
+  *' pull ghcr.io/ar-io/ar-io-envoy:'*) exit 0;;
+  *run\ --rm\ *ar-io-envoy:*) printf '%s\n' "${CURIO_TEST_HEIGHT:-123456}"; exit 0;;
+  *up\ -d*)
+    if [ "${CURIO_DOCKER_FAIL_UP:-0}" = 1 ] && [ ! -e "${CURIO_DOCKER_FAIL_ONCE_FILE:?}" ]; then touch "$CURIO_DOCKER_FAIL_ONCE_FILE"; exit 42; fi
+    exit 0;;
+esac
 exit 0
 EOF
-chmod +x "$TMP/bin/docker"; : >"$TMP/docker.log"
+chmod +x "$TMP/bin/docker"
+# The qualification host may be BSD while install.sh deliberately requires
+# GNU mv -T on Linux. Simulate that Linux primitive for the fake-Docker run.
+cat >"$TMP/bin/mv" <<'EOF'
+#!/bin/sh
+if [ "$1" = -Tf ]; then
+  shift
+  rm -f "$2"
+fi
+exec /bin/mv -f "$@"
+EOF
+chmod +x "$TMP/bin/mv"; : >"$TMP/docker.log"
 XDG_DATA_HOME="$TMP/xdg-data" XDG_CONFIG_HOME="$TMP/xdg-config" XDG_BIN_HOME="$TMP/bin-out" CURIO_APP_ROOT="$TMP/custom-app" CURIO_DATA_ROOT="$TMP/custom-state" CURIO_DOCKER_LOG="$TMP/docker.log" PATH="$TMP/bin:$PATH" "$ROOT/appliance/install.sh" >/dev/null
 [[ -L $TMP/custom-app/current ]] || fail 'installer did not create current release pointer'
 [[ -d $TMP/custom-state/ipfs && -f $TMP/xdg-config/curio/curio.env ]] || fail 'installer did not persist user state'
+[[ $(<"$TMP/custom-state/ar-io/start-height.env") == START_HEIGHT=123456 ]] || fail 'first install did not discover AR.IO height'
+[[ -f "$TMP/custom-state/ar-io/envoy-eds/arweave_full_nodes.json" && -f "$TMP/custom-state/ar-io/envoy-eds/arweave_partial_nodes.json" ]] || fail 'installer did not preseed user-owned Envoy EDS files'
+first_pointer=$(readlink "$TMP/custom-app/current"); first_version=$(<"$TMP/custom-app/current/VERSION")
+# Simulate the next verified release: an update must replace both pointer and
+# installed package version, not nest a link below the old release directory.
+cp "$ROOT/resolver/pyproject.toml" "$TMP/pyproject.orig"
+python3 - "$ROOT/resolver/pyproject.toml" <<'PY'
+from pathlib import Path
+path = Path(__import__('sys').argv[1])
+path.write_text(path.read_text().replace('version = "0.2.0"', 'version = "0.2.1"', 1))
+PY
 printf preserved >"$TMP/custom-state/sentinel"
 XDG_DATA_HOME="$TMP/xdg-data" XDG_CONFIG_HOME="$TMP/xdg-config" XDG_BIN_HOME="$TMP/bin-out" CURIO_APP_ROOT="$TMP/custom-app" CURIO_DOCKER_LOG="$TMP/docker.log" PATH="$TMP/bin:$PATH" "$ROOT/appliance/install.sh" >/dev/null
+second_pointer=$(readlink "$TMP/custom-app/current")
+[[ $second_pointer != "$first_pointer" && $(<"$TMP/custom-app/current/VERSION") != "$first_version" ]] || fail 'second install did not replace current release pointer and version'
+[[ $(<"$TMP/custom-state/ar-io/start-height.env") == START_HEIGHT=123456 ]] || fail 'rerun changed AR.IO start height'
 [[ $(<"$TMP/custom-state/sentinel") == preserved ]] || fail 'rerun damaged persistent state'
+# Failed start/health must restore the previous pointer and deployment.
+up_before=$(grep -c 'up -d' "$TMP/docker.log" || true)
+if XDG_DATA_HOME="$TMP/xdg-data" XDG_CONFIG_HOME="$TMP/xdg-config" XDG_BIN_HOME="$TMP/bin-out" CURIO_APP_ROOT="$TMP/custom-app" CURIO_DOCKER_LOG="$TMP/docker.log" CURIO_DOCKER_FAIL_UP=1 CURIO_DOCKER_FAIL_ONCE_FILE="$TMP/fail-once" PATH="$TMP/bin:$PATH" "$ROOT/appliance/install.sh" >/dev/null 2>&1; then fail 'installer accepted failed Compose health'; fi
+[[ $(readlink "$TMP/custom-app/current") == "$second_pointer" ]] || fail 'failed install did not roll back current pointer'
+[[ $(grep -c 'up -d' "$TMP/docker.log") -eq $((up_before + 2)) ]] || fail 'failed install did not restore prior Compose deployment'
 CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_DOCKER_LOG="$TMP/docker.log" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" status
 
 grep -q -- '--file .*custom-app/current/compose.yaml' "$TMP/docker.log" || fail 'wrapper did not discover configured custom app root'

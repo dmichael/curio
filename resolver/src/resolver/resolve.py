@@ -128,8 +128,8 @@ class Resolved:
 def external_url_ok(url: str) -> bool:
     """Refuse obviously-internal destinations in user/metadata-supplied URLs.
 
-    Literal-IP and localhost checks only — hostname-based private targets and
-    redirect chains are accepted under the LAN trust model (docs/design.md).
+    Literal-IP and localhost checks reject obvious local targets; DNS answers
+    and every redirect are separately validated before connection.
     """
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -218,7 +218,10 @@ async def _safe_stream(client: httpx.AsyncClient, method: str, url: str, setting
         parsed = urlparse(current)
         if addresses:
             request_url = _pinned_url(current, addresses[0])
-            headers = {"host": _host_header(parsed)}
+            # A pool keyed by numeric address could otherwise reuse a TLS
+            # connection verified for a different hostname sharing that IP.
+            # Keep Host/SNI for the original name and isolate each request.
+            headers = {"host": _host_header(parsed), "connection": "close"}
             extensions = {"sni_hostname": parsed.hostname}
         else:
             request_url, headers, extensions = current, {}, {}

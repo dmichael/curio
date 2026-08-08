@@ -107,9 +107,12 @@ async def ingest_url(
 async def pin_resolved(
     result: Resolved, settings: Settings, client: httpx.AsyncClient, why: str = "pin"
 ) -> str | None:
-    """Pin what a Resolved points at (IPFS) or warm it (Arweave: ar-io
-    caches on read, a full GET is as durable as a cache tier gets).
-    Returns "pinned" | "warmed" | None (unresolved or plain-HTTP target)."""
+    """Pin an IPFS Resolved target.
+
+    AR.IO cache reads are intentionally not performed here: selected-object
+    retention is unsupported, so callers receive ``unsupported`` rather than
+    treating an evictable cache warm as a keep operation.
+    """
     if not result.resolved:
         return None
     ipfs = ipfs_parts(result.resolved_url)

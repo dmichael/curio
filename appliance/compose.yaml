@@ -28,6 +28,12 @@ services:
     depends_on:
       kubo: {condition: service_healthy}
       ar-io-envoy: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=4).read()"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 4
     networks: [curio]
 
   kubo:
@@ -75,6 +81,9 @@ services:
 
   ar-io-core:
     image: ghcr.io/ar-io/ar-io-core:f3032933c6039305bc5ecec0d486526c6d60d6ea@sha256:1155d2042870e6ba2c1457258765c16b762fe66026e4a42799abfca3b5d0d900
+    # r81 accepts an arbitrary numeric UID. Keep its bind-mounted cache under
+    # the installing user's control even with a rootful Docker daemon.
+    user: "${CURIO_HOST_UID:?set CURIO_HOST_UID}:${CURIO_HOST_GID:?set CURIO_HOST_GID}"
     restart: unless-stopped
     env_file:
       - "${CURIO_DATA_ROOT}/ar-io/start-height.env"
@@ -113,11 +122,23 @@ services:
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
     command: ["echo 'AR.IO observer disabled for Curio'; exec sleep infinity"]
-    healthcheck: {disable: true}
+    # It is intentionally inert but still participates in Compose's complete
+    # health barrier; Envoy requires its DNS name to exist.
+    healthcheck:
+      test: ["CMD-SHELL", "test -d /"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     networks: [curio]
 
   ar-io-envoy:
     image: ghcr.io/ar-io/ar-io-envoy:bd738a2435f1293e259dfcbb4ef42f50b26545da@sha256:ffbf849370ed24b2dfecab2ceef733bf1fb67da2d14b4909063d788cc8f72282
+    # This pinned image's entrypoint must generate /etc/envoy/envoy.yaml as
+    # root, so it cannot run under an arbitrary UID. It receives the EDS
+    # mount has both EDS files pre-created by the installer as the host user;
+    # ar-io-core (mapped to the host UID:GID) owns their updates. Envoy only
+    # chmods/reads those existing files, so root is never hidden in persistent
+    # bind-mounted state.
     restart: unless-stopped
     environment:
       LOG_LEVEL: ${CURIO_AR_IO_ENVOY_LOG_LEVEL:-info}

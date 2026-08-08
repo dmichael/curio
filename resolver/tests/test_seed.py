@@ -97,8 +97,8 @@ async def test_eth_wallet_seed_pins_and_warms():
     assert job.status == "done", job.errors
     assert job.tokens == 2
     assert job.pinned == 1
-    assert job.warmed == 0
-    assert job.skipped == 1  # r81 cannot retain selected Arweave data
+    assert job.warmed == 1  # native full gateway read; cache-only, not kept
+    assert job.skipped == 0
     assert job.failed == 0
     assert sum("pin/add" in line for line in log) == 1  # deduped across tokens
 

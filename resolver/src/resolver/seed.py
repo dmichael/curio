@@ -229,11 +229,11 @@ async def _run_seed_inner(
             break
 
     sem = asyncio.Semaphore(settings.seed_concurrency)
-    # r81 cannot promote a transaction cache entry to durable retention.
-    # Do not imply preservation by issuing an ordinary cache warm.
-    job.skipped += len(txids)
+    # Native AR.IO participation is a full gateway read: it warms the local
+    # cache but deliberately does not claim selected-object preservation.
     await asyncio.gather(
         *(_pin_cid(cid, sources, job, settings, client, sem) for cid, sources in cids.items()),
+        *(_warm_txid(txid, job, settings, client, sem) for txid in txids),
     )
 
 
