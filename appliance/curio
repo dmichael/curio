@@ -3,11 +3,15 @@ set -eu
 
 DATA_HOME=${XDG_DATA_HOME:-"$HOME/.local/share"}
 CONFIG_HOME=${XDG_CONFIG_HOME:-"$HOME/.config"}
-APP_ROOT=${CURIO_APP_ROOT:-"$DATA_HOME/curio/app"}
 ENV_FILE=${CURIO_ENV_FILE:-"$CONFIG_HOME/curio/curio.env"}
+read_env() { [ -f "$1" ] && awk -F= -v k="$2" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$1"; }
+# CURIO_APP_ROOT in the persisted configuration wins over the XDG default, so
+# custom-root installs are discoverable when the wrapper is invoked from any cwd.
+APP_ROOT=${CURIO_APP_ROOT:-$(read_env "$ENV_FILE" CURIO_APP_ROOT)}
+APP_ROOT=${APP_ROOT:-"$DATA_HOME/curio/app"}
 DOCKER_BIN=${CURIO_DOCKER_BIN:-docker}
 PROJECT_NAME=${CURIO_PROJECT_NAME:-curio}
-COMPOSE_FILE=${CURIO_COMPOSE_FILE:-"$APP_ROOT/compose.yaml"}
+COMPOSE_FILE=${CURIO_COMPOSE_FILE:-"$APP_ROOT/current/compose.yaml"}
 
 fail() { echo "curio: $*" >&2; exit 1; }
 require_installation() {
@@ -16,41 +20,27 @@ require_installation() {
     command -v "$DOCKER_BIN" >/dev/null 2>&1 || fail "Docker is not available"
 }
 compose() { "$DOCKER_BIN" compose --project-name "$PROJECT_NAME" --env-file "$ENV_FILE" --file "$COMPOSE_FILE" "$@"; }
-version() { [ -f "$APP_ROOT/VERSION" ] || fail "installed version is unavailable"; cat "$APP_ROOT/VERSION"; }
+version() { [ -f "$APP_ROOT/current/VERSION" ] || fail "installed version is unavailable"; cat "$APP_ROOT/current/VERSION"; }
 release_base() { printf '%s' "${CURIO_RELEASE_BASE_URL:-https://github.com/${CURIO_GITHUB_REPOSITORY:-dmichael/curio}/releases}"; }
 check_update() {
     command -v curl >/dev/null 2>&1 || fail "curl is required for update checks"
     latest=$(curl -fsSL "$(release_base)/latest/download/VERSION" 2>/dev/null || true)
-    if [ -z "$latest" ]; then
-        echo "update check unavailable: release does not publish VERSION" >&2
-        return 1
-    fi
-    current=$(version)
-    printf 'installed %s; latest %s\n' "$current" "$latest"
-    [ "v$current" != "$latest" ]
+    [ -n "$latest" ] || { echo "update check unavailable: release does not publish VERSION" >&2; return 1; }
+    current=$(version); printf 'installed %s; latest %s\n' "$current" "$latest"; [ "v$current" != "$latest" ]
 }
 update() {
     requested=${1:-}
     [ -z "$requested" ] || case "$requested" in v[0-9]*.[0-9]*.[0-9]*) ;; *) fail "version must look like vX.Y.Z";; esac
     require_installation
-    # The installed bootstrap verifies the archive checksum and checks that
-    # the archive package version agrees with the requested release tag.
-    CURIO_VERSION="$requested" "$APP_ROOT/install.sh"
+    CURIO_APP_ROOT="$APP_ROOT" CURIO_VERSION="$requested" "$APP_ROOT/current/install.sh"
 }
-
 command=${1:-}; [ -n "$command" ] || fail "usage: curio {start|stop|restart|status|logs|health|version|update}"
 shift || true
 case "$command" in
     version) [ "$#" -eq 0 ] || fail "version takes no arguments"; version ;;
-    update)
-        case "${1:-}" in
-            --check) [ "$#" -eq 1 ] || fail "update --check takes no other arguments"; check_update ;;
-            --version) [ "$#" -eq 2 ] || fail "usage: curio update --version vX.Y.Z"; update "$2" ;;
-            '') update ;;
-            *) fail "usage: curio update [--check|--version vX.Y.Z]" ;;
-        esac ;;
-    start|stop|status|logs) require_installation; exec compose "$command" "$@" ;;
-    restart) require_installation; exec compose restart "$@" ;;
-    health) require_installation; exec compose exec -T resolver python -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8090/healthz").read().decode())' ;;
+    update) case "${1:-}" in --check) [ "$#" -eq 1 ] || fail "update --check takes no other arguments"; check_update ;; --version) [ "$#" -eq 2 ] || fail "usage: curio update --version vX.Y.Z"; update "$2" ;; '') update ;; *) fail "usage: curio update [--check|--version vX.Y.Z]";; esac ;;
+    start|stop|status|logs) require_installation; compose "$command" "$@" ;;
+    restart) require_installation; compose restart "$@" ;;
+    health) require_installation; compose exec -T resolver python -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8090/healthz").read().decode())' ;;
     *) fail "unknown command '$command'" ;;
 esac
