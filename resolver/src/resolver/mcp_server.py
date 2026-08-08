@@ -29,6 +29,7 @@ from .overrides import OverrideError, OverrideRegistry, get_registry, validate_e
 from .refs import canonical_ref_key
 from .resolve import resolve_ref
 from .seed import get_job, list_jobs, start_seed
+from .static_store import StaticStore
 from .wallets import list_wallet_tokens
 
 _SKILL_PATH = Path(__file__).parent / "skill" / "SKILL.md"
@@ -59,6 +60,20 @@ def _require_client() -> httpx.AsyncClient:
     return _client
 
 
+def _mcp_origin() -> str:
+    # FastMCP tools do not reliably expose the HTTP request. A configured
+    # public base is therefore required for a deploy; the fallback is an
+    # intentionally non-routable marker, never localhost/Docker.
+    settings = get_settings()
+    return settings.public_base_url.rstrip("/") or settings.ipfs_public_base.rstrip("/")
+
+
+def _promote_static(result) -> bool:
+    if result.source_kind not in {"http", "data", "upload"} or "/media/" not in result.resolved_url:
+        return False
+    return StaticStore(get_settings().static_root).keep(result.resolved_url.rsplit("/", 1)[-1])
+
+
 def _require_curator(token: str | None) -> None:
     configured = get_settings().curator_token
     if not configured or token != configured:
@@ -80,17 +95,20 @@ async def resolve(
     was recognized but unresolvable; don't cast those. substituted=true
     means the canonical content is gone and the operator's override registry
     supplied a replacement — substitution_status is its provenance tier.
-    pin=true additionally pins the resolved content onto the box (IPFS) or
-    warms its cache (Arweave), in the background — resolution alone never
-    pins; pass pin only when the content should be kept durably.
+    pin=true schedules an IPFS pin in the background; it is not completion
+    evidence. AR.IO r81 selected-object retention is unsupported, so Arweave
+    results report that state rather than pretending a cache warm is durable.
     """
-    result = await resolve_ref(ref, get_settings(), _require_client())
+    result = await resolve_ref(ref, get_settings(), _require_client(), origin=_mcp_origin())
     payload = result.as_dict()
     if pin:
         _require_curator(curator_token)
-        if result.resolved:
+        can_pin = result.resolved and result.source_kind != "arweave"
+        if can_pin:
             pin_in_background(result, get_settings(), _require_client(), why="resolve pin")
-        payload["pin_scheduled"] = result.resolved
+        payload["pin_scheduled"] = can_pin
+        if result.source_kind == "arweave":
+            payload["keep_state"] = "unsupported"
     return payload
 
 
@@ -253,7 +271,7 @@ async def add_override(
         raise ValueError(str(exc)) from exc
     try:
         # Disclosure, never a gate: the write already happened.
-        check = await resolve_ref(entry.replacement, get_settings(), _require_client())
+        check = await resolve_ref(entry.replacement, get_settings(), _require_client(), origin=_mcp_origin())
     except Exception:
         check = None
     return {
@@ -295,7 +313,7 @@ async def list_favorites() -> dict[str, Any]:
     playback_method — hand resolved_url straight to a renderer, no separate
     resolve call needed. resolved: false marks a favorite whose content is
     currently unreachable."""
-    records = await list_resolved(_require_favorites(), get_settings(), _require_client())
+    records = await list_resolved(_require_favorites(), get_settings(), _require_client(), _mcp_origin())
     return {"count": len(records), "favorites": records}
 
 
@@ -319,20 +337,26 @@ async def add_favorite(
     favorites = _require_favorites()
     try:
         # Enrichment, never a gate: a resolve hiccup must not block the pick.
-        check = await resolve_ref(ref, get_settings(), _require_client())
+        check = await resolve_ref(ref, get_settings(), _require_client(), origin=_mcp_origin())
     except Exception:
         check = None
     try:
         record = favorites.add(ref, title=check.title if check else None, note=note)
     except FavoriteError as exc:
         raise ValueError(str(exc)) from exc
-    pin_scheduled = bool(check and check.resolved)
-    if pin_scheduled:
+    pin_scheduled = bool(check and check.resolved and check.source_kind not in {"http", "data", "upload", "arweave"})
+    promoted = False
+    if check and check.resolved and check.source_kind in {"http", "data", "upload"}:
+        promoted = check.keep_state != "live-dependent" and _promote_static(check)
+        check.keep_state = "kept" if promoted else check.keep_state
+    elif pin_scheduled:
         pin_in_background(check, get_settings(), _require_client())
     return {
         **record,
         "resolved": check.resolved if check else None,
         "pin_scheduled": pin_scheduled,
+        "promoted": promoted,
+        "keep_state": check.keep_state if check else None,
     }
 
 

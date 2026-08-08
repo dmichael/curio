@@ -1,8 +1,12 @@
 """Target media-model contracts, independent of real gateways."""
+import socket
+
 import httpx
 
-from resolver.config import Settings
-from resolver.resolve import resolve_ref
+from resolver import app as app_module
+from resolver import mcp_server
+from resolver.config import Settings, get_settings
+from resolver.resolve import Resolved, resolve_ref
 from resolver.static_store import StaticStore
 
 
@@ -51,3 +55,78 @@ def test_request_origin_is_used_for_ipfs(http_client):
                                headers={"Host": "curio.example"})
     assert response.status_code == 200
     assert response.json()["media_url"] == "http://curio.example/ipfs/bafyCID/a.png"
+
+
+async def test_redirect_revalidates_each_hop_and_never_connects_private(monkeypatch, tmp_path):
+    settings = Settings(static_root=str(tmp_path), ipfs_api="http://kubo", redirect_max_hops=2)
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_a, **_k: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))
+    ])
+    calls = []
+    def handler(request):
+        calls.append((str(request.url), request.headers["host"], request.extensions.get("sni_hostname")))
+        return httpx.Response(302, headers={"location": "http://127.0.0.1/secret"})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await resolve_ref("https://safe.example/a.png", settings, client, origin="https://curio.example")
+    assert result.resolved is False
+    assert calls == [("https://8.8.8.8/a.png", "safe.example", "safe.example")]
+
+
+async def test_dns_connection_is_pinned_not_independently_resolved(monkeypatch, tmp_path):
+    settings = Settings(static_root=str(tmp_path))
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_a, **_k: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.4.4", 443))
+    ])
+    seen = []
+    def handler(request):
+        seen.append((str(request.url), request.headers["host"], request.extensions.get("sni_hostname")))
+        return httpx.Response(200, headers={"content-type": "image/png"}, content=b"x")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await resolve_ref("https://rebind.example/p.png", settings, client, origin="https://curio.example")
+    assert result.resolved
+    assert seen == [("https://8.8.4.4/p.png", "rebind.example", "rebind.example")]
+
+
+def test_favorite_promotes_static_and_does_not_schedule_ipfs(http_client, tmp_path, monkeypatch):
+    monkeypatch.setenv("RESOLVER_FAVORITES_PATH", str(tmp_path / "favorites.json"))
+    monkeypatch.setenv("RESOLVER_STATIC_ROOT", str(tmp_path / "media"))
+    get_settings.cache_clear()
+    entry = StaticStore(str(tmp_path / "media")).put(b"x", media_type="image/png", filename="x.png", source_ref="x")
+    async def static_result(*_args, **_kwargs):
+        return Resolved("x", f"http://testserver/media/{entry['id']}", "play", "http", True, source_kind="http")
+    monkeypatch.setattr(app_module, "resolve_ref", static_result)
+    monkeypatch.setattr(app_module, "pin_in_background", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no IPFS helper")))
+    response = http_client.post("/favorites", params={"ref": "https://origin.example/x.png"})
+    assert response.status_code == 201 and response.json()["promoted"] is True
+    assert StaticStore(str(tmp_path / "media")).get(str(entry["id"]))[0]["keep_state"] == "kept"
+    get_settings.cache_clear()
+
+
+def test_keep_does_not_lie_when_ipfs_pin_fails(http_client, monkeypatch):
+    async def ipfs_result(*_args, **_kwargs):
+        return Resolved("ipfs://x", "http://testserver/ipfs/bafy/x.png", "play", "ipfs", True, source_kind="ipfs")
+    async def fail_pin(*_args, **_kwargs):
+        raise httpx.ConnectError("pin down")
+    monkeypatch.setattr(app_module, "resolve_ref", ipfs_result)
+    monkeypatch.setattr(app_module, "pin_resolved", fail_pin)
+    response = http_client.post("/keep", params={"ref": "ipfs://x"})
+    assert response.status_code == 502 and response.json()["keep_state"] == "failed"
+
+
+def test_html_capture_is_live_dependent_and_keep_refuses(http_client, monkeypatch):
+    async def html_result(*_args, **_kwargs):
+        return Resolved("x", "http://testserver/media/x", "send", "http", True, source_kind="http", keep_state="live-dependent")
+    monkeypatch.setattr(app_module, "resolve_ref", html_result)
+    response = http_client.post("/keep", params={"ref": "https://origin.example/work.html"})
+    assert response.status_code == 409 and response.json()["keep_state"] == "live-dependent"
+
+
+async def test_mcp_uses_configured_public_origin(monkeypatch):
+    monkeypatch.setenv("RESOLVER_PUBLIC_BASE_URL", "https://curio.public")
+    get_settings.cache_clear()
+    def handler(_request): raise AssertionError("no network")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        mcp_server.set_client(client)
+        content, _ = await mcp_server.mcp.call_tool("resolve", {"ref": "ipfs://bafyCID/a.png"})
+    assert "https://curio.public/ipfs/bafyCID/a.png" in content[0].text
+    get_settings.cache_clear()

@@ -176,10 +176,10 @@ dead `substituted_ref`, and a provenance tier.
   currently unreachable.
 - `POST /favorites?ref=<anything>&note=…` — mark a favorite; `ref` accepts any
   spelling (ipfs://, gateway URL, ar://…) and respellings of the same content
-  count as one favorite (duplicate → `409`). Favoriting also makes the bytes
-  durable: what the ref resolves to is pinned (IPFS) or cache-warmed
-  (Arweave) in the background — browsing/resolving alone never pins;
-  favoriting is the keep-this signal.
+  count as one favorite (duplicate → `409`). An HTTP/data favorite promotes
+  its exact static artifact; an IPFS favorite schedules a pin (completion is
+  not claimed until pin success). Arweave warming is cache evidence only, not
+  selected-object retention. Browsing/resolving alone never pins.
 - `DELETE /favorites?ref=…` — unmark it (any spelling matches); nothing is
   unpinned or deleted.
 - MCP: `list_favorites`, `add_favorite(ref, note?)`, `remove_favorite(ref)`.

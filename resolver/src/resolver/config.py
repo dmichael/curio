@@ -18,17 +18,22 @@ class Settings(BaseSettings):
     ipfs_internal: str = "http://127.0.0.1:8080"
     arweave_internal: str = "http://127.0.0.1:3000"
 
-    # Deprecated compatibility values used only when resolve_ref is called
-    # outside an HTTP request. The HTTP surface derives one public origin from
-    # the request (or explicitly trusted forwarded headers).
+    # Public front-door URL for non-request callers (notably MCP).  Set this
+    # behind a reverse proxy; forwarded headers are deliberately not trusted
+    # from arbitrary direct clients.
+    public_base_url: str = ""
+    # Compatibility values for direct resolve_ref callers. HTTP requests use
+    # their request origin; MCP uses public_base_url or a non-routable marker.
     ipfs_public_base: str = ""
     arweave_public_base: str = ""
-    trusted_proxy_headers: bool = False
 
     # Curio's own HTTP backend. Its SQLite catalogue is authoritative for
     # retention metadata; object files are addressed by their SHA-256 digest.
     static_root: str = "/tmp/curio-media"
-    static_max_bytes: int = Field(default=1_073_741_824, gt=0)
+    static_max_bytes: int = Field(default=128_000_000, gt=0)
+    static_fetch_concurrency: int = Field(default=4, ge=1)
+    data_max_bytes: int = Field(default=4_000_000, gt=0)
+    redirect_max_hops: int = Field(default=5, ge=0)
     ssrf_dns_check: bool = True
 
     # Empty means curator mutations are disabled rather than public.
@@ -46,7 +51,7 @@ class Settings(BaseSettings):
     http_timeout: float = Field(default=20.0, gt=0)
     # Cap on any single body the resolver reads into memory (metadata JSON,
     # verse pages, directory listings). Media bytes are never buffered here.
-    fetch_max_bytes: int = Field(default=8_000_000, gt=0)
+    fetch_max_bytes: int = Field(default=2_000_000, gt=0)
 
     # Seeding (/seed): the box's Kubo API, and the keyless public indexers
     # used to enumerate a wallet's holdings.
@@ -73,7 +78,8 @@ class Settings(BaseSettings):
         # HTTP requests replace these with their actual request origin. The
         # fallback is the resolver front door for non-request callers (MCP),
         # never an internal gateway address.
-        fallback = f"http://localhost:{self.port}"
+        # Never manufacture a localhost URL for an MCP/non-request result.
+        fallback = self.public_base_url.rstrip("/") or "https://curio.invalid"
         self.ipfs_public_base = self.ipfs_public_base or fallback
         self.arweave_public_base = self.arweave_public_base or fallback
         return self

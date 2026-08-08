@@ -110,6 +110,19 @@ async def test_oversized_metadata_is_refused():
 # --- finding 6: health semantics ---
 
 
+async def test_participation_does_not_claim_docker_private_addresses_public():
+    from resolver.health import gateway_health
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v0/id":
+            return httpx.Response(200, json={"Addresses": ["/ip4/172.18.0.2/tcp/4001", "/ip4/8.8.8.8/tcp/4001"]})
+        return httpx.Response(404)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await gateway_health(SETTINGS, client)
+    participation = result["participation"]["ipfs"]
+    assert participation["status"] == "unknown"
+    assert participation["observed_public_addresses"] == ["/ip4/8.8.8.8/tcp/4001"]
+
+
 async def test_health_reports_5xx_backend_as_down_and_404_as_up():
     from resolver.health import gateway_health
 

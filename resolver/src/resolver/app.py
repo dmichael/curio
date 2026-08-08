@@ -49,7 +49,7 @@ from .favorites import (
     list_resolved,
 )
 from .health import gateway_health
-from .library import library_status, pin_in_background
+from .library import library_status, pin_in_background, pin_resolved
 from .mcp_server import mcp, set_client
 from .overrides import (
     DuplicateOverride,
@@ -87,14 +87,16 @@ app = FastAPI(title="Curio", lifespan=lifespan)
 
 
 def request_origin(request: Request) -> str:
-    """The sole source of consumer URLs, never a Compose service address."""
-    settings = get_settings()
-    if settings.trusted_proxy_headers:
-        proto = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
-        host = request.headers.get("x-forwarded-host", request.headers.get("host", "")).split(",")[0].strip()
-        if proto in {"http", "https"} and host:
-            return f"{proto}://{host}"
-    return str(request.base_url).rstrip("/")
+    """The public front door, never an untrusted forwarded header or Docker URL."""
+    configured = get_settings().public_base_url.rstrip("/")
+    return configured or str(request.base_url).rstrip("/")
+
+
+def _promote_static(result) -> bool:
+    """Promote the source-native static object; never route HTTP/data via IPFS."""
+    if result.source_kind not in {"http", "data", "upload"} or "/media/" not in result.resolved_url:
+        return False
+    return StaticStore(get_settings().static_root).keep(result.resolved_url.rsplit("/", 1)[-1])
 
 
 def require_curator(authorization: str | None = Header(default=None)) -> None:
@@ -124,9 +126,12 @@ async def resolve(
     if pin:
         # Opt-in only: plain resolution never pins (browsing must not grow
         # the library); pin=1 is the caller declaring keep-this intent.
-        if result.resolved:
+        can_pin = result.resolved and result.source_kind != "arweave"
+        if can_pin:
             pin_in_background(result, get_settings(), app.state.client, why="resolve pin")
-        payload["pin_scheduled"] = result.resolved
+        payload["pin_scheduled"] = can_pin
+        if result.source_kind == "arweave":
+            payload["keep_state"] = "unsupported"
     return JSONResponse(payload)
 
 
@@ -362,10 +367,14 @@ async def favorite_add(
         record = favorites.add(ref, title=check.title if check else None, note=note)
     except (DuplicateFavorite, FavoritesUnparseable) as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
-    pin_scheduled = bool(check and check.resolved)
-    if pin_scheduled:
-        # A favorite is a keep-this signal: pin/warm its content durably,
-        # in the background — cold, large media must not block the POST.
+    pin_scheduled = bool(check and check.resolved and check.source_kind not in {"http", "data", "upload", "arweave"})
+    promoted = False
+    if check and check.resolved and check.source_kind in {"http", "data", "upload"}:
+        # Static artifacts are kept in their own durable store, not copied to
+        # IPFS. HTML is a captured shell with live dependencies, not a kept runtime.
+        promoted = check.keep_state != "live-dependent" and _promote_static(check)
+        check.keep_state = "kept" if promoted else check.keep_state
+    elif pin_scheduled:
         pin_in_background(check, get_settings(), app.state.client, why="favorite")
     return JSONResponse(
         {
@@ -374,6 +383,8 @@ async def favorite_add(
             "resolved_url": check.resolved_url if check and check.resolved else None,
             "playback_method": check.playback_method if check else None,
             "pin_scheduled": pin_scheduled,
+            "keep_state": check.keep_state if check else None,
+            "promoted": promoted,
         },
         status_code=201,
     )
@@ -437,17 +448,22 @@ async def keep(request: Request, ref: str = Query(...), _: None = Depends(requir
         return JSONResponse({**result.as_dict(), "keep_state": "unsupported",
             "error": "AR.IO r81 has no documented API or configuration to protect selected transaction data from eviction"}, status_code=501)
     if result.source_kind in {"http", "data", "upload"}:
-        file_id = result.resolved_url.rsplit("/", 1)[-1]
-        if not StaticStore(get_settings().static_root).keep(file_id):
+        if result.keep_state == "live-dependent":
+            return JSONResponse({**result.as_dict(), "keep_state": "live-dependent",
+                "error": "HTML capture has uncaptured runtime dependencies"}, status_code=409)
+        if not _promote_static(result):
             return JSONResponse({"error": "static media missing"}, status_code=404)
         result.keep_state = "kept"
         return JSONResponse(result.as_dict())
     try:
-        pin_in_background(result, get_settings(), app.state.client, why="keep")
+        outcome = await pin_resolved(result, get_settings(), app.state.client, why="keep")
     except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=502)
+        return JSONResponse({**result.as_dict(), "keep_state": "failed", "error": str(exc)}, status_code=502)
+    if outcome != "pinned":
+        return JSONResponse({**result.as_dict(), "keep_state": "failed",
+            "error": "content was not successfully pinned"}, status_code=502)
     result.keep_state = "kept"
-    return JSONResponse(result.as_dict(), status_code=202)
+    return JSONResponse(result.as_dict())
 
 
 @app.get("/library")
@@ -461,8 +477,9 @@ async def media(file_id: str):
     if item is None:
         return JSONResponse({"error": "media not found"}, status_code=404)
     record, path = item
-    return FileResponse(path, media_type=record.get("media_type") or "application/octet-stream",
-                        filename=record.get("filename"))
+    # No filename= here: Starlette otherwise emits Content-Disposition:
+    # attachment, which tells browsers/media renderers not to play inline.
+    return FileResponse(path, media_type=record.get("media_type") or "application/octet-stream")
 
 
 async def _gateway_proxy(request: Request, backend: str, path: str):

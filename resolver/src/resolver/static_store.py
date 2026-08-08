@@ -37,7 +37,25 @@ class StaticStore:
 
     def put(self, data: bytes, *, media_type: str | None, filename: str | None,
             source_ref: str | None, keep_state: str = "cached") -> dict[str, object]:
-        digest = hashlib.sha256(data).hexdigest()
+        temporary = self.root / f".upload-{uuid4().hex}"
+        self.root.mkdir(parents=True, exist_ok=True)
+        temporary.write_bytes(data)
+        try:
+            return self.put_file(temporary, media_type=media_type, filename=filename,
+                                 source_ref=source_ref, keep_state=keep_state)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def put_file(self, temporary: Path, *, media_type: str | None, filename: str | None,
+                 source_ref: str | None, keep_state: str = "cached") -> dict[str, object]:
+        """Atomically promote a bounded temporary file into the object store."""
+        digest_hash = hashlib.sha256()
+        size = 0
+        with temporary.open("rb") as source:
+            for chunk in iter(lambda: source.read(65536), b""):
+                digest_hash.update(chunk)
+                size += len(chunk)
+        digest = digest_hash.hexdigest()
         file_id = uuid4().hex
         path = self.objects / digest
         db = self._connection()
@@ -46,21 +64,21 @@ class StaticStore:
                 "SELECT id, keep_state FROM media WHERE source_ref IS ? AND digest = ?", (source_ref, digest)
             ).fetchone()
             if existing is not None:
-                return {"id": existing["id"], "digest": digest, "bytes": len(data),
+                return {"id": existing["id"], "digest": digest, "bytes": size,
                         "media_type": media_type, "keep_state": existing["keep_state"]}
             if not path.exists():
-                temporary = path.with_suffix(".tmp")
-                temporary.write_bytes(data)
+                # tempfile is created under root by the resolver, so replace
+                # is an atomic same-filesystem commit.
                 temporary.replace(path)
             db.execute(
                 "INSERT INTO media VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (file_id, digest, filename, media_type, len(data), keep_state, source_ref,
+                (file_id, digest, filename, media_type, size, keep_state, source_ref,
                  datetime.now(timezone.utc).isoformat(timespec="seconds")),
             )
             db.commit()
         finally:
             db.close()
-        return {"id": file_id, "digest": digest, "bytes": len(data),
+        return {"id": file_id, "digest": digest, "bytes": size,
                 "media_type": media_type, "keep_state": keep_state}
 
     def get(self, file_id: str) -> tuple[dict[str, object], Path] | None:

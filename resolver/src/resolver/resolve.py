@@ -31,9 +31,13 @@ import ipaddress
 import json
 import re
 import socket
+import tempfile
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urlparse, urlunparse
+from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
 
 import httpx
 
@@ -43,7 +47,6 @@ from .fixups import (
     ext_from_content_type,
     extension_of,
     infer_playback_method,
-    pick_largest,
     probe_headers,
 )
 from .overrides import get_registry
@@ -66,6 +69,29 @@ _IMAGE_FIELDS = ("image", "image_url", "imageUrl", "displayUri", "display_uri")
 
 _MAX_DEPTH = 4
 _MAX_DIR_CHILDREN = 8
+# Per event-loop semaphores bound simultaneous remote static downloads. The
+# resolver may run tests on multiple loops, hence the loop identity in the key.
+_STATIC_FETCH_LIMITERS: dict[tuple[int, int], asyncio.Semaphore] = {}
+_STATIC_FETCH_DEPTH: ContextVar[int] = ContextVar("static_fetch_depth", default=0)
+
+
+@asynccontextmanager
+async def _static_fetch_slot(settings: Settings):
+    # Metadata can recurse into another HTTP reference. That child belongs to
+    # its parent's admission slot rather than waiting for a second one (which
+    # would deadlock when every slot is resolving metadata).
+    if _STATIC_FETCH_DEPTH.get():
+        yield
+        return
+    loop = asyncio.get_running_loop()
+    key = (id(loop), settings.static_fetch_concurrency)
+    limiter = _STATIC_FETCH_LIMITERS.setdefault(key, asyncio.Semaphore(settings.static_fetch_concurrency))
+    async with limiter:
+        token = _STATIC_FETCH_DEPTH.set(1)
+        try:
+            yield
+        finally:
+            _STATIC_FETCH_DEPTH.reset(token)
 
 
 @dataclass
@@ -115,40 +141,105 @@ def external_url_ok(url: str) -> bool:
         addr = ipaddress.ip_address(host)
     except ValueError:
         return True  # a DNS name; accepted (see trust model)
-    return not (
-        addr.is_private or addr.is_loopback or addr.is_link_local
-        or addr.is_multicast or addr.is_reserved or addr.is_unspecified
-    )
+    return addr.is_global
+
+
+def _is_internal_gateway(url: str, settings: Settings) -> bool:
+    return any(url == base.rstrip("/") or url.startswith(base.rstrip("/") + "/")
+               for base in (settings.ipfs_internal, settings.arweave_internal))
+
+
+async def _validated_addresses(url: str, settings: Settings) -> list[str] | None:
+    """Return DNS answers safe to connect to, rejecting mixed answers too.
+
+    The caller uses one returned numeric address as the TCP target. This is
+    intentionally more than a preflight: HTTPX never receives the hostname as
+    its connection destination, so a later resolver lookup cannot rebind it.
+    """
+    if not _fetch_allowed(url, settings):
+        return None
+    if _is_internal_gateway(url, settings) or not settings.ssrf_dns_check:
+        return []
+    parsed = urlparse(url)
+    if parsed.hostname is None:
+        return None
+    try:
+        answers = await asyncio.to_thread(
+            socket.getaddrinfo, parsed.hostname,
+            parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror:
+        return None
+    addresses: list[str] = []
+    for _, _, _, _, sockaddr in answers:
+        address = ipaddress.ip_address(sockaddr[0])
+        # is_global rejects RFC1918, loopback, link-local, CGNAT, documentation,
+        # multicast, unspecified, and other special-use ranges.
+        if not address.is_global:
+            return None
+        if str(address) not in addresses:
+            addresses.append(str(address))
+    return addresses or None
 
 
 async def _dns_fetch_allowed(url: str, settings: Settings) -> bool:
-    """Resolve every external hostname before connecting and reject private DNS.
+    return await _validated_addresses(url, settings) is not None
 
-    DNS answers are treated conservatively: one prohibited answer rejects the
-    target, and lookup failure does not become a connection attempt.
-    """
-    if not _fetch_allowed(url, settings):
-        return False
-    if any(url == base.rstrip("/") or url.startswith(base.rstrip("/") + "/")
-           for base in (settings.ipfs_internal, settings.arweave_internal)):
-        return True
-    if not settings.ssrf_dns_check:
-        return True
+
+def _pinned_url(url: str, address: str) -> str:
     parsed = urlparse(url)
-    if parsed.hostname is None:
-        return False
+    host = f"[{address}]" if ":" in address else address
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    return urlunparse(parsed._replace(netloc=netloc))
+
+
+def _host_header(parsed) -> str:
+    host = parsed.hostname or ""
+    if ":" in host:  # HTTP Host syntax brackets an IPv6 literal.
+        host = f"[{host}]"
+    return f"{host}:{parsed.port}" if parsed.port else host
+
+
+@asynccontextmanager
+async def _safe_stream(client: httpx.AsyncClient, method: str, url: str, settings: Settings):
+    """Fetch external HTTP only through a DNS-pinned connection.
+
+    HTTPS requests retain the original Host header and pass its hostname as
+    HTTP Core's SNI override, so certificate validation remains for the name
+    the user supplied. Redirects are explicit and every target is validated
+    and pinned independently.
+    """
+    current = url
+    response: httpx.Response | None = None
+    for hop in range(settings.redirect_max_hops + 1):
+        addresses = await _validated_addresses(current, settings)
+        if addresses is None:
+            raise ValueError("refusing to fetch internal/private URL")
+        parsed = urlparse(current)
+        if addresses:
+            request_url = _pinned_url(current, addresses[0])
+            headers = {"host": _host_header(parsed)}
+            extensions = {"sni_hostname": parsed.hostname}
+        else:
+            request_url, headers, extensions = current, {}, {}
+        request = client.build_request(method, request_url, headers=headers, extensions=extensions)
+        response = await client.send(request, stream=True)
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            break
+        location = response.headers.get("location")
+        await response.aclose()
+        response = None
+        if not location:
+            raise ValueError("redirect without Location")
+        if hop >= settings.redirect_max_hops:
+            raise ValueError("too many redirects")
+        current = urljoin(current, location)
+    if response is None:
+        raise ValueError("redirect failed")
     try:
-        addresses = await asyncio.to_thread(
-            socket.getaddrinfo, parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80),
-            type=socket.SOCK_STREAM,
-        )
-    except socket.gaierror:
-        return False
-    for _, _, _, _, sockaddr in addresses:
-        address = ipaddress.ip_address(sockaddr[0])
-        if address.is_private or address.is_loopback or address.is_link_local or address.is_multicast or address.is_reserved or address.is_unspecified:
-            return False
-    return bool(addresses)
+        yield response
+    finally:
+        await response.aclose()
 
 
 def _fetch_allowed(url: str, settings: Settings) -> bool:
@@ -163,9 +254,9 @@ def _fetch_allowed(url: str, settings: Settings) -> bool:
     return external_url_ok(url)
 
 
-async def _bounded_text(client: httpx.AsyncClient, url: str, max_bytes: int) -> str:
+async def _bounded_text(client: httpx.AsyncClient, url: str, max_bytes: int, settings: Settings) -> str:
     """GET a text body, refusing to buffer more than `max_bytes`."""
-    async with client.stream("GET", url) as response:
+    async with _safe_stream(client, "GET", url, settings) as response:
         response.raise_for_status()
         declared = response.headers.get("content-length")
         if declared and declared.isdigit() and int(declared) > max_bytes:
@@ -400,6 +491,15 @@ async def _resolve_arweave(
 async def _resolve_direct(
     ref: str, path: str, settings: Settings, client, depth: int, origin: str | None
 ) -> Resolved:
+    # Bound concurrent external body streams; metadata-only recursive work is
+    # small and separately bounded by fetch_max_bytes.
+    async with _static_fetch_slot(settings):
+        return await _resolve_direct_fetch(ref, path, settings, client, depth, origin)
+
+
+async def _resolve_direct_fetch(
+    ref: str, path: str, settings: Settings, client, depth: int, origin: str | None
+) -> Resolved:
     seg = path.rsplit("/", 1)[-1]
     ext = extension_of(seg)
     if not await _dns_fetch_allowed(ref, settings):
@@ -410,28 +510,49 @@ async def _resolve_direct(
         return await _resolve_token_metadata(ref, ref, "token-metadata", settings, client, depth)
 
     # HTTP is copied to Curio's static backend; it is never added to Kubo.
+    # Stream it to a bounded tempfile rather than collecting an attacker-sized
+    # body in memory. _safe_stream pins DNS and validates every redirect hop.
+    store = StaticStore(settings.static_root)
+    temporary: str | None = None
     try:
-        async with client.stream("GET", ref, follow_redirects=False) as response:
+        async with _safe_stream(client, "GET", ref, settings) as response:
             response.raise_for_status()
             content_type = response.headers.get("content-type")
+            declared = response.headers.get("content-length")
+            cap = settings.fetch_max_bytes if _main_content_type(content_type) == "application/json" else settings.static_max_bytes
+            if declared and declared.isdigit() and int(declared) > cap:
+                raise ValueError(f"response larger than {cap} bytes")
             if _main_content_type(content_type) == "application/json":
-                text = await _bounded_text(client, ref, settings.fetch_max_bytes)
-                return await _resolve_metadata_dict(ref, json.loads(text), "token-metadata", settings, client, depth)
-            chunks: list[bytes] = []
-            size = 0
-            async for chunk in response.aiter_bytes(65536):
-                size += len(chunk)
-                if size > settings.static_max_bytes:
-                    raise ValueError(f"response larger than {settings.static_max_bytes} bytes")
-                chunks.append(chunk)
-    except (httpx.HTTPError, ValueError) as exc:
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in response.aiter_bytes(65536):
+                    size += len(chunk)
+                    if size > cap:
+                        raise ValueError(f"response larger than {cap} bytes")
+                    chunks.append(chunk)
+                return await _resolve_metadata_dict(ref, json.loads(b"".join(chunks)), "token-metadata", settings, client, depth)
+            store.root.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=store.root, prefix=".fetch-", delete=False) as output:
+                temporary = output.name
+                size = 0
+                async for chunk in response.aiter_bytes(65536):
+                    size += len(chunk)
+                    if size > cap:
+                        raise ValueError(f"response larger than {cap} bytes")
+                    output.write(chunk)
+        entry = store.put_file(Path(temporary), media_type=content_type,
+                               filename=seg or None, source_ref=ref)
+        temporary = None  # put_file atomically moved it
+    except (httpx.HTTPError, ValueError, OSError, json.JSONDecodeError) as exc:
         return Resolved(ref, ref, "play", "http", False, note=f"media fetch failed: {exc}", source_kind="http")
-    entry = StaticStore(settings.static_root).put(b"".join(chunks), media_type=content_type,
-        filename=seg or None, source_ref=ref)
+    finally:
+        if temporary:
+            Path(temporary).unlink(missing_ok=True)
     public_origin = origin.rstrip("/") if origin else settings.ipfs_public_base.rstrip("/")
     url = f"{public_origin}/media/{entry['id']}"
     method = "send" if _main_content_type(content_type) == "text/html" else infer_playback_method(path)
     return Resolved(ref, url, method, "http", True, content_type=content_type, source_kind="http",
+        keep_state="live-dependent" if _main_content_type(content_type) == "text/html" else "cached",
         integrity={"algorithm": "sha256", "digest": str(entry["digest"])})
 
 
@@ -441,7 +562,7 @@ async def _resolve_token_metadata(
     if not await _dns_fetch_allowed(fetch_url, settings):
         return Resolved(ref, ref, "play", provider, False, note="refusing to fetch internal/private URL")
     try:
-        metadata: Any = json.loads(await _bounded_text(client, fetch_url, settings.fetch_max_bytes))
+        metadata: Any = json.loads(await _bounded_text(client, fetch_url, settings.fetch_max_bytes, settings))
     except (httpx.HTTPError, ValueError) as exc:
         return Resolved(ref, ref, "play", provider, False, note=f"metadata fetch failed: {exc}")
     if not isinstance(metadata, dict):
@@ -484,6 +605,11 @@ async def _resolve_data_uri(
     params, payload = match.group(1).split(";"), match.group(2)
     mediatype = params[0].strip().lower() or "text/plain"
     is_base64 = any(p.strip().lower() == "base64" for p in params[1:])
+    # Reject before decode: base64 expands by at most 3/4, percent encoding
+    # can only shrink. This prevents a giant tokenURI from allocating first.
+    encoded_limit = settings.data_max_bytes * (4 // 3 + 1) + 16
+    if len(payload) > encoded_limit:
+        return Resolved(ref, ref, "play", "data", False, note="data: URI exceeds configured size limit")
 
     if mediatype == "application/json":
         try:
@@ -492,6 +618,8 @@ async def _resolve_data_uri(
                 if is_base64
                 else unquote(payload)
             )
+            if len(text.encode("utf-8")) > settings.data_max_bytes:
+                raise ValueError("data: URI exceeds configured size limit")
             metadata: Any = json.loads(text)
         except ValueError as exc:
             return Resolved(ref, ref, "play", "data", False, note=f"data: URI decode failed: {exc}")
@@ -503,11 +631,14 @@ async def _resolve_data_uri(
         data = base64.b64decode(payload, validate=True) if is_base64 else unquote(payload).encode()
     except ValueError as exc:
         return Resolved(ref, ref, "play", "data", False, note=f"data: URI decode failed: {exc}")
+    if len(data) > settings.data_max_bytes:
+        return Resolved(ref, ref, "play", "data", False, note="data: URI exceeds configured size limit")
     entry = StaticStore(settings.static_root).put(data, media_type=mediatype, filename=None, source_ref=ref)
     base = origin.rstrip("/") if origin else settings.ipfs_public_base.rstrip("/")
     method = "send" if mediatype == "text/html" else "play"
     return Resolved(ref, f"{base}/media/{entry['id']}", method, "data", True, content_type=mediatype,
-        source_kind="data", integrity={"algorithm": "sha256", "digest": str(entry["digest"])})
+        source_kind="data", keep_state="live-dependent" if mediatype == "text/html" else "cached",
+        integrity={"algorithm": "sha256", "digest": str(entry["digest"])})
 
 
 def pick_media_field(metadata: dict[str, Any]) -> str | None:
@@ -530,9 +661,16 @@ async def _pick_image(metadata: dict[str, Any], settings: Settings, client) -> s
         return None
     if len(candidates) == 1:
         return candidates[0]
-    return await pick_largest(
-        [(c, _internal_fetch_url(c, settings)) for c in candidates], client
-    )
+    async def size(candidate: str) -> int:
+        try:
+            async with _safe_stream(client, "HEAD", _internal_fetch_url(candidate, settings), settings) as response:
+                response.raise_for_status()
+                return int(response.headers.get("content-length", "-1"))
+        except (httpx.HTTPError, ValueError):
+            return -1
+    sizes = await asyncio.gather(*(size(candidate) for candidate in candidates))
+    best = max(range(len(candidates)), key=lambda i: sizes[i])
+    return candidates[best] if sizes[best] >= 0 else candidates[0]
 
 
 def _verse_scrape_urls(ref: str) -> list[str]:
@@ -553,7 +691,7 @@ async def _resolve_verse(
     note = "no tokenUri/iframeUrl/og:image found in verse page"
     for page_url in _verse_scrape_urls(ref):
         try:
-            text = await _bounded_text(client, page_url, settings.fetch_max_bytes)
+            text = await _bounded_text(client, page_url, settings.fetch_max_bytes, settings)
         except (httpx.HTTPError, ValueError) as exc:
             note = f"verse fetch failed: {exc}"
             continue
