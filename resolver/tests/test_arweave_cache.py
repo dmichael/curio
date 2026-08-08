@@ -5,7 +5,11 @@ from resolver.config import Settings
 
 
 async def test_keep_fully_fetches_and_verifies_the_same_core_cache():
-    settings = Settings(arweave_internal="http://core.internal")
+    settings = Settings(
+        arweave_internal="http://core.internal",
+        arweave_cold_timeout=17,
+        seed_pin_timeout=999,
+    )
     calls: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -20,6 +24,7 @@ async def test_keep_fully_fetches_and_verifies_the_same_core_cache():
         ("GET", f"http://core.internal/{'A' * 43}/manifest/item.png"),
         ("GET", f"http://core.internal/{'A' * 43}/manifest/item.png"),
     ]
+    assert [request.extensions["timeout"]["read"] for request in calls] == [17, 17]
 
 
 async def test_keep_fails_without_a_same_core_native_hit():

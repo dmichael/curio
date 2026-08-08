@@ -49,9 +49,10 @@ assert set(s)=={'resolver','kubo','ar-io-core'}
 assert s['resolver']['depends_on']['ar-io-core']['condition']=='service_healthy'
 assert s['resolver']['healthcheck']['test'][0] == 'CMD'
 core=s['ar-io-core']['environment']
-for key in ('RUN_OBSERVER','TRUSTED_GATEWAYS_URLS','ON_DEMAND_RETRIEVAL_ORDER','ANS104_UNBUNDLE_FILTER','ANS104_INDEX_FILTER','CHAIN_CACHE_TYPE','ENABLE_CHUNK_DATA_CACHE_CLEANUP'):
+for key in ('RUN_OBSERVER','TRUSTED_GATEWAYS_URLS','ON_DEMAND_RETRIEVAL_ORDER','ANS104_UNBUNDLE_FILTER','ANS104_INDEX_FILTER','ENABLE_BACKGROUND_DATA_VERIFICATION','CHAIN_CACHE_TYPE','ENABLE_CHUNK_DATA_CACHE_CLEANUP'):
     assert key in core, key
 assert core['RUN_OBSERVER']=='false'
+assert core['ENABLE_BACKGROUND_DATA_VERIFICATION']=='false'
 assert core['TRUSTED_NODE_URL']=='https://arweave.net'
 assert core['CHAIN_CACHE_TYPE']=='lmdb'
 assert core['ENABLE_CHUNK_DATA_CACHE_CLEANUP']=='false'

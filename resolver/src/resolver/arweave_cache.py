@@ -27,8 +27,8 @@ async def _consume(client: httpx.AsyncClient, url: str, timeout: float) -> httpx
 async def keep_arweave(txid: str, path: str, settings: Settings, client: httpx.AsyncClient) -> str:
     """Eagerly fetch an exact identity and verify its same-Core cache hit."""
     try:
-        await _consume(client, _url(txid, path, settings), settings.seed_pin_timeout)
-        headers = await _consume(client, _url(txid, path, settings), settings.seed_pin_timeout)
+        await _consume(client, _url(txid, path, settings), settings.arweave_cold_timeout)
+        headers = await _consume(client, _url(txid, path, settings), settings.arweave_cold_timeout)
     except (httpx.HTTPError, ValueError):
         return "failed"
     return "kept" if headers.get("x-cache", "").strip().lower() == "hit" else "failed"

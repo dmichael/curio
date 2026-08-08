@@ -82,6 +82,7 @@ services:
       TRUSTED_GATEWAYS_URLS: '{"https://arweave.net":1,"https://ar-io.dev":2,"https://turbo-gateway.com":3,"https://permagate.io":4}'
       ANS104_UNBUNDLE_FILTER: '{"never":true}'
       ANS104_INDEX_FILTER: '{"never":true}'
+      ENABLE_BACKGROUND_DATA_VERIFICATION: "false"
       RUN_OBSERVER: "false"
       ON_DEMAND_RETRIEVAL_ORDER: trusted-gateways,ar-io-network,chunks-offset-aware,tx-data
       CHAIN_CACHE_TYPE: lmdb
