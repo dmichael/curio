@@ -4,8 +4,9 @@
 set -Eeuo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 MODE=${1:-}
-ARWEAVE_TXID=${CURIO_TEST_ARWEAVE_TXID:-}
-ARWEAVE_SHA256=${CURIO_TEST_ARWEAVE_SHA256:-}
+# Public qualified fixture. Override only to exercise another known object.
+ARWEAVE_TXID=${CURIO_TEST_ARWEAVE_TXID:-18VeoHbl4kVO0wPGcneapz8MT0y8CeTwBbR13UOlImo}
+ARWEAVE_SHA256=${CURIO_TEST_ARWEAVE_SHA256:-0ee462e8e0f5c2fb02cd77f45e03cc67c34dcc6ba0e92feacb5e1fe9a7241e18}
 EVIDENCE_DIR=${CURIO_TEST_EVIDENCE_DIR:-"${XDG_STATE_HOME:-$HOME/.local/state}/curio-appliance-test"}
 CONFIG_HOME=${XDG_CONFIG_HOME:-"$HOME/.config"}
 DATA_HOME=${XDG_DATA_HOME:-"$HOME/.local/share"}
@@ -61,15 +62,23 @@ fi
 "$ROOT/appliance/install.sh"
 wait_healthy
 readlink "$APP_ROOT/current" >"$EVIDENCE_DIR/release.before-rerun"
-if [[ -n $ARWEAVE_TXID || -n $ARWEAVE_SHA256 ]]; then
-  [[ $ARWEAVE_TXID =~ ^[A-Za-z0-9_-]{43}$ && $ARWEAVE_SHA256 =~ ^[a-fA-F0-9]{64}$ ]] || fail 'set both valid CURIO_TEST_ARWEAVE_TXID and CURIO_TEST_ARWEAVE_SHA256'
-  fetch_arweave_fixture "$ARWEAVE_TXID" "$EVIDENCE_DIR/arweave.initial" "$EVIDENCE_DIR/arweave.initial.headers"
-  [[ $(sha256sum "$EVIDENCE_DIR/arweave.initial" | awk '{print $1}') == "${ARWEAVE_SHA256,,}" ]] || fail 'AR.IO fixture checksum mismatch'
-  printf '%s\n' "$ARWEAVE_TXID" >"$EVIDENCE_DIR/arweave.txid"
-  printf '%s\n' "${ARWEAVE_SHA256,,}" >"$EVIDENCE_DIR/arweave.sha"
-fi
-printf 'curio-persistence-%s\n' "$(date +%s)" >"$EVIDENCE_DIR/payload"
 token=$(awk -F= '$1=="CURIO_CURATOR_TOKEN"{print $2}' "$ENV_FILE")
+[[ $ARWEAVE_TXID =~ ^[A-Za-z0-9_-]{43}$ && $ARWEAVE_SHA256 =~ ^[a-fA-F0-9]{64}$ ]] || fail 'set both valid CURIO_TEST_ARWEAVE_TXID and CURIO_TEST_ARWEAVE_SHA256'
+fetch_arweave_fixture "$ARWEAVE_TXID" "$EVIDENCE_DIR/arweave.initial" "$EVIDENCE_DIR/arweave.initial.headers"
+[[ $(sha256sum "$EVIDENCE_DIR/arweave.initial" | awk '{print $1}') == "${ARWEAVE_SHA256,,}" ]] || fail 'AR.IO fixture checksum mismatch'
+# This is isolated native retained-plane hydration, not an upstream r81 pin.
+keep=$(curl -fsS -X POST -H "Authorization: Bearer $token" --get --data-urlencode "ref=ar://$ARWEAVE_TXID" http://127.0.0.1:8090/keep)
+printf %s "$keep" | python3 -c 'import json,sys; assert json.load(sys.stdin)["keep_state"] == "kept"'
+printf '%s\n' "$ARWEAVE_TXID" >"$EVIDENCE_DIR/arweave.txid"
+printf '%s\n' "${ARWEAVE_SHA256,,}" >"$EVIDENCE_DIR/arweave.sha"
+# Prove public original-txid routing survives without the ordinary Core/Envoy
+# path. The resolver must use ar-io-retained, never substitute ordinary cache.
+compose stop ar-io-core ar-io-envoy
+fetch_arweave_fixture "$ARWEAVE_TXID" "$EVIDENCE_DIR/arweave.retained" "$EVIDENCE_DIR/arweave.retained.headers"
+[[ $(sha256sum "$EVIDENCE_DIR/arweave.retained" | awk '{print $1}') == "${ARWEAVE_SHA256,,}" ]] || fail 'retained AR.IO fixture checksum mismatch'
+compose start ar-io-core ar-io-envoy
+wait_healthy
+printf 'curio-persistence-%s\n' "$(date +%s)" >"$EVIDENCE_DIR/payload"
 store=$(curl -fsS -H "Authorization: Bearer $token" -F "file=@$EVIDENCE_DIR/payload" http://127.0.0.1:8090/store)
 printf %s "$store" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' >"$EVIDENCE_DIR/media-id"
 id=$(<"$EVIDENCE_DIR/media-id")

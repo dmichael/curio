@@ -94,10 +94,12 @@ The first Compose project runs:
 
 - `resolver`: Curio's FastAPI resolver;
 - `kubo`: IPFS gateway and pin store;
-- `ar-io-core`: AR.IO core at the release currently used by the reference
-  installation;
-- `ar-io-envoy`: the LAN-facing Arweave gateway;
-- `ar-io-redis`: AR.IO's Redis dependency;
+- `ar-io-core`: the ordinary, evictable AR.IO Core used by Envoy;
+- `ar-io-envoy`: the private ordinary Arweave gateway upstream;
+- `ar-io-redis`: the ordinary Core's Redis dependency;
+- `ar-io-retained`: a private second instance of the same pinned r81 Core,
+  used only by explicit Curio keep/seed hydration;
+- `ar-io-retained-redis`: the retained Core's separate Redis dependency;
 - a disabled observer compatibility container only if the pinned AR.IO Envoy
   definition still requires that service to exist.
 
@@ -111,6 +113,16 @@ trust distinction on fallback bytes. Core prefers IPv4 DNS results so hosts
 without a working IPv6 route do not exhaust the request window on IPv6
 connection attempts. Site-specific warm lists, hostnames, DNS settings,
 registries, and collection manifests do not belong in the appliance.
+
+`ar-io-retained` has its own bind-mounted `/app/data` (including r81 SQLite
+state), its own first-install height file, and no
+`CONTIGUOUS_DATA_CACHE_CLEANUP_THRESHOLD`. Its only trusted node is the ordinary
+Envoy. Curio records pending/kept/failed transaction/path intent in its own
+SQLite registry, fully consumes the retained Core response, verifies a second
+native response, then marks it kept. This is isolated native retained-plane
+operation, **not an AR.IO r81 per-transaction pin API**. Public
+`/arweave/<txid>/<path>` requests for kept txids go only to this Core; failure
+is reported as degraded rather than falling back to ordinary cached bytes.
 
 Only include AR.IO support containers that are required for this posture.
 `autoheal` or access to the Docker socket must not be added without a concrete
@@ -186,6 +198,10 @@ It must not run garbage collection or remove pins.
     ipfs/
     ar-io/
         start-height.env    # immutable first-deploy START_HEIGHT
+    ar-io-retained/
+        start-height.env    # same first-deploy height, separate Core state
+        redis/
+    arweave-retained.sqlite3 # Curio retained txid/path state registry
     resolver/
         overrides.toml
         favorites.json
@@ -207,12 +223,11 @@ Use bind mounts rather than anonymous Docker volumes. The host paths make
 backup, disk inspection, and migration understandable. Recreating containers
 must not affect these directories.
 
-AR.IO payload data is cache-like, but its tree also contains indexes and
-first-deploy state. Keep it together under `/var/lib/curio/ar-io` until AR.IO
-provides a clean and tested split between durable state and disposable cache.
-The installer records the initial chain height atomically in
-`start-height.env`; Compose passes that file only to AR.IO core, and installer
-reruns validate rather than replace it.
+The ordinary AR.IO tree is cache-like but contains indexes and first-deploy
+state. The retained Core has a separate `ar-io-retained` tree so ordinary cache
+cleanup cannot evict explicit keeps. The installer records the initial chain
+height atomically in `ar-io/start-height.env`, initializes the retained file
+from it once, and validates rather than replacing either on rerun.
 
 The selected images' runtime users and numeric IDs must be inspected before the
 installer assigns ownership. The pinned Kubo image defines `ipfs` as

@@ -1,12 +1,10 @@
 """The durability tier and its ledgers: what the box has decided to keep.
 
-The pin set *is* the library (docs/design.md): there is no catalog beyond
-what is pinned in Kubo, warmed through the ar-io gateway, and recorded in
-the provenance ledgers beside them (captures.jsonl, warmed.jsonl). This
-module owns that tier — the single-target pin/warm helpers callers use to
-make one resolved thing durable, the ledgers, the one ingest path bytes
-take into Kubo from an HTTP source, and `GET /library`: the cross-plane
-answer to "what does the box actually hold?".
+The library is source-native: Kubo pins IPFS, Curio's static store keeps
+ordinary HTTP/data, and the retained AR.IO registry records native Core
+hydration. Ordinary AR.IO warm records remain cache diagnostics, not keep
+claims. This module owns the source-appropriate single-target helpers and
+`GET /library`, the cross-plane answer to "what does the box actually hold?".
 """
 
 from __future__ import annotations
@@ -22,6 +20,7 @@ from typing import Any, NamedTuple
 
 import httpx
 
+from .arweave_retention import keep_arweave, retained_records
 from .config import Settings
 from .favorites import get_favorites
 from .overrides import get_registry
@@ -107,12 +106,7 @@ async def ingest_url(
 async def pin_resolved(
     result: Resolved, settings: Settings, client: httpx.AsyncClient, why: str = "pin"
 ) -> str | None:
-    """Pin an IPFS Resolved target.
-
-    AR.IO cache reads are intentionally not performed here: selected-object
-    retention is unsupported, so callers receive ``unsupported`` rather than
-    treating an evictable cache warm as a keep operation.
-    """
+    """Apply explicit keep intent on the source-native storage plane."""
     if not result.resolved:
         return None
     ipfs = ipfs_parts(result.resolved_url)
@@ -125,11 +119,14 @@ async def pin_resolved(
         )
         response.raise_for_status()
         return "pinned"
-    if result.provider == "arweave":
-        # AR.IO r81 can warm a cache by reading, but exposes no supported
-        # selected-object retention control. Calling that durable would be
-        # dishonest, so a keep action fails rather than merely warming it.
-        return "unsupported"
+    if result.provider == "arweave" or result.source_kind == "arweave":
+        from .refs import arweave_parts
+
+        arweave = arweave_parts(result.original_ref)
+        if arweave is None:
+            return "failed"
+        txid, path = arweave
+        return await keep_arweave(txid, path, settings, client)
     return None
 
 
@@ -233,10 +230,10 @@ def warmed_txids(settings: Settings) -> list[str]:
 async def library_status(settings: Settings, client: httpx.AsyncClient) -> dict[str, Any]:
     """What the box actually holds, plane by plane.
 
-    IPFS pins are the durable tier (a pin survives GC). The ar-io cache is
-    evictable and has no inventory endpoint, so the arweave plane replays the
-    warm ledger (warmed_file) against the gateway's X-Cache header —
-    currently_cached below known_warmed means evictions, not an error.
+    IPFS pins are durable. The Arweave retained registry counts native Core
+    hydration outcomes; ordinary warm records are separately replayed against
+    Envoy's X-Cache for cache diagnostics only. A cache miss is degraded,
+    never evidence for substituting a retained identity.
     Each plane degrades to {"error": …} on its own; status never 500s
     because one backend is down.
     """
@@ -270,10 +267,19 @@ async def _ipfs_status(settings: Settings, client: httpx.AsyncClient) -> dict[st
 
 
 async def _arweave_status(settings: Settings, client: httpx.AsyncClient) -> dict[str, Any]:
+    retained = retained_records(settings)
     txids = warmed_txids(settings)
     if not txids:
-        return {"kept": "unsupported", "technical_blocker":
-                "AR.IO r81 exposes no selected-data eviction protection API", "known_cached": 0}
+        return {
+            "retained": {
+                "kept": sum(record["state"] == "kept" for record in retained),
+                "pending": sum(record["state"] == "pending" for record in retained),
+                "failed": sum(record["state"] == "failed" for record in retained),
+                "operation": "isolated native retained-plane operation (not an AR.IO r81 pin API)",
+            },
+            "known_warmed": 0,
+            "currently_cached": 0,
+        }
     sem = asyncio.Semaphore(settings.seed_concurrency)
 
     async def cached(txid: str) -> bool:
@@ -289,7 +295,15 @@ async def _arweave_status(settings: Settings, client: httpx.AsyncClient) -> dict
                 return False
 
     hits = sum(await asyncio.gather(*(cached(txid) for txid in txids)))
-    status: dict[str, Any] = {"known_warmed": len(txids), "currently_cached": hits}
+    status: dict[str, Any] = {
+        "retained": {
+            "kept": sum(record["state"] == "kept" for record in retained),
+            "pending": sum(record["state"] == "pending" for record in retained),
+            "failed": sum(record["state"] == "failed" for record in retained),
+            "operation": "isolated native retained-plane operation (not an AR.IO r81 pin API)",
+        },
+        "known_warmed": len(txids), "currently_cached": hits,
+    }
     if hits != len(txids):
         status["note"] = (
             "ar-io cache is evictable — currently_cached < known_warmed means evictions"

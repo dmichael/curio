@@ -88,7 +88,7 @@ async def test_eth_wallet_seed_pins_and_warms():
             "status_code": 200,
             "json": {"Pins": ["bafyIMG"]},
         },
-        f"http://ar.internal/{TXID}": {"status_code": 200, "content": b"0" * 100},
+        f"http://127.0.0.1:4001/{TXID}": [{"status_code": 200, "content": b"0" * 100}, {"status_code": 200, "content": b"0" * 100}],
     }
     client, log = fake_net(routes)
     job = make_job(ETH_ADDR, "ethereum")
@@ -97,7 +97,7 @@ async def test_eth_wallet_seed_pins_and_warms():
     assert job.status == "done", job.errors
     assert job.tokens == 2
     assert job.pinned == 1
-    assert job.warmed == 1  # native full gateway read; cache-only, not kept
+    assert job.retained == 1 and job.warmed == 0  # explicit seed uses retained native plane
     assert job.skipped == 0
     assert job.failed == 0
     assert sum("pin/add" in line for line in log) == 1  # deduped across tokens

@@ -150,8 +150,8 @@ async def test_mcp_library_status_smoke():
         mcp_server.set_client(client)
         payload = await call("library_status", {})
     assert payload["ipfs"] == {"pinned": 1, "repo_size_bytes": 4096, "repo_objects": 12}
-    assert payload["arweave"]["kept"] == "unsupported"
-    assert "r81" in payload["arweave"]["technical_blocker"]
+    assert set(payload["arweave"]["retained"]) == {"kept", "pending", "failed", "operation"}
+    assert "not an AR.IO r81 pin API" in payload["arweave"]["retained"]["operation"]
     assert payload["registry"] == {"overrides": None, "favorites": None, "captures": None}
 
 

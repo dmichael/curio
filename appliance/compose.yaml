@@ -14,6 +14,8 @@ services:
       RESOLVER_IPFS_INTERNAL: http://kubo:8080
       RESOLVER_IPFS_API: http://kubo:5001
       RESOLVER_ARWEAVE_INTERNAL: http://ar-io-envoy:3000
+      RESOLVER_ARWEAVE_RETAINED_INTERNAL: http://ar-io-retained:4000
+      RESOLVER_ARWEAVE_RETENTION_DB: /state/arweave-retained.sqlite3
       RESOLVER_PUBLIC_BASE_URL: ${CURIO_PUBLIC_BASE_URL:-}
       RESOLVER_STATIC_ROOT: /state/media
       RESOLVER_OVERRIDES_PATH: /state/overrides.toml
@@ -28,6 +30,7 @@ services:
     depends_on:
       kubo: {condition: service_healthy}
       ar-io-envoy: {condition: service_healthy}
+      ar-io-retained: {condition: service_healthy}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=4).read()"]
       interval: 15s
@@ -107,6 +110,60 @@ services:
         target: /app/data
     depends_on:
       ar-io-redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "/bin/sh", "/app/healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 30
+    networks: [curio]
+
+  # This private Core is the source-native retention plane. r81 has no
+  # per-tx pin API: explicit Curio keep traffic is fully read here, from the
+  # ordinary Envoy trusted upstream, and its independent /app/data survives
+  # ordinary Core/Envoy cache eviction. It has no cleanup-threshold setting.
+  ar-io-retained-redis:
+    image: redis:7.4.7-alpine@sha256:02f2cc4882f8bf87c79a220ac958f58c700bdec0dfb9b9ea61b62fb0e8f1bfcf
+    user: "${CURIO_HOST_UID:?set CURIO_HOST_UID}:${CURIO_HOST_GID:?set CURIO_HOST_GID}"
+    restart: unless-stopped
+    command: [redis-server, --maxmemory, "${CURIO_REDIS_MAX_MEMORY:-256mb}", --maxmemory-policy, allkeys-lru, --save, "", --appendonly, "no"]
+    volumes:
+      - type: bind
+        source: ${CURIO_DATA_ROOT}/ar-io-retained/redis
+        target: /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [curio]
+
+  ar-io-retained:
+    image: ghcr.io/ar-io/ar-io-core:f3032933c6039305bc5ecec0d486526c6d60d6ea@sha256:1155d2042870e6ba2c1457258765c16b762fe66026e4a42799abfca3b5d0d900
+    user: "${CURIO_HOST_UID:?set CURIO_HOST_UID}:${CURIO_HOST_GID:?set CURIO_HOST_GID}"
+    restart: unless-stopped
+    env_file:
+      - "${CURIO_DATA_ROOT}/ar-io-retained/start-height.env"
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: --dns-result-order=ipv4first
+      LOG_LEVEL: ${CURIO_AR_IO_LOG_LEVEL:-info}
+      LOG_FORMAT: simple
+      TRUSTED_NODE_URL: http://ar-io-envoy:3000
+      TRUSTED_GATEWAYS_URLS: '{"http://ar-io-envoy:3000":1}'
+      ANS104_UNBUNDLE_FILTER: '{"never":true}'
+      ANS104_INDEX_FILTER: '{"never":true}'
+      RUN_OBSERVER: "false"
+      ON_DEMAND_RETRIEVAL_ORDER: trusted-gateways
+      CHAIN_CACHE_TYPE: redis
+      REDIS_CACHE_URL: redis://ar-io-retained-redis:6379
+    volumes:
+      - type: bind
+        source: ${CURIO_DATA_ROOT}/ar-io-retained
+        target: /app/data
+    depends_on:
+      ar-io-retained-redis: {condition: service_healthy}
+      ar-io-envoy: {condition: service_healthy}
     healthcheck:
       test: ["CMD", "/bin/sh", "/app/healthcheck.sh"]
       interval: 10s

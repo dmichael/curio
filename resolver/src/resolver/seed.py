@@ -5,8 +5,8 @@
 extracts every content-addressed media reference from token metadata, then:
 
   - IPFS refs    -> `pin add` on the box's Kubo API (fetches and keeps the DAG)
-  - Arweave refs -> reported as cache-only (r81 cannot retain selected data)
-  - plain http   -> skipped; curator action stores it in Curio's static backend
+  - Arweave refs -> hydrated through Curio's private native retained AR.IO Core
+  - plain http   -> copied into and synchronously kept by Curio's static backend
 
 Wallet seeding never moves ordinary HTTP bytes into IPFS.
 
@@ -30,10 +30,12 @@ from datetime import datetime, timezone
 
 import httpx
 
+from .arweave_retention import keep_arweave
 from .config import Settings
 from .library import ingest_url, keep_task, record_warm
-from .refs import arweave_txid, ipfs_parts
-from .resolve import external_url_ok
+from .refs import arweave_parts, ipfs_parts
+from .resolve import external_url_ok, resolve_ref
+from .static_store import StaticStore
 from .wallets import (
     _check_scope,
     _enumerator,
@@ -61,8 +63,9 @@ class SeedJob:
     refs_found: int = 0
     pinned: int = 0
     recovered: int = 0  # pinned via HTTP-copy recovery after IPFS fetch failed
-    warmed: int = 0
-    captured: int = 0  # retained for wire compatibility; automatic capture is disabled
+    warmed: int = 0  # ordinary cache-only warm operations, not explicit keeps
+    retained: int = 0
+    captured: int = 0  # static HTTP captures (kept for wire compatibility)
     skipped: int = 0
     failed: int = 0
     errors: list[str] = field(default_factory=list)
@@ -204,7 +207,8 @@ async def _run_seed_inner(
     # job.address was resolved by start_seed, before admission control.
     items = _enumerator(job.chain, job.scope, job.include_burned)
     cids: dict[str, list[str]] = {}  # cid -> HTTP source URLs (ordered de-dupe)
-    txids: dict[str, None] = {}
+    arweave: dict[tuple[str, str], None] = {}
+    http_refs: dict[str, None] = {}
     # Ordinary HTTP belongs to Curio's static backend when explicitly kept;
     # wallet seeding never publishes or copies it into IPFS.
     async for item in items(job.address, settings, client):
@@ -220,20 +224,23 @@ async def _run_seed_inner(
                 if not path.strip("/") and ref.startswith(("http://", "https://")) and ref not in sources:
                     sources.append(ref)
                 continue
-            txid = arweave_txid(ref)
-            if txid is not None:
-                txids[txid] = None
+            ar_parts = arweave_parts(ref)
+            if ar_parts is not None:
+                # Preserve manifest path identity, not merely the root txid.
+                arweave[ar_parts] = None
+                continue
+            if ref.startswith(("http://", "https://")):
+                http_refs[ref] = None
                 continue
             job.skipped += 1
         if limit is not None and job.tokens >= limit:
             break
 
     sem = asyncio.Semaphore(settings.seed_concurrency)
-    # Native AR.IO participation is a full gateway read: it warms the local
-    # cache but deliberately does not claim selected-object preservation.
     await asyncio.gather(
         *(_pin_cid(cid, sources, job, settings, client, sem) for cid, sources in cids.items()),
-        *(_warm_txid(txid, job, settings, client, sem) for txid in txids),
+        *(_keep_txid(txid, path, job, settings, client, sem) for txid, path in arweave),
+        *(_keep_http(ref, job, settings, client, sem) for ref in http_refs),
     )
 
 
@@ -341,14 +348,10 @@ async def _recover_cid(
 async def _warm_txid(
     txid: str, job: SeedJob, settings: Settings, client: httpx.AsyncClient, sem: asyncio.Semaphore
 ) -> None:
-    """Full streaming GET through the box's ar-io gateway; it caches on read."""
+    """Legacy cache-only warm helper for diagnostics; explicit seed uses keep."""
     async with sem:
         try:
-            async with client.stream(
-                "GET",
-                f"{settings.arweave_internal}/{txid}",
-                timeout=settings.seed_pin_timeout,
-            ) as response:
+            async with client.stream("GET", f"{settings.arweave_internal}/{txid}", timeout=settings.seed_pin_timeout) as response:
                 response.raise_for_status()
                 async for _ in response.aiter_bytes(65536):
                     pass
@@ -357,4 +360,36 @@ async def _warm_txid(
         except httpx.HTTPError as exc:
             job.failed += 1
             _note_error(job, f"warm {txid}: {type(exc).__name__}: {exc}")
-            _log.warning("seed %s: warm %s failed: %s: %s", job.id, txid, type(exc).__name__, exc)
+
+
+async def _keep_txid(
+    txid: str, path: str, job: SeedJob, settings: Settings, client: httpx.AsyncClient, sem: asyncio.Semaphore
+) -> None:
+    """Explicit seed intent uses the retained native plane, never cache warm."""
+    async with sem:
+        outcome = await keep_arweave(txid, path, settings, client)
+        if outcome == "kept":
+            job.retained += 1
+            return
+        job.failed += 1
+        _note_error(job, f"retain {txid}{path}: native retained-plane hydration failed")
+
+
+async def _keep_http(
+    ref: str, job: SeedJob, settings: Settings, client: httpx.AsyncClient, sem: asyncio.Semaphore
+) -> None:
+    """Resolve HTTP into Curio static storage and promote it; never call Kubo."""
+    async with sem:
+        try:
+            result = await resolve_ref(ref, settings, client)
+        except (httpx.HTTPError, ValueError) as exc:
+            job.failed += 1
+            _note_error(job, f"retain HTTP {ref}: {type(exc).__name__}: {exc}")
+            return
+        if result.resolved and result.source_kind == "http" and "/media/" in result.resolved_url:
+            kept = StaticStore(settings.static_root).keep(result.resolved_url.rsplit("/", 1)[-1])
+            if kept:
+                job.captured += 1
+                return
+        job.failed += 1
+        _note_error(job, f"retain HTTP {ref}: static promotion failed")

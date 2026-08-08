@@ -41,6 +41,7 @@ from fastapi.responses import (
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
+from .arweave_retention import retained_state
 from .config import get_settings
 from .favorites import (
     DuplicateFavorite,
@@ -61,7 +62,7 @@ from .overrides import (
     get_registry,
     validate_entry,
 )
-from .refs import canonical_ref_key
+from .refs import arweave_parts, canonical_ref_key
 from .resolve import resolve_ref
 from .seed import TooManySeedJobs, get_job, list_jobs, start_seed
 from .static_store import StaticStore
@@ -161,10 +162,12 @@ async def resolve(
             pin_in_background(result, get_settings(), app.state.client, why="resolve pin")
             payload["pin_scheduled"] = True
             payload["keep_state"] = "pending"
+        elif result.resolved and result.source_kind == "arweave":
+            payload["pin_scheduled"] = False
+            outcome = await pin_resolved(result, get_settings(), app.state.client, why="resolve keep")
+            payload["keep_state"] = outcome or "failed"
         else:
             payload["pin_scheduled"] = False
-            if result.source_kind == "arweave":
-                payload["keep_state"] = "unsupported"
     return JSONResponse(payload)
 
 
@@ -411,8 +414,9 @@ async def favorite_add(
         pin_in_background(check, get_settings(), app.state.client, why="favorite")
         check.keep_state = "pending"
     elif check and check.resolved and check.source_kind == "arweave":
-        # A favorite is a keep intent; r81 cannot make that promise.
-        check.keep_state = "unsupported"
+        # Favorites are explicit keep intent. This is a private native Core
+        # hydration, not a claim that r81 offers a pin endpoint.
+        check.keep_state = (await pin_resolved(check, get_settings(), app.state.client, why="favorite")) or "failed"
     return JSONResponse(
         {
             **record,
@@ -497,10 +501,6 @@ async def keep(request: Request, ref: str = Query(...), _: None = Depends(requir
     result = await resolve_ref(ref, get_settings(), app.state.client, origin=request_origin(request))
     if not result.resolved:
         return JSONResponse(result.as_dict(), status_code=422)
-    if result.source_kind == "arweave":
-        # r81 exposes cache observations but no selected-object retention API.
-        return JSONResponse({**result.as_dict(), "keep_state": "unsupported",
-            "error": "AR.IO r81 has no documented API or configuration to protect selected transaction data from eviction"}, status_code=501)
     if result.source_kind in {"http", "data", "upload"}:
         if result.keep_state == "live-dependent":
             return JSONResponse({**result.as_dict(), "keep_state": "live-dependent",
@@ -513,9 +513,9 @@ async def keep(request: Request, ref: str = Query(...), _: None = Depends(requir
         outcome = await pin_resolved(result, get_settings(), app.state.client, why="keep")
     except Exception as exc:
         return JSONResponse({**result.as_dict(), "keep_state": "failed", "error": str(exc)}, status_code=502)
-    if outcome != "pinned":
+    if outcome not in {"pinned", "kept"}:
         return JSONResponse({**result.as_dict(), "keep_state": "failed",
-            "error": "content was not successfully pinned"}, status_code=502)
+            "error": "content was not successfully retained"}, status_code=502)
     result.keep_state = "kept"
     return JSONResponse(result.as_dict())
 
@@ -539,14 +539,18 @@ async def media(file_id: str):
 async def _gateway_proxy(request: Request, backend: str, path: str):
     """One public origin for native gateways; backend ports stay private."""
     settings = get_settings()
-    base = settings.ipfs_internal if backend == "ipfs" else settings.arweave_internal
+    base = (settings.ipfs_internal if backend == "ipfs" else
+            settings.arweave_retained_internal if backend == "arweave-retained" else
+            settings.arweave_internal)
     upstream_path = f"/ipfs/{path}" if backend == "ipfs" else f"/{path}"
     url = f"{base.rstrip('/')}{upstream_path}"
     if request.url.query:
         url += f"?{request.url.query}"
+    headers = {}
+    if request.headers.get("range"):
+        headers["range"] = request.headers["range"]
     upstream = await app.state.client.send(
-        app.state.client.build_request(request.method, url, headers={"range": request.headers.get("range", "")}),
-        stream=True,
+        app.state.client.build_request(request.method, url, headers=headers), stream=True,
     )
     headers = {k: v for k, v in upstream.headers.items() if k.lower() in
                {"content-type", "content-length", "content-range", "accept-ranges", "etag", "cache-control", "x-cache"}}
@@ -561,6 +565,14 @@ async def ipfs_gateway(request: Request, path: str):
 
 @app.api_route("/arweave/{path:path}", methods=["GET", "HEAD"])
 async def arweave_gateway(request: Request, path: str):
+    parsed = arweave_parts(f"ar://{path}")
+    if parsed is not None:
+        txid, retained_path = parsed
+        # A kept identity never quietly falls back to the ordinary Envoy.
+        # If the retained Core is unavailable its response is surfaced as a
+        # degraded native-plane failure rather than substituted bytes.
+        if retained_state(txid, retained_path, get_settings()) == "kept":
+            return await _gateway_proxy(request, "arweave-retained", path)
     return await _gateway_proxy(request, "arweave", path)
 
 

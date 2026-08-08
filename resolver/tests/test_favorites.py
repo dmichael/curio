@@ -137,8 +137,8 @@ async def test_pin_resolved_warms_arweave_and_skips_unresolved():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         arweave = Resolved("ar://TX123", "http://box:3000/TX123", "play", "arweave", True)
-        assert await pin_resolved(arweave, PIN_SETTINGS, client) == "unsupported"
-        assert warmed == []  # r81 cache warming is not durable retention
+        assert await pin_resolved(arweave, PIN_SETTINGS, client) == "kept"
+        assert warmed == ["http://127.0.0.1:4001/TX123", "http://127.0.0.1:4001/TX123"]
 
         dead = Resolved("ipfs://bafyDEAD", "ipfs://bafyDEAD", "play", "ipfs", False)
         assert await pin_resolved(dead, PIN_SETTINGS, client) is None  # nothing fetched

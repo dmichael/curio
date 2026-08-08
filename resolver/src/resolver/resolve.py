@@ -41,6 +41,7 @@ from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
 
 import httpx
 
+from .arweave_retention import retained_available, retained_state
 from .config import Settings
 from .fixups import (
     KNOWN_EXTENSIONS,
@@ -484,11 +485,25 @@ async def _resolve_arweave(
     headers = await probe_headers(client, internal)
     content_type = headers.get("content-type") if headers is not None else None
     main = _main_content_type(content_type)
+    # Kept identity is confirmed against the private Core, never inferred
+    # from the ordinary Envoy's evictable cache headers.
+    state = retained_state(txid, path, settings)
+    retained = state == "kept" and await retained_available(txid, path, settings, client)
 
     if main == "application/json":
-        return await _resolve_token_metadata(ref, internal, "arweave", settings, client, depth)
+        result = await _resolve_token_metadata(ref, internal, "arweave", settings, client, depth)
+        if retained:
+            result.keep_state = "kept"
+        elif state == "kept":
+            result.keep_state = "degraded"
+            result.note = "retained AR.IO plane is unavailable; not falling back for kept identity"
+        return result
     method = "send" if main == "text/html" else "play"
-    return Resolved(ref, public, method, "arweave", True, content_type=content_type)
+    return Resolved(
+        ref, public, method, "arweave", True, content_type=content_type,
+        keep_state="kept" if retained else ("degraded" if state == "kept" else "cached"),
+        note="retained AR.IO plane is unavailable; not falling back for kept identity" if state == "kept" and not retained else None,
+    )
 
 
 async def _resolve_direct(

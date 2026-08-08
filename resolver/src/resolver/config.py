@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     # Gateways the resolver PROBES and fetches metadata from (on-box, localhost).
     ipfs_internal: str = "http://127.0.0.1:8080"
     arweave_internal: str = "http://127.0.0.1:3000"
+    # Private native AR.IO Core used only for explicit Arweave keep intent.
+    # It has separate on-disk Core state from the ordinary evictable gateway.
+    arweave_retained_internal: str = "http://127.0.0.1:4001"
+    arweave_retention_db: str = ""
 
     # Public front-door URL for non-request callers (notably MCP).  Set this
     # behind a reverse proxy; forwarded headers are deliberately not trusted
@@ -82,6 +86,7 @@ class Settings(BaseSettings):
         fallback = self.public_base_url.rstrip("/") or "https://curio.invalid"
         self.ipfs_public_base = self.ipfs_public_base or fallback
         self.arweave_public_base = self.arweave_public_base or fallback
+        self.arweave_retention_db = self.arweave_retention_db or f"{self.static_root.rstrip('/')}/arweave-retained.sqlite3"
         return self
 
 

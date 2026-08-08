@@ -188,7 +188,9 @@ Kept IPFS works are pinned as their canonical DAGs. Kubo announces and serves th
 
 ### Arweave
 
-Kept Arweave works remain available through Curio's AR.IO gateway. Curio protects selected data from its ordinary cache eviction policy and serves it under the original transaction or manifest path.
+Kept Arweave works remain available through Curio's AR.IO gateway. Curio uses two pinned r81 Core instances: ordinary reads use the evictable Core/Envoy cache; explicit keep intent is fully consumed through a private retained Core with separate persistent AR.IO data/SQLite state and the ordinary Envoy as its trusted upstream. The retained Core has no contiguous-cache cleanup threshold and keeps the original transaction and manifest path identity.
+
+This is isolated native retained-plane operation, **not** an upstream AR.IO r81 pin API. Curio records `pending`, `kept`, or `failed` transaction/path intent transactionally, marks `kept` only after a second local native response succeeds, and routes kept txids only to that private Core. If its integrity or availability check fails, status is degraded rather than silently substituting ordinary-cache bytes.
 
 AR.IO gateway participation does not create a new Arweave transaction and does not claim to replicate the underlying Arweave storage network. Its contribution is reliable gateway availability for the selected data.
 

@@ -41,7 +41,7 @@ ensure_start_height() {
 
 assert_state_owned() {
     foreign=$(find "$data_root" -xdev \( ! -user "$(id -u)" -o ! -group "$(id -g)" \) -print -quit 2>/dev/null || true)
-    [ -z "$foreign" ] || fail "persistent state is not owned by the installing user: $foreign (fix ownership before rerunning)"
+    [ -z "$foreign" ] || { echo "persistent state is not owned by the installing user: $foreign (fix ownership before rerunning)" >&2; return 1; }
 }
 
 preseed_envoy_eds() {
@@ -63,6 +63,9 @@ rollback() {
     echo "curio install: new deployment diagnostics follow:" >&2
     docker compose --project-name curio --env-file "$config_file" --file "$new_compose" ps --all >&2 || true
     docker compose --project-name curio --env-file "$config_file" --file "$new_compose" logs --no-color >&2 || true
+    # A failed first deployment must not leave a running partial project;
+    # likewise stop the failed new graph before restoring the old release.
+    docker compose --project-name curio --env-file "$config_file" --file "$new_compose" down --remove-orphans >&2 || true
     if [ -n "$prior_release" ]; then
         echo "curio install: restoring previous release $prior_release" >&2
         switch_current "$prior_release"
@@ -93,6 +96,7 @@ main() {
         app_root=$(read_env "$config_file" CURIO_APP_ROOT); data_root=$(read_env "$config_file" CURIO_DATA_ROOT)
         [ -n "$app_root" ] && [ -n "$data_root" ] || fail "$config_file lacks CURIO_APP_ROOT or CURIO_DATA_ROOT"
         [ -z "${CURIO_APP_ROOT:-}" ] || [ "$requested_app_root" = "$app_root" ] || fail "CURIO_APP_ROOT differs from existing configuration; make an explicit migration instead"
+        [ -z "${CURIO_DATA_ROOT:-}" ] || [ "$requested_data_root" = "$data_root" ] || fail "CURIO_DATA_ROOT differs from existing configuration; make an explicit migration instead"
     else
         app_root=$requested_app_root; data_root=$requested_data_root
         token=${CURIO_CURATOR_TOKEN:-$(dd if=/dev/urandom bs=24 count=1 2>/dev/null | base64 | tr -d '\n')}
@@ -114,10 +118,14 @@ EOF
     grep -q '^CURIO_CURATOR_TOKEN=.' "$config_file" || fail "CURIO_CURATOR_TOKEN is required"
     grep -q '^CURIO_HOST_UID=[0-9][0-9]*$' "$config_file" || fail "CURIO_HOST_UID is required"
     grep -q '^CURIO_HOST_GID=[0-9][0-9]*$' "$config_file" || fail "CURIO_HOST_GID is required"
-    mkdir -p "$app_root/releases" "$data_root/ipfs" "$data_root/ar-io/redis" "$data_root/ar-io/envoy-eds" "$data_root/media"
-    chmod 700 "$data_root"; assert_state_owned
+    mkdir -p "$app_root/releases" "$data_root/ipfs" "$data_root/ar-io/redis" "$data_root/ar-io/envoy-eds" "$data_root/ar-io-retained/redis" "$data_root/media"
+    chmod 700 "$data_root"; assert_state_owned || fail "persistent state ownership check failed"
     preseed_envoy_eds
     ensure_start_height "$data_root/ar-io/start-height.env"
+    # Both r81 Cores must share the first-install chain height while retaining
+    # completely separate Core data/SQLite directories.
+    [ -e "$data_root/ar-io-retained/start-height.env" ] || cp "$data_root/ar-io/start-height.env" "$data_root/ar-io-retained/start-height.env"
+    assert_state_owned || fail "persistent state ownership check failed"
 
     version=$(awk -F '"' '/^version = / {print $2; exit}' "$source_root/resolver/pyproject.toml")
     [ -n "$version" ] || fail "cannot determine package version"
@@ -139,7 +147,7 @@ EOF
     docker compose --project-name curio --env-file "$config_file" --file "$new_compose" build resolver || rollback "resolver image build failed"
     echo "Waiting up to ${health_timeout}s for all Curio services (including Envoy and resolver health)..."
     docker compose --project-name curio --env-file "$config_file" --file "$new_compose" up -d --wait --wait-timeout "$health_timeout" || rollback "Compose start or health check failed"
-    assert_state_owned
+    assert_state_owned || rollback "persistent state ownership check failed after start"
     install -m 0755 "$script_dir/curio" "$bin_home/curio"
     echo "Curio $version installed and healthy. Add $bin_home to PATH, then run: curio status"
 }

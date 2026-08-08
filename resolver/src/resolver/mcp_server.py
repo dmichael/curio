@@ -24,7 +24,7 @@ from .config import get_settings
 from .favorites import FavoriteError, Favorites, get_favorites, list_resolved
 from .health import gateway_health
 from .library import library_status as _library_status
-from .library import pin_in_background
+from .library import pin_in_background, pin_resolved
 from .overrides import OverrideError, OverrideRegistry, get_registry, validate_entry
 from .refs import canonical_ref_key
 from .resolve import resolve_ref
@@ -120,10 +120,11 @@ async def resolve(
             pin_in_background(result, get_settings(), _require_client(), why="resolve pin")
             payload["pin_scheduled"] = True
             payload["keep_state"] = "pending"
+        elif result.resolved and result.source_kind == "arweave":
+            payload["pin_scheduled"] = False
+            payload["keep_state"] = (await pin_resolved(result, get_settings(), _require_client(), why="resolve keep")) or "failed"
         else:
             payload["pin_scheduled"] = False
-            if result.source_kind == "arweave":
-                payload["keep_state"] = "unsupported"
     return payload
 
 
@@ -371,7 +372,7 @@ async def add_favorite(
         pin_in_background(check, get_settings(), _require_client())
         check.keep_state = "pending"
     elif check and check.resolved and check.source_kind == "arweave":
-        check.keep_state = "unsupported"
+        check.keep_state = (await pin_resolved(check, get_settings(), _require_client(), why="favorite")) or "failed"
     return {
         **record,
         "resolved": check.resolved if check else None,

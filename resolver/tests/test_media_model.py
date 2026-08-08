@@ -127,16 +127,18 @@ def test_favorite_promotes_static_and_does_not_schedule_ipfs(http_client, tmp_pa
     get_settings.cache_clear()
 
 
-def test_favorite_reports_arweave_keep_unsupported(http_client, tmp_path, monkeypatch):
+def test_favorite_uses_arweave_retained_plane(http_client, tmp_path, monkeypatch):
     monkeypatch.setenv("RESOLVER_FAVORITES_PATH", str(tmp_path / "favorites.json"))
     get_settings.cache_clear()
     async def ar_result(*_args, **_kwargs):
         return Resolved("ar://x", "http://testserver/arweave/x", "play", "arweave", True, source_kind="arweave")
     monkeypatch.setattr(app_module, "resolve_ref", ar_result)
+    async def retained(*_args, **_kwargs): return "kept"
+    monkeypatch.setattr(app_module, "pin_resolved", retained)
     response = http_client.post("/favorites", params={"ref": "ar://x"})
     assert response.status_code == 201
     assert response.json()["pin_scheduled"] is False
-    assert response.json()["keep_state"] == "unsupported"
+    assert response.json()["keep_state"] == "kept"
     get_settings.cache_clear()
 
 

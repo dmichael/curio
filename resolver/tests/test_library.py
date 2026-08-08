@@ -107,8 +107,8 @@ async def test_pin_resolved_arweave_warm_records_the_caller_why(tmp_path):
     async with client_for(handler) as client:
         outcome = await pin_resolved(result, settings, client, why="favorite")
 
-    assert outcome == "unsupported"
-    assert warmed_txids(settings) == []
+    assert outcome == "kept"
+    assert warmed_txids(settings) == []  # retained-plane hydration is not an ordinary warm
 
 
 # --- capture ledger (seed-driven) --------------------------------------------
@@ -148,20 +148,19 @@ def capture_routes():
 
 
 async def test_http_only_media_is_captured_with_provenance(tmp_path):
-    settings = SEED_SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path)})
+    settings = SEED_SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path), "static_root": str(tmp_path / "media"), "ssrf_dns_check": False})
     client, _ = fake_net(capture_routes())
     job = make_job(ETH_ADDR, "ethereum")
     async with client:
         await run_seed(job, settings, client)
     assert job.status == "done", job.errors
-    assert job.captured == 0
-    assert job.skipped == 1
-    assert job.failed == 0
-    assert not (tmp_path / "captures.jsonl").exists()  # never auto-published to Kubo
+    assert job.captured == 1
+    assert job.skipped == 0 and job.failed == 0
+    assert not (tmp_path / "captures.jsonl").exists()  # HTTP never enters Kubo
 
 
 async def test_capture_is_once_per_url_across_jobs(tmp_path):
-    settings = SEED_SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path)})
+    settings = SEED_SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path), "static_root": str(tmp_path / "media"), "ssrf_dns_check": False})
     first, _ = fake_net(capture_routes())
     async with first:
         await run_seed(make_job(ETH_ADDR, "ethereum"), settings, first)
@@ -171,23 +170,24 @@ async def test_capture_is_once_per_url_across_jobs(tmp_path):
     async with second:
         await run_seed(job, settings, second)
     assert job.status == "done", job.errors
-    assert job.captured == 0
-    assert job.skipped == 1
-    assert not any(CAPTURE_URL in line for line in log)  # no automatic HTTP fetch
+    assert job.captured == 1
+    assert job.skipped == 0
+    assert any(CAPTURE_URL in line for line in log)  # explicit seed retains HTTP statically
 
 
 async def test_http_media_is_skipped_when_capture_is_off():
+    settings = SEED_SETTINGS.model_copy(update={"static_root": "/tmp/curio-seed-test", "ssrf_dns_check": False})
     client, _ = fake_net(capture_routes())
     job = make_job(ETH_ADDR, "ethereum")
     async with client:
-        await run_seed(job, SEED_SETTINGS, client)
+        await run_seed(job, settings, client)
     assert job.status == "done", job.errors
-    assert job.captured == 0
-    assert job.skipped == 1
+    assert job.captured == 1
+    assert job.skipped == 0 and job.failed == 0
 
 
 async def test_capture_failure_is_counted_not_fatal(tmp_path):
-    settings = SEED_SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path)})
+    settings = SEED_SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path), "static_root": str(tmp_path / "media"), "ssrf_dns_check": False})
     routes = capture_routes()
     routes[CAPTURE_URL] = {"status_code": 410}  # the domain died mid-seed
     client, _ = fake_net(routes)
@@ -196,8 +196,7 @@ async def test_capture_failure_is_counted_not_fatal(tmp_path):
         await run_seed(job, settings, client)
     assert job.status == "done"
     assert job.captured == 0
-    assert job.failed == 0
-    assert job.skipped == 1
+    assert job.failed == 1 and job.skipped == 0
     assert not (tmp_path / "captures.jsonl").exists()
 
 
@@ -247,8 +246,8 @@ async def test_library_status_degrades_per_plane():
         status = await library_status(SETTINGS, client)
 
     assert "error" in status["ipfs"]
-    assert status["arweave"]["kept"] == "unsupported"
-    assert "r81" in status["arweave"]["technical_blocker"]
+    assert set(status["arweave"]["retained"]) == {"kept", "pending", "failed", "operation"}
+    assert "retained-plane" in status["arweave"]["retained"]["operation"]
     assert status["registry"] == {"overrides": None, "favorites": None, "captures": None}
 
 
@@ -259,6 +258,7 @@ async def test_library_status_degrades_per_plane():
 def library_env(http_client, tmp_path, monkeypatch):
     """The shared client with every subsystem enabled against tmp paths."""
     monkeypatch.setenv("RESOLVER_SEED_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("RESOLVER_ARWEAVE_RETENTION_DB", str(tmp_path / "retained.sqlite3"))
     monkeypatch.setenv("RESOLVER_OVERRIDES_PATH", str(tmp_path / "overrides.toml"))
     monkeypatch.setenv("RESOLVER_FAVORITES_PATH", str(tmp_path / "favorites.json"))
     get_settings.cache_clear()
@@ -291,5 +291,6 @@ def test_library_route_reports_the_three_planes(library_env):
     body = response.json()
     assert set(body) == {"ipfs", "arweave", "registry"}
     assert body["ipfs"]["pinned"] == 3
-    assert body["arweave"] == {"known_warmed": 1, "currently_cached": 1}  # no eviction note
+    assert body["arweave"]["known_warmed"] == 1 and body["arweave"]["currently_cached"] == 1
+    assert body["arweave"]["retained"]["kept"] == 0
     assert body["registry"] == {"overrides": 0, "favorites": 0, "captures": 0}

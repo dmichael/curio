@@ -32,8 +32,9 @@ if PATH="$TMP/bin:$PATH" CURIO_RELEASE_BASE_URL="file://$TMP/release" "$ROOT/ins
 # retains all r81 services/configuration while exposing only Curio's front door
 # (plus IPFS swarm participation), and resolver waits on real Envoy health.
 if command -v docker >/dev/null && docker compose version >/dev/null 2>&1; then
-  DATA="$TMP/data"; APP="$TMP/app"; mkdir -p "$DATA/ar-io" "$APP/current"
+  DATA="$TMP/data"; APP="$TMP/app"; mkdir -p "$DATA/ar-io" "$DATA/ar-io-retained" "$APP/current"
   printf 'START_HEIGHT=0\n' >"$DATA/ar-io/start-height.env"
+  printf 'START_HEIGHT=0\n' >"$DATA/ar-io-retained/start-height.env"
   cat >"$TMP/curio.env" <<EOF
 CURIO_APP_ROOT=$APP
 CURIO_DATA_ROOT=$DATA
@@ -45,8 +46,9 @@ EOF
   python3 - "$TMP/compose.json" "$DATA" <<'PY'
 import json, pathlib, sys
 c=json.loads(pathlib.Path(sys.argv[1]).read_text()); s=c['services']; data=pathlib.Path(sys.argv[2])
-assert set(s)=={'resolver','kubo','ar-io-redis','ar-io-core','ar-io-observer','ar-io-envoy'}
+assert set(s)=={'resolver','kubo','ar-io-redis','ar-io-core','ar-io-retained-redis','ar-io-retained','ar-io-observer','ar-io-envoy'}
 assert s['resolver']['depends_on']['ar-io-envoy']['condition']=='service_healthy'
+assert s['resolver']['depends_on']['ar-io-retained']['condition']=='service_healthy'
 assert s['resolver']['healthcheck']['test'][0] == 'CMD'
 assert s['ar-io-envoy']['healthcheck']['test'] == ['CMD','curl','-fsS','http://127.0.0.1:3000/ar-io/info']
 assert s['ar-io-observer']['healthcheck']['test'] == ['CMD-SHELL', 'test -d /']
@@ -55,6 +57,11 @@ for key in ('RUN_OBSERVER','TRUSTED_GATEWAYS_URLS','ON_DEMAND_RETRIEVAL_ORDER','
     assert key in core, key
 assert core['RUN_OBSERVER']=='false' and core['ON_DEMAND_RETRIEVAL_ORDER'].split(',')[0]=='trusted-gateways'
 assert s['ar-io-core']['user'] == f'{__import__("os").getuid()}:{__import__("os").getgid()}'
+retained=s['ar-io-retained']
+assert retained['user'] == f'{__import__("os").getuid()}:{__import__("os").getgid()}'
+assert retained['environment']['TRUSTED_NODE_URL']=='http://ar-io-envoy:3000'
+assert 'CONTIGUOUS_DATA_CACHE_CLEANUP_THRESHOLD' not in retained['environment']
+assert not retained.get('ports', [])
 assert 'user' not in s['ar-io-envoy']  # image must generate /etc/envoy config as root
 assert not next(v for v in s['ar-io-envoy']['volumes'] if v['target'] == '/data/envoy-eds').get('read_only', False)
 envoy=s['ar-io-envoy']['environment']
@@ -65,6 +72,7 @@ assert ('resolver',8090) in ports and ('kubo',4001) in ports
 assert not s['kubo'].get('ports',[])[0]['target']==8080
 assert not s['ar-io-envoy'].get('ports',[])
 assert s['resolver']['environment']['RESOLVER_ARWEAVE_INTERNAL']=='http://ar-io-envoy:3000'
+assert s['resolver']['environment']['RESOLVER_ARWEAVE_RETAINED_INTERNAL']=='http://ar-io-retained:4000'
 assert 'RESOLVER_IPFS_PUBLIC_BASE' not in s['resolver']['environment']
 PY
 else
@@ -116,6 +124,7 @@ XDG_DATA_HOME="$TMP/xdg-data" XDG_CONFIG_HOME="$TMP/xdg-config" XDG_BIN_HOME="$T
 [[ -L $TMP/custom-app/current ]] || fail 'installer did not create current release pointer'
 [[ -d $TMP/custom-state/ipfs && -f $TMP/xdg-config/curio/curio.env ]] || fail 'installer did not persist user state'
 [[ $(<"$TMP/custom-state/ar-io/start-height.env") == START_HEIGHT=123456 ]] || fail 'first install did not discover AR.IO height'
+[[ $(<"$TMP/custom-state/ar-io-retained/start-height.env") == START_HEIGHT=123456 ]] || fail 'installer did not initialize retained AR.IO state'
 [[ -f "$TMP/custom-state/ar-io/envoy-eds/arweave_full_nodes.json" && -f "$TMP/custom-state/ar-io/envoy-eds/arweave_partial_nodes.json" ]] || fail 'installer did not preseed user-owned Envoy EDS files'
 first_pointer=$(readlink "$TMP/custom-app/current"); first_version=$(<"$TMP/custom-app/current/VERSION")
 # Simulate the next verified release: an update must replace both pointer and
@@ -132,11 +141,13 @@ second_pointer=$(readlink "$TMP/custom-app/current")
 [[ $second_pointer != "$first_pointer" && $(<"$TMP/custom-app/current/VERSION") != "$first_version" ]] || fail 'second install did not replace current release pointer and version'
 [[ $(<"$TMP/custom-state/ar-io/start-height.env") == START_HEIGHT=123456 ]] || fail 'rerun changed AR.IO start height'
 [[ $(<"$TMP/custom-state/sentinel") == preserved ]] || fail 'rerun damaged persistent state'
+if XDG_DATA_HOME="$TMP/xdg-data" XDG_CONFIG_HOME="$TMP/xdg-config" XDG_BIN_HOME="$TMP/bin-out" CURIO_APP_ROOT="$TMP/custom-app" CURIO_DATA_ROOT="$TMP/conflicting-state" CURIO_DOCKER_LOG="$TMP/docker.log" PATH="$TMP/bin:$PATH" "$ROOT/appliance/install.sh" >/dev/null 2>&1; then fail 'installer accepted conflicting CURIO_DATA_ROOT on rerun'; fi
 # Failed start/health must restore the previous pointer and deployment.
 up_before=$(grep -c 'up -d' "$TMP/docker.log" || true)
 if XDG_DATA_HOME="$TMP/xdg-data" XDG_CONFIG_HOME="$TMP/xdg-config" XDG_BIN_HOME="$TMP/bin-out" CURIO_APP_ROOT="$TMP/custom-app" CURIO_DOCKER_LOG="$TMP/docker.log" CURIO_DOCKER_FAIL_UP=1 CURIO_DOCKER_FAIL_ONCE_FILE="$TMP/fail-once" PATH="$TMP/bin:$PATH" "$ROOT/appliance/install.sh" >/dev/null 2>&1; then fail 'installer accepted failed Compose health'; fi
 [[ $(readlink "$TMP/custom-app/current") == "$second_pointer" ]] || fail 'failed install did not roll back current pointer'
 [[ $(grep -c 'up -d' "$TMP/docker.log") -eq $((up_before + 2)) ]] || fail 'failed install did not restore prior Compose deployment'
+grep -q 'down --remove-orphans' "$TMP/docker.log" || fail 'failed install did not remove partial Compose project'
 CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_DOCKER_LOG="$TMP/docker.log" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" status
 
 grep -q -- '--file .*custom-app/current/compose.yaml' "$TMP/docker.log" || fail 'wrapper did not discover configured custom app root'
