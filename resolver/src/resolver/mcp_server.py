@@ -20,17 +20,15 @@ import httpx
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+from . import operations
 from .config import get_settings
 from .favorites import FavoriteError, Favorites, get_favorites, list_resolved
 from .health import gateway_health
 from .library import library_status as _library_status
-from .library import pin_in_background, pin_resolved
 from .origin import effective_origin
-from .overrides import OverrideError, OverrideRegistry, get_registry, validate_entry
-from .refs import canonical_ref_key
+from .overrides import OverrideError, OverrideRegistry, get_registry
 from .resolve import resolve_ref
 from .seed import get_job, list_jobs, start_seed
-from .static_store import StaticStore
 from .wallets import list_wallet_tokens
 
 _SKILL_PATH = Path(__file__).parent / "skill" / "SKILL.md"
@@ -80,13 +78,6 @@ def _mcp_origin(ctx: Context | None = None) -> str:
     return settings.public_base_url.rstrip("/") or settings.ipfs_public_base.rstrip("/")
 
 
-def _promote_static(result) -> bool:
-    if result.source_kind not in {"http", "data", "upload"} or "/media/" not in result.resolved_url:
-        return False
-    settings = get_settings()
-    return StaticStore(settings.static_root, settings.static_cache_max_bytes).keep(result.resolved_url.rsplit("/", 1)[-1])
-
-
 def _require_curator(token: str | None) -> None:
     configured = get_settings().curator_token
     if not configured or token != configured:
@@ -107,28 +98,13 @@ async def resolve(
     static media is promoted synchronously, and Arweave fully fetches then
     verifies the same persistent Core cache. Runtime HTML remains live-dependent.
     """
-    result = await resolve_ref(ref, get_settings(), _require_client(), origin=_mcp_origin(ctx))
-    payload = result.as_dict()
+    settings = get_settings()
+    client = _require_client()
+    result = await resolve_ref(ref, settings, client, origin=_mcp_origin(ctx))
     if pin:
         _require_curator(curator_token)
-        if result.source_kind in {"http", "data", "upload"}:
-            promoted = result.keep_state != "live-dependent" and _promote_static(result)
-            payload["pin_scheduled"] = False
-            payload["promoted"] = promoted
-            if promoted:
-                payload["keep_state"] = "kept"
-            elif result.keep_state != "live-dependent":
-                payload["keep_state"] = "failed"
-        elif result.resolved and result.keep_state != "live-dependent" and result.source_kind == "ipfs":
-            pin_in_background(result, get_settings(), _require_client(), why="resolve pin")
-            payload["pin_scheduled"] = True
-            payload["keep_state"] = "pending"
-        elif result.resolved and result.keep_state != "live-dependent" and result.source_kind == "arweave":
-            payload["pin_scheduled"] = False
-            payload["keep_state"] = (await pin_resolved(result, get_settings(), _require_client(), why="resolve keep")) or "failed"
-        else:
-            payload["pin_scheduled"] = False
-    return payload
+        return await operations.resolved_with_optional_pin(result, settings, client)
+    return result.as_dict()
 
 
 @mcp.tool()
@@ -265,33 +241,25 @@ async def add_override(
     tells you whether the replacement actually resolves right now.
     """
     _require_curator(curator_token)
-    entry = validate_entry(
-        {
-            "ref": ref,
-            "replacement": replacement,
-            "status": status,
-            "token": token,
-            "source": source,
-            "captured": captured,
-            "note": note,
-        }
-    )
     try:
-        replaced = _require_registry().upsert(entry, replace=replace)
+        return await operations.create_override(
+            _require_registry(),
+            {
+                "ref": ref,
+                "replacement": replacement,
+                "status": status,
+                "token": token,
+                "source": source,
+                "captured": captured,
+                "note": note,
+            },
+            replace=replace,
+            settings=get_settings(),
+            client=_require_client(),
+            origin=lambda: _mcp_origin(ctx),
+        )
     except OverrideError as exc:
         raise ValueError(str(exc)) from exc
-    try:
-        # Disclosure, never a gate: the write already happened.
-        check = await resolve_ref(entry.replacement, get_settings(), _require_client(), origin=_mcp_origin(ctx))
-    except Exception:
-        check = None
-    return {
-        "entry": asdict(entry),
-        "canonical_key": canonical_ref_key(entry.ref),
-        "replaced": replaced,
-        "replacement_resolved": check.resolved if check else None,
-        "replacement_resolved_url": check.resolved_url if check and check.resolved else None,
-    }
 
 
 @mcp.tool()
@@ -347,40 +315,26 @@ async def add_favorite(
     was picked.
     """
     _require_curator(curator_token)
-    favorites = _require_favorites()
     try:
-        # Enrichment, never a gate: a resolve hiccup must not block the pick.
-        check = await resolve_ref(ref, get_settings(), _require_client(), origin=_mcp_origin(ctx))
-    except Exception:
-        check = None
-    try:
-        record = favorites.add(
-            ref, title=check.title if check else None, note=note,
-            final_ref=check.final_ref if check else None,
+        created = await operations.create_favorite(
+            _require_favorites(),
+            ref,
+            note,
+            settings=get_settings(),
+            client=_require_client(),
+            origin=lambda: _mcp_origin(ctx),
         )
     except FavoriteError as exc:
         raise ValueError(str(exc)) from exc
-    pin_scheduled = bool(
-        check and check.resolved and check.keep_state != "live-dependent"
-        and check.source_kind not in {"http", "data", "upload", "arweave"}
-    )
-    promoted = False
-    if check and check.resolved and check.source_kind in {"http", "data", "upload"}:
-        promoted = check.keep_state != "live-dependent" and _promote_static(check)
-        check.keep_state = "kept" if promoted else check.keep_state
-    elif pin_scheduled:
-        pin_in_background(check, get_settings(), _require_client())
-        check.keep_state = "pending"
-    elif check and check.resolved and check.keep_state != "live-dependent" and check.source_kind == "arweave":
-        check.keep_state = (await pin_resolved(check, get_settings(), _require_client(), why="favorite")) or "failed"
+    result, record = created.result, created.record
     return {
         **record,
-        "resolved": check.resolved if check else None,
-        "final_ref": check.final_ref if check else record.get("final_ref"),
-        "source_ref": check.final_ref if check else record.get("final_ref"),
-        "pin_scheduled": pin_scheduled,
-        "promoted": promoted,
-        "keep_state": check.keep_state if check else None,
+        "resolved": result.resolved if result else None,
+        "final_ref": result.final_ref if result else record.get("final_ref"),
+        "source_ref": result.final_ref if result else record.get("final_ref"),
+        "pin_scheduled": created.pin_scheduled,
+        "promoted": created.promoted,
+        "keep_state": result.keep_state if result else None,
     }
 
 

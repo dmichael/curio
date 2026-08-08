@@ -40,6 +40,7 @@ from fastapi.responses import (
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
+from . import operations
 from .config import get_settings
 from .favorites import (
     DuplicateFavorite,
@@ -50,7 +51,7 @@ from .favorites import (
     list_resolved,
 )
 from .health import gateway_health
-from .library import library_status, pin_in_background, pin_resolved
+from .library import library_status, pin_resolved
 from .mcp_server import mcp, set_client
 from .origin import effective_origin, normalize_origin
 from .overrides import (
@@ -59,9 +60,7 @@ from .overrides import (
     OverrideRegistry,
     RegistryUnparseable,
     get_registry,
-    validate_entry,
 )
-from .refs import canonical_ref_key
 from .resolve import resolve_ref
 from .seed import TooManySeedJobs, get_job, list_jobs, start_seed
 from .static_store import StaticStore
@@ -117,14 +116,6 @@ def request_origin(request: Request) -> str:
     return origin
 
 
-def _promote_static(result) -> bool:
-    """Promote the source-native static object; never route HTTP/data via IPFS."""
-    if result.source_kind not in {"http", "data", "upload"} or "/media/" not in result.resolved_url:
-        return False
-    settings = get_settings()
-    return StaticStore(settings.static_root, settings.static_cache_max_bytes).keep(result.resolved_url.rsplit("/", 1)[-1])
-
-
 def require_curator(authorization: str | None = Header(default=None)) -> None:
     token = get_settings().curator_token
     if not token:
@@ -147,29 +138,13 @@ async def resolve(
 ):
     if pin:
         require_curator(request.headers.get("authorization"))
-    result = await resolve_ref(ref, get_settings(), app.state.client, origin=request_origin(request))
-    payload = result.as_dict()
-    if pin:
-        # Static objects have a local durable store, so promote them in this
-        # request and never pretend a no-op IPFS helper was scheduled.
-        if result.source_kind in {"http", "data", "upload"}:
-            promoted = result.keep_state != "live-dependent" and _promote_static(result)
-            payload["pin_scheduled"] = False
-            payload["promoted"] = promoted
-            if promoted:
-                payload["keep_state"] = "kept"
-            elif result.keep_state != "live-dependent":
-                payload["keep_state"] = "failed"
-        elif result.resolved and result.keep_state != "live-dependent" and result.source_kind == "ipfs":
-            pin_in_background(result, get_settings(), app.state.client, why="resolve pin")
-            payload["pin_scheduled"] = True
-            payload["keep_state"] = "pending"
-        elif result.resolved and result.keep_state != "live-dependent" and result.source_kind == "arweave":
-            payload["pin_scheduled"] = False
-            outcome = await pin_resolved(result, get_settings(), app.state.client, why="resolve keep")
-            payload["keep_state"] = outcome or "failed"
-        else:
-            payload["pin_scheduled"] = False
+    settings = get_settings()
+    result = await resolve_ref(ref, settings, app.state.client, origin=request_origin(request))
+    payload = (
+        await operations.resolved_with_optional_pin(result, settings, app.state.client)
+        if pin
+        else result.as_dict()
+    )
     return JSONResponse(payload)
 
 
@@ -322,29 +297,19 @@ async def override_add(
     if registry is None:
         return _registry_disabled()
     try:
-        entry = validate_entry(body.model_dump(exclude={"replace"}))
+        payload = await operations.create_override(
+            registry,
+            body.model_dump(exclude={"replace"}),
+            replace=body.replace,
+            settings=get_settings(),
+            client=app.state.client,
+            origin=lambda: request_origin(request),
+        )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
-    try:
-        replaced = registry.upsert(entry, replace=body.replace)
     except (DuplicateOverride, RegistryUnparseable) as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
-    try:
-        # Disclosure, never a gate: the write above already happened, and a
-        # network hiccup must not make it look like it didn't.
-        check = await resolve_ref(entry.replacement, get_settings(), app.state.client, origin=request_origin(request))
-    except Exception:
-        check = None
-    return JSONResponse(
-        {
-            "entry": asdict(entry),
-            "canonical_key": canonical_ref_key(entry.ref),
-            "replaced": replaced,
-            "replacement_resolved": check.resolved if check else None,
-            "replacement_resolved_url": check.resolved_url if check and check.resolved else None,
-        },
-        status_code=201,
-    )
+    return JSONResponse(payload, status_code=201)
 
 
 @app.delete("/override")
@@ -396,46 +361,29 @@ async def favorite_add(
     if favorites is None:
         return _favorites_disabled()
     try:
-        # Enrichment, never a gate: a title is nice to have in the browse
-        # list, but a network hiccup must not block recording the pick.
-        check = await resolve_ref(ref, get_settings(), app.state.client, origin=request_origin(request))
-    except Exception:
-        check = None
-    try:
-        record = favorites.add(
-            ref, title=check.title if check else None, note=note,
-            final_ref=check.final_ref if check else None,
+        created = await operations.create_favorite(
+            favorites,
+            ref,
+            note,
+            settings=get_settings(),
+            client=app.state.client,
+            origin=lambda: request_origin(request),
+            background_why="favorite",
         )
     except (DuplicateFavorite, FavoritesUnparseable) as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
-    pin_scheduled = bool(
-        check and check.resolved and check.keep_state != "live-dependent"
-        and check.source_kind not in {"http", "data", "upload", "arweave"}
-    )
-    promoted = False
-    if check and check.resolved and check.source_kind in {"http", "data", "upload"}:
-        # Static artifacts are kept in their own durable store, not copied to
-        # IPFS. HTML is a captured shell with live dependencies, not a kept runtime.
-        promoted = check.keep_state != "live-dependent" and _promote_static(check)
-        check.keep_state = "kept" if promoted else check.keep_state
-    elif pin_scheduled:
-        pin_in_background(check, get_settings(), app.state.client, why="favorite")
-        check.keep_state = "pending"
-    elif check and check.resolved and check.keep_state != "live-dependent" and check.source_kind == "arweave":
-        # Favorites are explicit keep intent: fetch and verify this same
-        # persistent Core cache, not an AR.IO pin or network replication claim.
-        check.keep_state = (await pin_resolved(check, get_settings(), app.state.client, why="favorite")) or "failed"
+    result, record = created.result, created.record
     return JSONResponse(
         {
             **record,
-            "resolved": check.resolved if check else None,
-            "resolved_url": check.resolved_url if check and check.resolved else None,
-            "playback_method": check.playback_method if check else None,
-            "final_ref": check.final_ref if check else record.get("final_ref"),
-            "source_ref": check.final_ref if check else record.get("final_ref"),
-            "pin_scheduled": pin_scheduled,
-            "keep_state": check.keep_state if check else None,
-            "promoted": promoted,
+            "resolved": result.resolved if result else None,
+            "resolved_url": result.resolved_url if result and result.resolved else None,
+            "playback_method": result.playback_method if result else None,
+            "final_ref": result.final_ref if result else record.get("final_ref"),
+            "source_ref": result.final_ref if result else record.get("final_ref"),
+            "pin_scheduled": created.pin_scheduled,
+            "keep_state": result.keep_state if result else None,
+            "promoted": created.promoted,
         },
         status_code=201,
     )
@@ -515,7 +463,7 @@ async def keep(request: Request, ref: str = Query(...), _: None = Depends(requir
         return JSONResponse({**result.as_dict(), "keep_state": "live-dependent",
             "error": "HTML capture has uncaptured runtime dependencies"}, status_code=409)
     if result.source_kind in {"http", "data", "upload"}:
-        if not _promote_static(result):
+        if not operations.promote_static(result, get_settings()):
             return JSONResponse({"error": "static media missing"}, status_code=404)
         result.keep_state = "kept"
         return JSONResponse(result.as_dict())

@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from resolver import app as app_module
-from resolver import mcp_server
+from resolver import mcp_server, operations
 from resolver.config import Settings, get_settings
 from resolver.library import pin_resolved
 from resolver.resolve import Resolved, resolve_ref
@@ -218,7 +218,7 @@ def test_resolve_pin_promotes_static_synchronously(http_client, tmp_path, monkey
     async def static_result(*_args, **_kwargs):
         return Resolved("x", f"http://testserver/media/{entry['id']}", "play", "http", True, source_kind="http")
     monkeypatch.setattr(app_module, "resolve_ref", static_result)
-    monkeypatch.setattr(app_module, "pin_in_background", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no background pin")))
+    monkeypatch.setattr(operations, "pin_in_background", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no background pin")))
     response = http_client.get("/resolve", params={"ref": "https://origin.example/x.png", "pin": "true"})
     assert response.status_code == 200
     assert response.json()["promoted"] is True and response.json()["keep_state"] == "kept"
@@ -233,8 +233,8 @@ def test_favorite_promotes_static_and_does_not_schedule_ipfs(http_client, tmp_pa
     entry = StaticStore(str(tmp_path / "media")).put(b"x", media_type="image/png", filename="x.png", source_ref="x")
     async def static_result(*_args, **_kwargs):
         return Resolved("x", f"http://testserver/media/{entry['id']}", "play", "http", True, source_kind="http")
-    monkeypatch.setattr(app_module, "resolve_ref", static_result)
-    monkeypatch.setattr(app_module, "pin_in_background", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no IPFS helper")))
+    monkeypatch.setattr(operations, "resolve_ref", static_result)
+    monkeypatch.setattr(operations, "pin_in_background", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no IPFS helper")))
     response = http_client.post("/favorites", params={"ref": "https://origin.example/x.png"})
     assert response.status_code == 201 and response.json()["promoted"] is True
     assert StaticStore(str(tmp_path / "media")).get(str(entry["id"]))[0]["keep_state"] == "kept"
@@ -246,9 +246,9 @@ def test_favorite_verifies_same_core_arweave_cache(http_client, tmp_path, monkey
     get_settings.cache_clear()
     async def ar_result(*_args, **_kwargs):
         return Resolved("ar://x", "http://testserver/arweave/x", "play", "arweave", True, source_kind="arweave")
-    monkeypatch.setattr(app_module, "resolve_ref", ar_result)
+    monkeypatch.setattr(operations, "resolve_ref", ar_result)
     async def verified(*_args, **_kwargs): return "kept"
-    monkeypatch.setattr(app_module, "pin_resolved", verified)
+    monkeypatch.setattr(operations, "pin_resolved", verified)
     response = http_client.post("/favorites", params={"ref": "ar://x"})
     assert response.status_code == 201
     assert response.json()["pin_scheduled"] is False
@@ -306,8 +306,9 @@ def test_live_native_html_is_never_scheduled_or_kept_by_rest_actions(
         raise AssertionError("runtime HTML must not be retained as a complete work")
 
     monkeypatch.setattr(app_module, "resolve_ref", html_result)
-    monkeypatch.setattr(app_module, "pin_in_background", retention_called)
-    monkeypatch.setattr(app_module, "pin_resolved", retention_called)
+    monkeypatch.setattr(operations, "resolve_ref", html_result)
+    monkeypatch.setattr(operations, "pin_in_background", retention_called)
+    monkeypatch.setattr(operations, "pin_resolved", retention_called)
     response = http_client.get("/resolve", params={"ref": final_ref, "pin": "true"})
     assert response.status_code == 200
     assert response.json()["keep_state"] == "live-dependent"
@@ -336,8 +337,9 @@ async def test_mcp_live_html_is_never_scheduled_or_kept(tmp_path, monkeypatch, s
         raise AssertionError("runtime HTML must not be retained as a complete work")
 
     monkeypatch.setattr(mcp_server, "resolve_ref", html_result)
-    monkeypatch.setattr(mcp_server, "pin_in_background", retention_called)
-    monkeypatch.setattr(mcp_server, "pin_resolved", retention_called)
+    monkeypatch.setattr(operations, "resolve_ref", html_result)
+    monkeypatch.setattr(operations, "pin_in_background", retention_called)
+    monkeypatch.setattr(operations, "pin_resolved", retention_called)
     content, _ = await mcp_server.mcp.call_tool(
         "resolve", {"ref": final_ref, "pin": True, "curator_token": "test-curator-token"},
     )
