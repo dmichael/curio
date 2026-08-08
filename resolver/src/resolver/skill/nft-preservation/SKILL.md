@@ -10,15 +10,15 @@ what to preserve and what Curio can honestly claim.
 
 ## Mental model
 
-- **Resolution is not keep.** A resolution can populate evictable Kubo,
-  AR.IO, or Curio-static cache. `cached` is not durable preservation.
+- **Resolution is not keep.** A resolution can populate Kubo, the persistent
+  AR.IO Core, or Curio-static cache. `cached` is not durable preservation.
 - **Keep is source-appropriate.** IPFS keep pins the canonical DAG in Kubo and
-  seeds it. Arweave keep hydrates a separate retained r81 Core and verifies a
-  native hit. HTTP, `data:`, and uploads stay in Curio static storage; Curio
-  does not add them to IPFS implicitly.
-- **Arweave wording matters.** The retained Core is not an AR.IO r81 pin API
-  and does not create a new Arweave replica. It preserves selected local native
-  serving state and routes kept identities only through that plane.
+  seeds it. Arweave keep fully fetches through the same persistent Core and
+  verifies a native hit. HTTP, `data:`, and uploads stay in Curio static
+  storage; Curio does not add them to IPFS implicitly.
+- **Arweave wording matters.** Same-Core cache verification is not an AR.IO
+  pin API and does not create a new Arweave replica or move content between
+  tiers.
 - **Runtime HTML is different.** A live HTML response can play, but scripts,
   workers, APIs, fonts, and origin behavior may still be upstream-dependent.
   Curio marks it `live-dependent` and does not call it kept.
@@ -38,7 +38,7 @@ what to preserve and what Curio can honestly claim.
    `failed` needs operator attention. `live-dependent` is not complete runtime
    preservation.
 4. Inspect `GET /library` and `/healthz`. A daemon running or a Kubo address
-   advertised does not prove public reachability. AR.IO r81 exposes no public
+   advertised does not prove public reachability. AR.IO Core exposes no public
    reachability proof, so `unknown` is the honest result.
 
 ## Keep one work
@@ -51,11 +51,13 @@ curl -X POST -H 'Authorization: Bearer YOUR_TOKEN' --get \
   --data-urlencode 'ref=ar://transaction-id/path'
 ```
 
-For IPFS, this pins the canonical DAG. For Arweave, Curio stores pending intent,
-fully consumes the retained-Core response, verifies a second native cache hit,
-and then marks it kept. For HTTP/data, first resolve it so it has a `/media/<id>`
-artifact, then keep promotes that static object. If any promotion fails, record
-that failure; do not call a cache warm a pin.
+For IPFS, this pins the canonical DAG. For Arweave, Curio fully consumes the
+same-Core response, verifies a second native cache hit, and then reports the
+keep result. Resolve/play also populate this persistent cache; keep is eager
+fetch/verification, not a network replication claim. For HTTP/data, first
+resolve it so it has a `/media/<id>` artifact, then keep promotes that static
+object. If any promotion fails, record that failure; do not call a cache warm a
+pin.
 
 `GET /resolve?ref=...&pin=1` also requires the bearer token. It is useful when
 an asynchronous IPFS pin is acceptable, but `pin_scheduled: true` only means
@@ -74,7 +76,8 @@ curl -X POST -H 'Authorization: Bearer YOUR_TOKEN' --get \
 ```
 
 Poll `GET /seed/<id>`. The job is in-memory, so save its outcome separately if
-needed. It keeps IPFS through Kubo, Arweave through retained Core, and ordinary
+needed. It keeps IPFS through Kubo, fetches/verifies Arweave through the same
+persistent Core, and keeps ordinary
 media in Curio static storage. It does not upload ordinary media to IPFS.
 
 Use `scope=held` for holdings; Tezos `scope=published` for first-minted works;

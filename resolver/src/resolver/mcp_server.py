@@ -104,8 +104,8 @@ async def resolve(
     `play` is static media and `send` is HTML. `resolved=false` means Curio
     cannot serve a local artifact. `substituted=true` discloses an override.
     pin=true requires curator_token: IPFS reports a background pending pin,
-    static media is promoted synchronously, and Arweave uses verified private
-    retained-Core hydration. Runtime HTML remains live-dependent.
+    static media is promoted synchronously, and Arweave fully fetches then
+    verifies the same persistent Core cache. Runtime HTML remains live-dependent.
     """
     result = await resolve_ref(ref, get_settings(), _require_client(), origin=_mcp_origin(ctx))
     payload = result.as_dict()
@@ -189,8 +189,8 @@ async def seed_wallet(
 ) -> dict[str, Any]:
     """Start a source-appropriate wallet keep job (background).
 
-    It pins final IPFS artifacts, keeps final Arweave artifacts through the
-    verified private retained Core, and promotes final HTTP/data artifacts in
+    It pins final IPFS artifacts, fetches and verifies final Arweave artifacts
+    through the one persistent Core, and promotes final HTTP/data artifacts in
     Curio static storage. Ordinary bytes never enter IPFS implicitly. Poll
     with seed_status. Re-running is safe; use limit for a partial run.
     scope="published" and "created" are Tezos-only; "contract" accepts a
@@ -342,7 +342,7 @@ async def add_favorite(
     whether the ref resolves right now). Favoriting also makes the content
     durable where the source supports it: static records are promoted
     synchronously, IPFS pinning is scheduled (`pin_scheduled=true`), and
-    Arweave uses the retained Core synchronously. Runtime HTML remains
+    Arweave synchronously fetches and verifies the same persistent Core cache. Runtime HTML remains
     live-dependent. Removing a favorite never unpins. Use note for why it
     was picked.
     """
@@ -406,11 +406,11 @@ async def health() -> dict[str, Any]:
 async def library_status() -> dict[str, Any]:
     """What the box holds, plane by plane.
 
-    `ipfs.pinned` counts recursive Kubo pins. `arweave.retained` reports
-    pending/kept/failed private retained-Core identities and confirmed native
-    availability; it is not an r81 pin API. `known_warmed` and
-    `currently_cached` are separate, evictable ordinary-AR.IO diagnostics.
-    Registry counts cover operator state. A failed plane gets its own error
+    `ipfs.pinned` counts recursive Kubo pins. Arweave `known_warmed` and
+    `currently_cached` describe the one persistent Core cache. Resolve/play
+    also populate it; explicit keep eagerly fetches and verifies a local hit.
+    This is not an Arweave-network replication claim. Registry counts cover
+    operator state. A failed plane gets its own error
     rather than failing the complete response.
     """
     return await _library_status(get_settings(), _require_client())

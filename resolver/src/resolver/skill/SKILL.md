@@ -56,8 +56,8 @@ curl -X POST -H 'Authorization: Bearer YOUR_TOKEN' --get \
 `POST /keep?ref=...` returns only after its source-appropriate promotion:
 
 - IPFS pins the canonical DAG in Kubo and seeds it.
-- Arweave hydrates the private retained r81 Core and verifies native retention.
-  It is not an AR.IO r81 pin API or new Arweave replication.
+- Arweave fully fetches and verifies the same persistent Core cache used for
+  resolve/play. It is not an AR.IO pin API or new Arweave replication.
 - HTTP, `data:`, and uploads promote the existing Curio static object.
 
 `GET /resolve?ref=...&pin=1` is an authenticated convenience action. For IPFS
@@ -95,8 +95,8 @@ curl -X POST -H 'Authorization: Bearer YOUR_TOKEN' --get \
 ```
 
 It returns `202` and a job id; poll `GET /seed/<id>` or list `GET /seed`.
-Seeding pins IPFS final artifacts, keeps Arweave final artifacts through the
-retained plane, and promotes ordinary HTTP/data final artifacts in static
+Seeding pins IPFS final artifacts, fetches/verifies Arweave final artifacts
+through the same Core, and promotes ordinary HTTP/data final artifacts in static
 storage. It does not move ordinary bytes into Kubo. Job history is in memory;
 kept media survives restart, job status does not.
 
@@ -119,8 +119,9 @@ with `ref`, `replacement`, and `status`) or `DELETE /override?ref=...`.
 Statuses are `canonical-recovered`, `captured-original`, `operator-attested`,
 and `alternate-master`. A replacement is never silent.
 
-`GET /library` separates Kubo pin status, retained Arweave records, ordinary
-Arweave cache diagnostics, and operator records. Cache is not keep. `/healthz`
+`GET /library` separates Kubo pin status, same-Core Arweave cache diagnostics,
+and operator records. Resolve/play also populate that cache; explicit keep is
+an eager fetch/verification, not a replication claim. `/healthz`
 reports backend health plus conservative participation evidence; AR.IO public
 reachability can honestly be `unknown`.
 

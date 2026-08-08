@@ -72,7 +72,7 @@ static store.
 | Other `data:` media | Decodes it into Curio static storage and serves `/media/<id>` |
 | `verse.works/artworks/...` | Follows token URI, iframe, or artwork image |
 
-Resolution can populate an evictable cache. It does not keep a work. HTML
+Resolution can populate local cache. It does not keep a work. HTML
 runtime responses are marked `live-dependent`: saving the HTML shell does not
 preserve scripts, APIs, workers, or origin behavior.
 
@@ -81,8 +81,9 @@ preserve scripts, APIs, workers, or origin behavior.
 Keep is explicit and source-appropriate:
 
 - IPFS keep pins the canonical DAG in Kubo; Kubo then seeds it.
-- Arweave keep hydrates and verifies the private retained r81 Core plane. This
-  is not an AR.IO r81 pin API or a claim of new Arweave replication.
+- Arweave keep fully fetches and verifies local availability in the same
+  persistent AR.IO Core used for resolve and play. It is not an AR.IO pin API
+  or a claim of new Arweave-network replication.
 - HTTP, `data:`, and uploads remain in Curio static storage; none enters IPFS
   unless a future explicit publication operation says so.
 
@@ -130,9 +131,9 @@ networks, Solana, and other chains are not supported for wallet discovery.
 ## Network and provenance
 
 Only port `8090` is Curio's public HTTP origin for REST, MCP, media, IPFS, and
-Arweave paths. Kubo and both ordinary and retained AR.IO native planes remain
-on the Compose network. Kubo additionally publishes swarm `4001/tcp` and
-`4001/udp` for participation.
+Arweave paths. Kubo and the one persistent AR.IO Core remain on the Compose
+network. Kubo additionally publishes swarm `4001/tcp` and `4001/udp` for
+participation.
 
 Direct HTTP requests derive returned URLs from the request origin.
 `CURIO_PUBLIC_BASE_URL` explicitly overrides that origin. Otherwise, forwarded
@@ -143,13 +144,14 @@ complete, valid RFC `Forwarded` origin or the `X-Forwarded-Proto` plus
 
 `/healthz` reports backend reachability and participation evidence. Kubo and
 AR.IO are enabled by default, but neither a running daemon nor advertised
-addresses prove public reachability; AR.IO r81 currently reports that evidence
+addresses prove public reachability; AR.IO Core currently reports that evidence
 as unknown.
 
 Back up the actual XDG configuration and state paths. State includes Kubo pins,
-the static media store, operator records, and separate ordinary and retained
-AR.IO trees. Cache is not preservation; retained records and static/IPFS kept
-content must be backed up if their upstreams matter.
+the static media store, operator records, and the persistent AR.IO Core tree.
+Resolve/play and keep populate that same local cache; keep is eager fetch and
+verification, not a move between tiers or a replication claim. Static/IPFS kept
+content and Core state must be backed up if their upstreams matter.
 
 ## Development
 

@@ -40,7 +40,6 @@ from urllib.parse import quote, unquote, urlparse, urlunparse
 import httpx
 
 from . import safe_fetch
-from .arweave_retention import retained_available, retained_state
 from .config import Settings
 from .fixups import (
     KNOWN_EXTENSIONS,
@@ -159,8 +158,7 @@ def _fetch_allowed(url: str, settings: Settings) -> bool:
 async def _bounded_text(client: httpx.AsyncClient, url: str, max_bytes: int, settings: Settings) -> str:
     """GET a text body, refusing to buffer more than `max_bytes`."""
     arweave_internal = url.startswith(settings.arweave_internal.rstrip("/") + "/")
-    arweave_retained = url.startswith(settings.arweave_retained_internal.rstrip("/") + "/")
-    timeout = settings.arweave_cold_timeout if arweave_internal or arweave_retained else None
+    timeout = settings.arweave_cold_timeout if arweave_internal else None
     async with _safe_stream(client, "GET", url, settings, timeout=timeout) as response:
         response.raise_for_status()
         declared = response.headers.get("content-length")
@@ -186,12 +184,7 @@ def _internal_fetch_url(ref: str, settings: Settings) -> str:
     arweave = arweave_parts(ref)
     if arweave is not None:
         txid, path = arweave
-        base = (
-            settings.arweave_retained_internal
-            if retained_state(txid, path, settings) == "kept"
-            else settings.arweave_internal
-        )
-        return f"{base.rstrip('/')}/{txid}{path}"
+        return f"{settings.arweave_internal.rstrip('/')}/{txid}{path}"
     return ref
 
 
@@ -403,34 +396,18 @@ async def _resolve_arweave(
     if query:
         public = f"{public}?{query}"
 
-    # A registry-kept identity is exclusively served from the retained Core.
-    # Do this before every probe and metadata fetch: ordinary Core bytes must
-    # never mask a missing retained artifact.
-    state = retained_state(txid, path, settings)
-    if state == "kept" and not await retained_available(txid, path, settings, client):
-        return Resolved(
-            ref, public, "play", "arweave", False, source_kind="arweave", final_ref=native_ref,
-            keep_state="degraded",
-            note="retained AR.IO plane is unavailable; not falling back for kept identity",
-        )
-    retained = state == "kept"
-    base = settings.arweave_retained_internal if retained else settings.arweave_internal
-    internal = f"{base.rstrip('/')}/{txid}{path}"
+    internal = f"{settings.arweave_internal.rstrip('/')}/{txid}{path}"
     headers = await probe_headers(client, internal, timeout=settings.arweave_cold_timeout)
-    if headers is None or (retained and headers.get("x-cache", "").strip().lower() != "hit"):
+    if headers is None:
         return Resolved(
             ref, public, "play", "arweave", False, source_kind="arweave", final_ref=native_ref,
-            keep_state="degraded" if retained else "cached",
-            note=("retained AR.IO plane is unavailable; not falling back for kept identity"
-                  if retained else "local AR.IO backend cannot serve this artifact"),
+            note="local AR.IO backend cannot serve this artifact",
         )
     content_type = headers.get("content-type")
     main = _main_content_type(content_type)
 
     integrity = _arweave_integrity(headers)
     if main == "application/json":
-        # The metadata identity may be retained while its final media is not;
-        # recursion reports the final artifact's own keep state.
         return await _resolve_token_metadata(
             ref, internal, "arweave", settings, client, depth,
             source_kind="arweave", final_ref=native_ref,
@@ -439,7 +416,7 @@ async def _resolve_arweave(
     return Resolved(
         ref, public, method, "arweave", True, content_type=content_type,
         source_kind="arweave", final_ref=native_ref,
-        keep_state=("live-dependent" if main == "text/html" else "kept" if retained else "cached"),
+        keep_state="live-dependent" if main == "text/html" else "cached",
         integrity=integrity,
     )
 

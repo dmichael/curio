@@ -48,7 +48,7 @@ A work is not necessarily a single file. Directories, manifests, playlists, and 
 The local representation Curio serves through the source-appropriate backend:
 
 - an IPFS DAG pinned or cached in Kubo;
-- an Arweave transaction or manifest path retained or cached by AR.IO;
+- an Arweave transaction or manifest path cached by the persistent AR.IO Core;
 - a static file or package retained or cached by Curio's HTTP file service.
 
 A hosted artifact retains its source kind and native identity. Curio does not treat these backends as interchangeable buckets.
@@ -61,8 +61,9 @@ The active mapping from an input reference to the hosted artifact Curio should s
 
 A hosted artifact is either cached or kept:
 
-- `cached`: available locally now but eligible for eviction;
-- `kept`: retained until the curator explicitly removes it.
+- `cached`: available locally now;
+- `kept`: explicit source-appropriate keep completed. For Arweave this means
+  eager fetch and same-Core cache verification, not a second storage tier.
 
 ### Participation
 
@@ -117,7 +118,7 @@ https://curio.example/media/<file-id>        -> Curio static file service
 
 An IPFS work remains its original DAG and is served by Kubo. Curio must not flatten a directory or file into a static copy and claim that the original CID was preserved.
 
-An Arweave work remains associated with its original transaction and manifest identity and is served by AR.IO. Kept works need protocol-appropriate retention within the AR.IO serving plane rather than a separate fallback copy in another store.
+An Arweave work remains associated with its original transaction and manifest identity and is served by the one persistent AR.IO Core. Resolve, play, and keep all use that same cache; there is no fallback or retained tier.
 
 HTTP files, inline media, and operator uploads are served as static HTTP files. They do not enter Kubo merely because Kubo is running. Publishing one of these files to IPFS is a separate, explicit action that creates a new CID and a new source identity.
 
@@ -125,30 +126,30 @@ If a backend is unavailable, Curio reports degraded serving. It does not silentl
 
 ## Cache and keep
 
-Resolution and preservation use the same source-appropriate backend with different retention policies.
+Resolution and keep use the same source-appropriate backend.
 
 ### Cache
 
 On first successful resolution, Curio fetches enough of the work into the appropriate local cache to serve it through Curio.
 
 - IPFS blocks may enter Kubo's cache without being pinned.
-- Arweave data may enter AR.IO's cache without being protected from eviction.
+- Arweave data may enter the persistent AR.IO Core cache through resolve or play.
 - HTTP and inline media may enter Curio's evictable static file cache.
 
-A cached artifact can disappear under storage pressure. Curio may fetch it again from the canonical source while that source remains available.
+Core's automatic content cleanup is disabled. Curio may still need to fetch again if local state is unavailable or maintenance removed invalid cache references.
 
 ### Keep
 
-A keep request promotes the hosted artifact to durable retention in the same backend.
+A keep request applies source-appropriate completion semantics in the same backend.
 
 - IPFS: pin the canonical DAG in Kubo and provide it to the network.
-- Arweave: protect the transaction data from local eviction and continue serving it through AR.IO.
+- Arweave: fully fetch the transaction/path and verify local availability through the same AR.IO Core.
 - HTTP or inline media: retain the static file or package in Curio's HTTP store.
 - Operator upload: retain the uploaded static file in Curio's HTTP store.
 
 Keeping is idempotent. Repeating the request for the same source identity and immutable bytes does not create another logical work.
 
-For decentralized sources, keep also means seed. Curators do not need to make a second participation decision for each kept work.
+For IPFS, keep also means seed. Arweave keep verifies local Core cache availability only; it is not an Arweave-network replication claim.
 
 Keep intent can come from:
 
@@ -165,7 +166,7 @@ Every adapter ends in its appropriate local serving backend.
 | Source | Resolution | Keep | Serving |
 |---|---|---|---|
 | IPFS | Parse CID/path, fetch and verify the requested DAG or file | Pin the original DAG and announce it | Kubo IPFS gateway and IPFS peer service |
-| Arweave | Resolve transaction and manifest paths and retain transaction identity | Protect selected data from local eviction | AR.IO gateway |
+| Arweave | Resolve transaction and manifest paths through the one Core | Fully fetch and verify a same-Core native cache hit | AR.IO gateway |
 | HTTP(S) | Fetch through Curio, validate redirects, and determine whether the result is metadata or media | Retain the static file or package in Curio's HTTP store | Curio static file service |
 | `data:` | Decode inline metadata or media | Retain decoded media in Curio's HTTP store | Curio static file service |
 | NFT metadata | Follow fields to the selected media and retain token context when supplied | Keep the final work in the backend selected by its media reference | Backend selected by the final media reference |
@@ -188,11 +189,16 @@ Kept IPFS works are pinned as their canonical DAGs. Kubo announces and serves th
 
 ### Arweave
 
-Kept Arweave works remain available through Curio's native AR.IO serving path. Curio uses two pinned r81 Core instances: ordinary reads go directly to the evictable Core data API, with Envoy retained as that Core's trusted network/upstream and participation component; explicit keep intent is fully consumed through a private retained Core with separate persistent AR.IO data/SQLite state and the ordinary Envoy as its trusted upstream. The retained Core has no contiguous-cache cleanup threshold and keeps the original transaction and manifest path identity. Native cold reads and availability probes use a configurable 300-second default timeout, separate from the resolver's short general HTTP timeout.
+Arweave works remain available through Curio's one pinned AR.IO Core and retain
+the original transaction/manifest path identity. Resolve and playback can
+populate its persistent cache. Explicit keep fully consumes the exact Core
+response and then fully consumes a second response requiring native `X-Cache:
+HIT`; native cold reads use a configurable 300-second default timeout. Core
+uses embedded LMDB and disables automatic chunk-data cleanup.
 
-This is isolated native retained-plane operation, **not** an upstream AR.IO r81 pin API. Curio records `pending`, `kept`, or `failed` transaction/path intent transactionally, marks `kept` only after a second local native response succeeds, and routes kept txids only to that private Core. If its integrity or availability check fails, status is degraded rather than silently substituting ordinary-cache bytes.
-
-AR.IO gateway participation does not create a new Arweave transaction and does not claim to replicate the underlying Arweave storage network. Its contribution is reliable gateway availability for the selected data.
+This is same-Core eager fetch/verification, **not** an AR.IO pin API, movement
+between tiers, or a claim of new replication in the Arweave storage network.
+AR.IO gateway serving does not create a new Arweave transaction.
 
 ### Reduced operation
 
@@ -326,9 +332,9 @@ An implementation conforms to this model when:
 4. Arweave content is hosted and served by AR.IO under its canonical transaction and manifest identity.
 5. HTTP, inline, and uploaded files are hosted and served by Curio's static HTTP service unless the curator explicitly publishes them elsewhere.
 6. No content crosses into IPFS, Arweave, or another protocol without explicit curator intent.
-7. Every keep action produces durable retention in the same backend or clearly fails.
-8. Cached and kept states remain distinguishable after restart.
-9. Kept Arweave and HTTP works survive loss of their upstream source.
+7. Every keep action uses its source-appropriate operation or clearly fails.
+8. Arweave keep reports only completed same-Core fetch/verification; it does not claim a separate durable tier after restart.
+9. HTTP kept works survive loss of their upstream source; Arweave cache availability is local Core state, not an upstream or network replication guarantee.
 10. Content-addressed sources are verified against their recorded identifier when claiming canonical preservation.
 11. Replacements and cross-protocol publication are explicit in stored records and resolution responses.
 12. Internal service addresses never appear in consumer responses.

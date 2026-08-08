@@ -3,7 +3,7 @@
 # only after the new release has started and passed its complete health check.
 set -eu
 
-AR_IO_ENVOY_IMAGE='ghcr.io/ar-io/ar-io-envoy:bd738a2435f1293e259dfcbb4ef42f50b26545da@sha256:ffbf849370ed24b2dfecab2ceef733bf1fb67da2d14b4909063d788cc8f72282'
+AR_IO_CORE_IMAGE='ghcr.io/ar-io/ar-io-core:f3032933c6039305bc5ecec0d486526c6d60d6ea@sha256:1155d2042870e6ba2c1457258765c16b762fe66026e4a42799abfca3b5d0d900'
 fail() { echo "curio install: $*" >&2; exit 1; }
 cleanup_stage() { [ -d "$1" ] && [ ! -L "$1" ] && find "$1" -depth -delete; }
 read_env() { awk -F= -v k="$2" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$1"; }
@@ -28,9 +28,9 @@ ensure_start_height() {
         return
     fi
     echo "Resolving the current Arweave chain height (first install only)..."
-    docker pull "$AR_IO_ENVOY_IMAGE"
-    height=$(docker run --rm --entrypoint /bin/sh "$AR_IO_ENVOY_IMAGE" -c \
-        'curl -fsSL --max-time 30 https://arweave.net/info | jq -er ".height | select(type == \"number\" and floor == .)"') || fail "could not query Arweave height through pinned AR.IO Envoy image"
+    docker pull "$AR_IO_CORE_IMAGE"
+    height=$(docker run --rm --entrypoint node "$AR_IO_CORE_IMAGE" -e \
+        'const https=require("https");const r=https.get("https://arweave.net/info",{timeout:30000},x=>{let b="";x.on("data",c=>b+=c);x.on("end",()=>{try{const h=JSON.parse(b).height;if(Number.isSafeInteger(h)&&h>=0)console.log(h);else process.exitCode=1}catch{process.exitCode=1}})});r.on("timeout",()=>r.destroy(new Error("timeout")));r.on("error",()=>process.exitCode=1);') || fail "could not query Arweave height through pinned AR.IO Core image"
     valid_uint "$height" || fail "arweave.net returned an invalid chain height: ${height:-empty}"
     temporary="$state_file.tmp.$$"
     (umask 077; printf 'START_HEIGHT=%s\n' "$height" >"$temporary")
@@ -42,19 +42,6 @@ ensure_start_height() {
 assert_state_owned() {
     foreign=$(find "$data_root" -xdev \( ! -user "$(id -u)" -o ! -group "$(id -g)" \) -print -quit 2>/dev/null || true)
     [ -z "$foreign" ] || { echo "persistent state is not owned by the installing user: $foreign (fix ownership before rerunning)" >&2; return 1; }
-}
-
-preseed_envoy_eds() {
-    # The pinned Envoy image must start as root to render /etc/envoy/envoy.yaml.
-    # Give it valid, user-owned EDS files up front so that unavoidable root
-    # startup never creates persistent bind-mounted files.
-    for cluster in arweave_full_nodes arweave_partial_nodes; do
-        file="$data_root/ar-io/envoy-eds/$cluster.json"
-        [ -e "$file" ] && continue
-        temporary="$file.tmp.$$"
-        printf '{"version_info":"curio-preseed","resources":[{"@type":"type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment","cluster_name":"%s","endpoints":[{"lb_endpoints":[]}]}]}\n' "$cluster" >"$temporary"
-        mv -f "$temporary" "$file"
-    done
 }
 
 rollback() {
@@ -108,8 +95,6 @@ CURIO_HOST_GID=$(id -g)
 CURIO_CURATOR_TOKEN=$token
 CURIO_IPFS_STORAGE_MAX=${CURIO_IPFS_STORAGE_MAX:-20GB}
 CURIO_STATIC_CACHE_MAX_BYTES=${CURIO_STATIC_CACHE_MAX_BYTES:-1000000000}
-CURIO_REDIS_MAX_MEMORY=${CURIO_REDIS_MAX_MEMORY:-256mb}
-CURIO_AR_IO_CACHE_CLEANUP_THRESHOLD=${CURIO_AR_IO_CACHE_CLEANUP_THRESHOLD:-2592000}
 CURIO_ARWEAVE_COLD_TIMEOUT=${CURIO_ARWEAVE_COLD_TIMEOUT:-300}
 CURIO_PORT=${CURIO_PORT:-8090}
 CURIO_PUBLIC_BASE_URL=${CURIO_PUBLIC_BASE_URL:-}
@@ -121,13 +106,10 @@ EOF
     grep -q '^CURIO_CURATOR_TOKEN=.' "$config_file" || fail "CURIO_CURATOR_TOKEN is required"
     grep -q '^CURIO_HOST_UID=[0-9][0-9]*$' "$config_file" || fail "CURIO_HOST_UID is required"
     grep -q '^CURIO_HOST_GID=[0-9][0-9]*$' "$config_file" || fail "CURIO_HOST_GID is required"
-    mkdir -p "$app_root/releases" "$data_root/ipfs" "$data_root/ar-io/redis" "$data_root/ar-io/envoy-eds" "$data_root/ar-io-retained/redis" "$data_root/media"
+    # Historical Redis/Envoy/retained directories are intentionally untouched.
+    mkdir -p "$app_root/releases" "$data_root/ipfs" "$data_root/ar-io" "$data_root/media"
     chmod 700 "$data_root"; assert_state_owned || fail "persistent state ownership check failed"
-    preseed_envoy_eds
     ensure_start_height "$data_root/ar-io/start-height.env"
-    # Both r81 Cores must share the first-install chain height while retaining
-    # completely separate Core data/SQLite directories.
-    [ -e "$data_root/ar-io-retained/start-height.env" ] || cp "$data_root/ar-io/start-height.env" "$data_root/ar-io-retained/start-height.env"
     assert_state_owned || fail "persistent state ownership check failed"
 
     version=$(awk -F '"' '/^version = / {print $2; exit}' "$source_root/resolver/pyproject.toml")
@@ -148,8 +130,10 @@ EOF
     health_timeout=${CURIO_HEALTH_TIMEOUT:-600}; valid_uint "$health_timeout" || rollback "CURIO_HEALTH_TIMEOUT must be seconds"
     docker compose --project-name curio --env-file "$config_file" --file "$new_compose" config --quiet || rollback "Compose configuration failed"
     docker compose --project-name curio --env-file "$config_file" --file "$new_compose" build resolver || rollback "resolver image build failed"
-    echo "Waiting up to ${health_timeout}s for all Curio services (including Envoy and resolver health)..."
-    docker compose --project-name curio --env-file "$config_file" --file "$new_compose" up -d --wait --wait-timeout "$health_timeout" || rollback "Compose start or health check failed"
+    echo "Waiting up to ${health_timeout}s for all Curio services..."
+    # Remove services absent from this release (for example, the former
+    # Redis/Envoy/retained graph). Rollback below starts the prior graph again.
+    docker compose --project-name curio --env-file "$config_file" --file "$new_compose" up -d --wait --wait-timeout "$health_timeout" --remove-orphans || rollback "Compose start or health check failed"
     assert_state_owned || rollback "persistent state ownership check failed after start"
     install -m 0755 "$script_dir/curio" "$bin_home/curio"
     echo "Curio $version installed and healthy. Add $bin_home to PATH, then run: curio status"

@@ -5,7 +5,7 @@
 extracts every content-addressed media reference from token metadata, then:
 
   - IPFS refs    -> `pin add` on the box's Kubo API (fetches and keeps the DAG)
-  - Arweave refs -> hydrated through Curio's private native retained AR.IO Core
+  - Arweave refs -> fetched and verified through Curio's one persistent AR.IO Core
   - plain http   -> copied into and synchronously kept by Curio's static backend
 
 Wallet seeding never moves ordinary HTTP bytes into IPFS.
@@ -14,9 +14,7 @@ Seeding is a background job: POST returns 202 with a job id immediately;
 poll GET /seed/{id}. Jobs live in memory only — a restart forgets history
 (the pins themselves, of course, persist in Kubo).
 
-This is the *hot* cache tier; a site may separately maintain a curated deep
-archive elsewhere. This endpoint answers "make everything this wallet holds
-locally servable, now."
+This endpoint answers "make everything this wallet holds locally servable, now."
 """
 
 from __future__ import annotations
@@ -30,7 +28,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from .arweave_retention import keep_arweave
+from .arweave_cache import keep_arweave
 from .config import Settings
 from .library import ingest_url, keep_task, record_warm
 from .refs import arweave_parts, ipfs_parts
@@ -63,8 +61,7 @@ class SeedJob:
     refs_found: int = 0
     pinned: int = 0
     recovered: int = 0  # pinned via HTTP-copy recovery after IPFS fetch failed
-    warmed: int = 0  # ordinary cache-only warm operations, not explicit keeps
-    retained: int = 0
+    warmed: int = 0  # same-Core fetch/verification operations
     captured: int = 0  # static HTTP captures (kept for wire compatibility)
     skipped: int = 0
     failed: int = 0
@@ -330,7 +327,7 @@ async def _recover_cid(
 async def _warm_txid(
     txid: str, job: SeedJob, settings: Settings, client: httpx.AsyncClient, sem: asyncio.Semaphore
 ) -> None:
-    """Legacy cache-only warm helper for diagnostics; explicit seed uses keep."""
+    """Fetch an Arweave transaction through the one Core for diagnostics."""
     async with sem:
         try:
             async with client.stream("GET", f"{settings.arweave_internal}/{txid}", timeout=settings.seed_pin_timeout) as response:
@@ -347,14 +344,15 @@ async def _warm_txid(
 async def _keep_txid(
     txid: str, path: str, job: SeedJob, settings: Settings, client: httpx.AsyncClient, sem: asyncio.Semaphore
 ) -> None:
-    """Explicit seed intent uses the retained native plane, never cache warm."""
+    """Explicit seed intent fetches and verifies the same persistent Core."""
     async with sem:
         outcome = await keep_arweave(txid, path, settings, client)
         if outcome == "kept":
-            job.retained += 1
+            job.warmed += 1
+            record_warm(txid, settings, why="seed")
             return
         job.failed += 1
-        _note_error(job, f"retain {txid}{path}: native retained-plane hydration failed")
+        _note_error(job, f"keep {txid}{path}: same-Core cache verification failed")
 
 
 async def _keep_ref(
@@ -378,8 +376,8 @@ async def _keep_ref(
         job.failed += 1
         _note_error(job, f"retain {ref}: HTML runtime has uncaptured dependencies")
         return
-    # A CID pin covers every file below that CID; retained Arweave paths and
-    # static artifacts remain distinct identities.
+    # A CID pin covers every file below that CID; Arweave paths and static
+    # artifacts remain distinct identities.
     native_key = f"ipfs:{ipfs[0]}" if ipfs else final_ref
     async with native_refs_lock:
         if native_key in native_refs:

@@ -28,7 +28,7 @@ def external_url_ok(url: str) -> bool:
 
 def _is_internal_gateway(url: str, settings: Settings) -> bool:
     return any(url == base.rstrip("/") or url.startswith(base.rstrip("/") + "/") for base in (
-        settings.ipfs_internal, settings.arweave_internal, settings.arweave_retained_internal,
+        settings.ipfs_internal, settings.arweave_internal,
     ))
 
 

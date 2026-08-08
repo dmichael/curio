@@ -1,10 +1,9 @@
 """The durability tier and its ledgers: what the box has decided to keep.
 
 The library is source-native: Kubo pins IPFS, Curio's static store keeps
-ordinary HTTP/data, and the retained AR.IO registry records native Core
-hydration. Ordinary AR.IO warm records remain cache diagnostics, not keep
-claims. This module owns the source-appropriate single-target helpers and
-`GET /library`, the cross-plane answer to "what does the box actually hold?".
+ordinary HTTP/data, and Arweave keep eagerly fetches and verifies the one
+persistent AR.IO Core cache. This module owns the source-appropriate helpers
+and `GET /library`, the cross-plane answer to "what does the box hold?".
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ from typing import Any, NamedTuple
 
 import httpx
 
-from .arweave_retention import keep_arweave, retained_available, retained_records
+from .arweave_cache import keep_arweave
 from .config import Settings
 from .favorites import get_favorites
 from .overrides import get_registry
@@ -137,7 +136,10 @@ async def pin_resolved(
         if arweave is None:
             return "failed"
         txid, path = arweave
-        return await keep_arweave(txid, path, settings, client)
+        outcome = await keep_arweave(txid, path, settings, client)
+        if outcome == "kept":
+            record_warm(txid, settings, why)
+        return outcome
     return None
 
 
@@ -191,16 +193,12 @@ def _captured_sources(settings: Settings) -> set[str]:
 
 
 def warmed_file(settings: Settings) -> Path:
-    """Ledger of Arweave txids deliberately warmed through the box's gateway.
-
-    ar-io's cache is evictable and exposes no inventory API, so this file is
-    the only record of what the box ever *meant* to hold on the Arweave
-    plane; /library re-checks each entry against the gateway's X-Cache."""
+    """Ledger of Arweave txids verified through the box's one Core cache."""
     return Path(settings.seed_capture_dir) / "warmed.jsonl"
 
 
 def record_warm(txid: str, settings: Settings, why: str) -> None:
-    """Append a successful warm to the ledger — once per txid, ever.
+    """Append a successful same-Core verification — once per txid, ever.
 
     No-op when capture is disabled. Same deliberately-synchronous file I/O
     as the captures ledger — see the note above _captured_sources."""
@@ -239,14 +237,12 @@ def warmed_txids(settings: Settings) -> list[str]:
 
 
 async def library_status(settings: Settings, client: httpx.AsyncClient) -> dict[str, Any]:
-    """What the box actually holds, plane by plane.
+    """What the box holds, plane by plane.
 
-    IPFS pins are durable. The Arweave retained registry counts native Core
-    hydration outcomes; ordinary warm records are separately replayed against
-    Envoy's X-Cache for cache diagnostics only. A cache miss is degraded,
-    never evidence for substituting a retained identity.
-    Each plane degrades to {"error": …} on its own; status never 500s
-    because one backend is down.
+    IPFS pins are durable. Arweave records are same-Core cache diagnostics:
+    resolving, playing, and explicit keep all populate the one persistent
+    Core cache. Each plane degrades independently rather than making status
+    fail because one backend is down.
     """
     return {
         "ipfs": await _ipfs_status(settings, client),
@@ -278,33 +274,14 @@ async def _ipfs_status(settings: Settings, client: httpx.AsyncClient) -> dict[st
 
 
 async def _arweave_status(settings: Settings, client: httpx.AsyncClient) -> dict[str, Any]:
-    retained = retained_records(settings)
-    registry_counts = {
-        state: sum(record["state"] == state for record in retained)
-        for state in ("kept", "pending", "failed")
-    }
-    kept_records = [record for record in retained if record["state"] == "kept"]
-    sem = asyncio.Semaphore(settings.seed_concurrency)
-
-    async def retained_now(record: dict[str, str | None]) -> bool:
-        async with sem:
-            return await retained_available(str(record["txid"]), str(record["path"]), settings, client)
-
-    retained_hits = sum(await asyncio.gather(*(retained_now(record) for record in kept_records)))
-    retained_status = {
-        "registry": registry_counts,
-        "confirmed_available": retained_hits,
-        "degraded": len(kept_records) - retained_hits,
-        "operation": "isolated native retained-plane operation (not an AR.IO r81 pin API)",
-    }
     txids = warmed_txids(settings)
     if not txids:
-        return {"retained": retained_status, "known_warmed": 0, "currently_cached": 0}
+        return {"known_warmed": 0, "currently_cached": 0}
+    sem = asyncio.Semaphore(settings.seed_concurrency)
+
     async def cached(txid: str) -> bool:
-        # X-Cache HIT/MISS on GET/HEAD is the only cache introspection ar-io
-        # offers. A cold Core may retrieve on demand, so this native
-        # availability probe gets its cold-read budget rather than the short
-        # generic status timeout.
+        # X-Cache is the only Core cache introspection. A cold read has its
+        # own timeout because Core can retrieve data on demand.
         async with sem:
             try:
                 response = await client.head(
@@ -315,15 +292,11 @@ async def _arweave_status(settings: Settings, client: httpx.AsyncClient) -> dict
                 return False
 
     hits = sum(await asyncio.gather(*(cached(txid) for txid in txids)))
-    status: dict[str, Any] = {
-        "retained": retained_status,
-        "known_warmed": len(txids), "currently_cached": hits,
+    return {
+        "known_warmed": len(txids),
+        "currently_cached": hits,
+        "operation": "same persistent Core cache; local serving is not Arweave-network replication",
     }
-    if hits != len(txids):
-        status["note"] = (
-            "ar-io cache is evictable — currently_cached < known_warmed means evictions"
-        )
-    return status
 
 
 def _registry_status(settings: Settings) -> dict[str, Any]:

@@ -1,5 +1,3 @@
-import os
-
 import httpx
 import pytest
 
@@ -14,7 +12,6 @@ SETTINGS = Settings(
     ipfs_public_base="http://box:8080",
     arweave_public_base="http://box:3000",
     ssrf_dns_check=False,
-    arweave_retention_db=f"/tmp/curio-resolve-{os.getpid()}.sqlite3",
 )
 
 TXID = "abcdefghijklmnopqrstuvwxyz0123456789_ABCDEF"  # 43 chars
@@ -233,7 +230,6 @@ async def test_arweave_availability_probe_uses_cold_timeout():
         arweave_internal="http://core.internal",
         arweave_cold_timeout=300.0,
         http_timeout=0.01,
-        arweave_retention_db=f"/tmp/curio-cold-probe-{os.getpid()}.sqlite3",
     )
     seen = []
 

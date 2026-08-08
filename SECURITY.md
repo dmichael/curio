@@ -5,7 +5,7 @@
 Curio can be placed behind a private-network or internet-facing front door; a
 network boundary is not authorization. Its one public HTTP origin is port
 `8090`, which serves REST, MCP, static media, and proxied IPFS/Arweave paths.
-Kubo and the ordinary and retained AR.IO planes are internal Compose services.
+Kubo and the one persistent AR.IO Core are internal Compose services.
 Kubo swarm `4001/tcp` and `4001/udp` are separately published for IPFS
 participation, not for Curio administration.
 
@@ -34,12 +34,12 @@ and timeout limits apply. Treat this as defense in depth: run the resolver with
 only the outbound access appropriate to its curator workload and keep Docker,
 Curio, and its dependencies updated.
 
-Kept IPFS content is pinned and Kubo is configured to participate. Kept
-Arweave content uses an isolated retained r81 Core and remains served through
-Curio's AR.IO path. Neither is proof of public reachability: `/healthz` reports
-Kubo evidence conservatively and AR.IO reachability as unknown where r81 has no
-probe. AR.IO retention is not an r81 pin API and does not create new Arweave
-replicas.
+Kept IPFS content is pinned and Kubo is configured to participate. Arweave
+resolve/play and keep use one persistent Core; keep eagerly fetches and verifies
+local cache availability. This is not an AR.IO pin API or new Arweave
+replication. Neither is proof of public reachability: `/healthz` reports Kubo
+evidence conservatively and AR.IO reachability as unknown where Core has no
+probe.
 
 The appliance contacts public IPFS peers/gateways, AR.IO upstreams, Blockscout,
 BENS, and TzKT as needed. Their availability, privacy practices, and returned

@@ -20,13 +20,12 @@ Curio does not flatten every work into IPFS.
 - **IPFS:** resolution uses Kubo's cache and serving keeps the original
   CID/path. Explicit keep pins the canonical DAG in Kubo, which is Curio's
   IPFS contribution to the network.
-- **Arweave:** ordinary reads use the evictable r81 Core data plane. Explicit
-  keep records `pending`, hydrates a private retained r81 Core with independent
-  persistent state, verifies a second native cache hit, then records `kept`.
-  Kept paths route only to that retained Core; an unavailable retained plane is
-  degraded, not silently replaced with ordinary-cache bytes. This is isolated
-  native retained-plane operation, not an AR.IO r81 pin API and not new
-  replication in the Arweave storage network.
+- **Arweave:** resolve, play, and keep use one persistent AR.IO Core. Explicit
+  keep fully fetches the requested transaction/path, then fully reads it again
+  and requires Core's native cache hit. It verifies local serving at that time;
+  it is not an AR.IO pin API, a separate retention tier, or new replication in
+  the Arweave storage network. Core cleanup is disabled, so Curio does not
+  automatically delete cached content.
 - **HTTP, `data:`, and uploads:** Curio stores and serves bounded static files
   under `/media/<id>`, with a SHA-256 record. They never enter Kubo implicitly.
   Cross-protocol publication would need an explicit curator action and a new
@@ -74,13 +73,12 @@ canonical bytes.
 
 ## Network, trust, and participation
 
-The Compose graph has one HTTP ingress, resolver port `8090`; Kubo, ordinary
-AR.IO Core, retained AR.IO Core, Redis, and Envoy gateway/admin interfaces are
-private. Kubo swarm `4001/tcp` and `4001/udp` are published for native IPFS
-participation. Kubo and AR.IO are enabled by default. `/healthz` distinguishes
-backend health from participation evidence: advertised Kubo addresses are not
-an inbound reachability probe, and r81 exposes no equivalent AR.IO reachability
-fact, so both can honestly remain `unknown`.
+The Compose graph has one HTTP ingress, resolver port `8090`; Kubo and the
+one AR.IO Core are private. Kubo swarm `4001/tcp` and `4001/udp` are published
+for native IPFS participation. Kubo and AR.IO are enabled by default. `/healthz`
+distinguishes backend health from participation evidence: advertised Kubo
+addresses are not an inbound reachability probe, and Core exposes no equivalent
+AR.IO reachability fact, so both can honestly remain `unknown`.
 
 Read-only routes may be public. Mutations require the curator bearer token:
 keep/pin, seed, upload, favorite changes, and override changes. Source fetching
@@ -101,7 +99,7 @@ Host/Origin check.
 The supported source install is per-user and no-sudo. It uses
 `$XDG_CONFIG_HOME/curio/curio.env`, `$XDG_DATA_HOME/curio/app/releases`, and
 `$XDG_DATA_HOME/curio/state` by default. The state tree contains Kubo data,
-ordinary and retained AR.IO state, static media, and operator records; back up
+persistent AR.IO Core state, static media, and operator records; back up
 those actual paths.
 
 `curio version`, `curio update --check`, `curio update`, and

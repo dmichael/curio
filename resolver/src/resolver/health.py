@@ -20,18 +20,14 @@ async def gateway_health(settings: Settings, client: httpx.AsyncClient) -> dict[
     would report a healthy backend as down.
     """
     backends: dict[str, Any] = {}
-    for name, base in (
-        ("ipfs", settings.ipfs_internal),
-        ("arweave", settings.arweave_internal),
-        ("arweave_retained", settings.arweave_retained_internal),
-    ):
+    for name, base in (("ipfs", settings.ipfs_internal), ("arweave", settings.arweave_internal)):
         try:
             response = await client.get(base, timeout=3.0)
             backends[name] = {"ok": response.status_code < 500, "status": response.status_code}
         except httpx.HTTPError as exc:
             backends[name] = {"ok": False, "error": str(exc)}
     # A running process is not evidence of network contribution. Kubo's API
-    # can expose observed public swarm addresses; r81 has no equivalent
+    # can expose observed public swarm addresses; Core has no equivalent
     # reachability/served-data signal, so status remains explicitly unknown.
     ipfs_participation: dict[str, Any] = {"status": "unknown", "reason": "no public reachability evidence"}
     try:
@@ -62,7 +58,6 @@ async def gateway_health(settings: Settings, client: httpx.AsyncClient) -> dict[
         "backends": backends,
         "participation": {
             "ipfs": ipfs_participation,
-            "arweave": {"status": "unknown", "reason": "AR.IO r81 exposes no public reachability evidence"},
-            "arweave_retained": {"status": "unknown", "reason": "private retained Core has no public reachability role"},
+            "arweave": {"status": "unknown", "reason": "AR.IO Core exposes no public reachability evidence"},
         },
     }

@@ -128,8 +128,8 @@ async def test_pin_resolved_pins_ipfs_target(tmp_path):
     assert calls == [("/api/v0/pin/add", {"arg": "/ipfs/bafyFAV"})]
 
 
-async def test_pin_resolved_warms_arweave_and_skips_unresolved(tmp_path):
-    settings = PIN_SETTINGS.model_copy(update={"arweave_retention_db": str(tmp_path / "retained.sqlite3")})
+async def test_pin_resolved_verifies_arweave_cache_and_skips_unresolved():
+    settings = PIN_SETTINGS
     warmed = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -139,7 +139,7 @@ async def test_pin_resolved_warms_arweave_and_skips_unresolved(tmp_path):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         arweave = Resolved("ar://TX123", "http://box:3000/TX123", "play", "arweave", True)
         assert await pin_resolved(arweave, settings, client) == "kept"
-        assert warmed == ["http://127.0.0.1:4001/TX123", "http://127.0.0.1:4001/TX123"]
+        assert warmed == ["http://ar.internal/TX123", "http://ar.internal/TX123"]
 
         dead = Resolved("ipfs://bafyDEAD", "ipfs://bafyDEAD", "play", "ipfs", False)
         assert await pin_resolved(dead, settings, client) is None  # nothing fetched

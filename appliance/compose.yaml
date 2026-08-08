@@ -13,12 +13,9 @@ services:
       RESOLVER_PORT: "8090"
       RESOLVER_IPFS_INTERNAL: http://kubo:8080
       RESOLVER_IPFS_API: http://kubo:5001
-      # Serve ordinary reads straight from Core's data API. Envoy remains
-      # Core's trusted network/upstream path, outside the cold byte stream.
+      # All Arweave reads, including explicit keep verification, use this Core.
       RESOLVER_ARWEAVE_INTERNAL: http://ar-io-core:4000
-      RESOLVER_ARWEAVE_RETAINED_INTERNAL: http://ar-io-retained:4000
       RESOLVER_ARWEAVE_COLD_TIMEOUT: ${CURIO_ARWEAVE_COLD_TIMEOUT:-300}
-      RESOLVER_ARWEAVE_RETENTION_DB: /state/arweave-retained.sqlite3
       RESOLVER_PUBLIC_BASE_URL: ${CURIO_PUBLIC_BASE_URL:-}
       RESOLVER_TRUSTED_PROXY_CIDRS: ${CURIO_TRUSTED_PROXY_CIDRS:-}
       RESOLVER_STATIC_ROOT: /state/media
@@ -35,8 +32,6 @@ services:
     depends_on:
       kubo: {condition: service_healthy}
       ar-io-core: {condition: service_healthy}
-      ar-io-envoy: {condition: service_healthy}
-      ar-io-retained: {condition: service_healthy}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=4).read()"]
       interval: 15s
@@ -72,26 +67,8 @@ services:
       retries: 12
     networks: [curio]
 
-  ar-io-redis:
-    image: redis:7.4.7-alpine@sha256:02f2cc4882f8bf87c79a220ac958f58c700bdec0dfb9b9ea61b62fb0e8f1bfcf
-    user: "${CURIO_HOST_UID:?set CURIO_HOST_UID}:${CURIO_HOST_GID:?set CURIO_HOST_GID}"
-    restart: unless-stopped
-    command: [redis-server, --maxmemory, "${CURIO_REDIS_MAX_MEMORY:-256mb}", --maxmemory-policy, allkeys-lru, --save, "", --appendonly, "no"]
-    volumes:
-      - type: bind
-        source: ${CURIO_DATA_ROOT}/ar-io/redis
-        target: /data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-    networks: [curio]
-
   ar-io-core:
     image: ghcr.io/ar-io/ar-io-core:f3032933c6039305bc5ecec0d486526c6d60d6ea@sha256:1155d2042870e6ba2c1457258765c16b762fe66026e4a42799abfca3b5d0d900
-    # r81 accepts an arbitrary numeric UID. Keep its bind-mounted cache under
-    # the installing user's control even with a rootful Docker daemon.
     user: "${CURIO_HOST_UID:?set CURIO_HOST_UID}:${CURIO_HOST_GID:?set CURIO_HOST_GID}"
     restart: unless-stopped
     env_file:
@@ -101,142 +78,24 @@ services:
       NODE_OPTIONS: --dns-result-order=ipv4first
       LOG_LEVEL: ${CURIO_AR_IO_LOG_LEVEL:-info}
       LOG_FORMAT: simple
-      TRUSTED_NODE_URL: http://ar-io-envoy:3000
-      TRUSTED_GATEWAYS_URLS: '{"https://ar-io.dev":1,"https://turbo-gateway.com":2,"https://permagate.io":{"priority":3,"trusted":false},"https://arweave.net":{"priority":4,"trusted":false}}'
+      TRUSTED_NODE_URL: https://arweave.net
+      TRUSTED_GATEWAYS_URLS: '{"https://arweave.net":1,"https://ar-io.dev":2,"https://turbo-gateway.com":3,"https://permagate.io":4}'
       ANS104_UNBUNDLE_FILTER: '{"never":true}'
       ANS104_INDEX_FILTER: '{"never":true}'
       RUN_OBSERVER: "false"
       ON_DEMAND_RETRIEVAL_ORDER: trusted-gateways,ar-io-network,chunks-offset-aware,tx-data
-      CHAIN_CACHE_TYPE: redis
-      REDIS_CACHE_URL: redis://ar-io-redis:6379
-      CONTIGUOUS_DATA_CACHE_CLEANUP_THRESHOLD: ${CURIO_AR_IO_CACHE_CLEANUP_THRESHOLD:-2592000}
+      CHAIN_CACHE_TYPE: lmdb
+      ENABLE_CHUNK_DATA_CACHE_CLEANUP: "false"
     volumes:
       - type: bind
         source: ${CURIO_DATA_ROOT}/ar-io
         target: /app/data
-    depends_on:
-      ar-io-redis: {condition: service_healthy}
     healthcheck:
       test: ["CMD", "/bin/sh", "/app/healthcheck.sh"]
       interval: 10s
       timeout: 5s
       start_period: 30s
       retries: 30
-    networks: [curio]
-
-  # This private Core is the source-native retention plane. r81 has no
-  # per-tx pin API: explicit Curio keep traffic is fully read here, from the
-  # ordinary Envoy trusted upstream, and its independent /app/data survives
-  # ordinary Core/Envoy cache eviction. It has no cleanup-threshold setting.
-  ar-io-retained-redis:
-    image: redis:7.4.7-alpine@sha256:02f2cc4882f8bf87c79a220ac958f58c700bdec0dfb9b9ea61b62fb0e8f1bfcf
-    user: "${CURIO_HOST_UID:?set CURIO_HOST_UID}:${CURIO_HOST_GID:?set CURIO_HOST_GID}"
-    restart: unless-stopped
-    command: [redis-server, --maxmemory, "${CURIO_REDIS_MAX_MEMORY:-256mb}", --maxmemory-policy, allkeys-lru, --save, "", --appendonly, "no"]
-    volumes:
-      - type: bind
-        source: ${CURIO_DATA_ROOT}/ar-io-retained/redis
-        target: /data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-    networks: [curio]
-
-  ar-io-retained:
-    image: ghcr.io/ar-io/ar-io-core:f3032933c6039305bc5ecec0d486526c6d60d6ea@sha256:1155d2042870e6ba2c1457258765c16b762fe66026e4a42799abfca3b5d0d900
-    user: "${CURIO_HOST_UID:?set CURIO_HOST_UID}:${CURIO_HOST_GID:?set CURIO_HOST_GID}"
-    restart: unless-stopped
-    env_file:
-      - "${CURIO_DATA_ROOT}/ar-io-retained/start-height.env"
-    environment:
-      NODE_ENV: production
-      NODE_OPTIONS: --dns-result-order=ipv4first
-      LOG_LEVEL: ${CURIO_AR_IO_LOG_LEVEL:-info}
-      LOG_FORMAT: simple
-      TRUSTED_NODE_URL: http://ar-io-envoy:3000
-      TRUSTED_GATEWAYS_URLS: '{"http://ar-io-envoy:3000":1}'
-      ANS104_UNBUNDLE_FILTER: '{"never":true}'
-      ANS104_INDEX_FILTER: '{"never":true}'
-      RUN_OBSERVER: "false"
-      ON_DEMAND_RETRIEVAL_ORDER: trusted-gateways
-      CHAIN_CACHE_TYPE: redis
-      REDIS_CACHE_URL: redis://ar-io-retained-redis:6379
-    volumes:
-      - type: bind
-        source: ${CURIO_DATA_ROOT}/ar-io-retained
-        target: /app/data
-    depends_on:
-      ar-io-retained-redis: {condition: service_healthy}
-      ar-io-envoy: {condition: service_healthy}
-    healthcheck:
-      test: ["CMD", "/bin/sh", "/app/healthcheck.sh"]
-      interval: 10s
-      timeout: 5s
-      start_period: 30s
-      retries: 30
-    networks: [curio]
-
-  # r81 Envoy has a STRICT_DNS observer cluster. It must remain resolvable even
-  # though Curio does not run observer work or hold observer wallet state.
-  ar-io-observer:
-    image: ghcr.io/ar-io/ar-io-observer:308b6777d0df4a45f59a1984bcb0874a50f58965@sha256:53fa690e402313561fa9dd3ce6868ffd2f5b9e5688d4eead50da57c90192798e
-    restart: unless-stopped
-    entrypoint: ["/bin/sh", "-c"]
-    command: ["echo 'AR.IO observer disabled for Curio'; exec sleep infinity"]
-    # It is intentionally inert but still participates in Compose's complete
-    # health barrier; Envoy requires its DNS name to exist.
-    healthcheck:
-      test: ["CMD-SHELL", "test -d /"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-    networks: [curio]
-
-  ar-io-envoy:
-    image: ghcr.io/ar-io/ar-io-envoy:bd738a2435f1293e259dfcbb4ef42f50b26545da@sha256:ffbf849370ed24b2dfecab2ceef733bf1fb67da2d14b4909063d788cc8f72282
-    # This pinned image's entrypoint must generate /etc/envoy/envoy.yaml as
-    # root, so it cannot run under an arbitrary UID. It receives the EDS
-    # mount has both EDS files pre-created by the installer as the host user;
-    # ar-io-core (mapped to the host UID:GID) owns their updates. Envoy only
-    # chmods/reads those existing files, so root is never hidden in persistent
-    # bind-mounted state.
-    restart: unless-stopped
-    environment:
-      LOG_LEVEL: ${CURIO_AR_IO_ENVOY_LOG_LEVEL:-info}
-      TVAL_AR_IO_HOST: ar-io-core
-      TVAL_AR_IO_PORT: "4000"
-      TVAL_OBSERVER_HOST: ar-io-observer
-      TVAL_OBSERVER_PORT: "5050"
-      TVAL_TRUSTED_NODE_HOST: arweave.net
-      TVAL_TRUSTED_NODE_PORT: "443"
-      TVAL_FALLBACK_NODE_HOST: peers.arweave.xyz
-      TVAL_FALLBACK_NODE_PORT: "1984"
-      TVAL_GRAPHQL_HOST: ar-io-core
-      TVAL_GRAPHQL_PORT: "4000"
-      TVAL_GRAPHQL_HOST_HEADER: ""
-      TVAL_DATASETS_HOST: ar-io-core
-      TVAL_DATASETS_PORT: "4000"
-      TVAL_ARNS_ROOT_HOST: ""
-      TVAL_ARWEAVE_POST_DRY_RUN: "false"
-      TVAL_ENABLE_ARWEAVE_PEER_EDS: "true"
-      TVAL_ARWEAVE_PEER_DNS_RECORDS: peers.arweave.xyz
-      TVAL_ARWEAVE_PEER_DNS_PORT: "1984"
-      TVAL_ARIO_GATEWAY_UPSTREAM_IDLE_TIMEOUT: 55s
-    volumes:
-      - type: bind
-        source: ${CURIO_DATA_ROOT}/ar-io/envoy-eds
-        target: /data/envoy-eds
-    depends_on:
-      ar-io-core: {condition: service_started}
-      ar-io-observer: {condition: service_started}
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/ar-io/info"]
-      interval: 10s
-      timeout: 5s
-      start_period: 10s
-      retries: 12
     networks: [curio]
 
 networks:

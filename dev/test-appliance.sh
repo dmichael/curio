@@ -42,14 +42,14 @@ verify(){
   if [[ -f $EVIDENCE_DIR/arweave.txid ]]; then
     fetch_arweave_fixture "$(<"$EVIDENCE_DIR/arweave.txid")" "$EVIDENCE_DIR/arweave.verify" "$EVIDENCE_DIR/arweave.headers"
     [[ $(sha256sum "$EVIDENCE_DIR/arweave.verify" | awk '{print $1}') == $(<"$EVIDENCE_DIR/arweave.sha") ]] || fail 'AR.IO fixture bytes changed'
-    grep -Eiq '^x-cache:[[:space:]]*HIT' "$EVIDENCE_DIR/arweave.headers" || fail 'AR.IO fixture was not retained in cache'
+    grep -Eiq '^x-cache:[[:space:]]*HIT' "$EVIDENCE_DIR/arweave.headers" || fail 'AR.IO fixture was not cached'
   fi
   compose ps --all --quiet | xargs -r docker inspect >"$EVIDENCE_DIR/containers.json"
   python3 - "$EVIDENCE_DIR/containers.json" <<'PY'
 import json, pathlib, sys
 for c in json.loads(pathlib.Path(sys.argv[1]).read_text() or '[]'):
     name=c['Config']['Labels']['com.docker.compose.service']; ports=c['HostConfig'].get('PortBindings') or {}
-    if name in {'ar-io-core','ar-io-redis','ar-io-retained','ar-io-retained-redis','ar-io-observer','ar-io-envoy'}: assert not ports, (name,ports)
+    if name == 'ar-io-core': assert not ports, (name,ports)
     if name=='kubo': assert set(ports) <= {'4001/tcp','4001/udp'}, ports
 PY
 }
@@ -66,19 +66,16 @@ token=$(awk -F= '$1=="CURIO_CURATOR_TOKEN"{print $2}' "$ENV_FILE")
 [[ $ARWEAVE_TXID =~ ^[A-Za-z0-9_-]{43}$ && $ARWEAVE_SHA256 =~ ^[a-fA-F0-9]{64}$ ]] || fail 'set both valid CURIO_TEST_ARWEAVE_TXID and CURIO_TEST_ARWEAVE_SHA256'
 fetch_arweave_fixture "$ARWEAVE_TXID" "$EVIDENCE_DIR/arweave.initial" "$EVIDENCE_DIR/arweave.initial.headers"
 [[ $(sha256sum "$EVIDENCE_DIR/arweave.initial" | awk '{print $1}') == "${ARWEAVE_SHA256,,}" ]] || fail 'AR.IO fixture checksum mismatch'
-# This is isolated native retained-plane hydration, not an upstream r81 pin.
+# A second read proves the same persistent Core now serves a native cache hit.
+fetch_arweave_fixture "$ARWEAVE_TXID" "$EVIDENCE_DIR/arweave.cached" "$EVIDENCE_DIR/arweave.cached.headers"
+[[ $(sha256sum "$EVIDENCE_DIR/arweave.cached" | awk '{print $1}') == "${ARWEAVE_SHA256,,}" ]] || fail 'cached AR.IO fixture checksum mismatch'
+grep -Eiq '^x-cache:[[:space:]]*HIT' "$EVIDENCE_DIR/arweave.cached.headers" || fail 'second AR.IO fetch was not a native cache hit'
+# Keep is eager same-Core fetch and verification, not movement between tiers
+# or a claim of replication into the Arweave network.
 keep=$(curl -fsS -X POST -H "Authorization: Bearer $token" --get --data-urlencode "ref=ar://$ARWEAVE_TXID" http://127.0.0.1:8090/keep)
 printf %s "$keep" | python3 -c 'import json,sys; assert json.load(sys.stdin)["keep_state"] == "kept"'
 printf '%s\n' "$ARWEAVE_TXID" >"$EVIDENCE_DIR/arweave.txid"
 printf '%s\n' "${ARWEAVE_SHA256,,}" >"$EVIDENCE_DIR/arweave.sha"
-# Prove public original-txid routing survives without the ordinary Core/Envoy
-# path. The resolver must use ar-io-retained, never substitute ordinary cache.
-compose stop ar-io-core ar-io-envoy
-fetch_arweave_fixture "$ARWEAVE_TXID" "$EVIDENCE_DIR/arweave.retained" "$EVIDENCE_DIR/arweave.retained.headers"
-[[ $(sha256sum "$EVIDENCE_DIR/arweave.retained" | awk '{print $1}') == "${ARWEAVE_SHA256,,}" ]] || fail 'retained AR.IO fixture checksum mismatch'
-grep -Eiq '^x-cache:[[:space:]]*HIT' "$EVIDENCE_DIR/arweave.retained.headers" || fail 'retained AR.IO fixture was not a native cache hit'
-compose start ar-io-core ar-io-envoy
-wait_healthy
 printf 'curio-persistence-%s\n' "$(date +%s)" >"$EVIDENCE_DIR/payload"
 store=$(curl -fsS -H "Authorization: Bearer $token" -F "file=@$EVIDENCE_DIR/payload" http://127.0.0.1:8090/store)
 printf %s "$store" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' >"$EVIDENCE_DIR/media-id"
@@ -93,6 +90,9 @@ sha256sum "$DATA_ROOT/ar-io/start-height.env" | awk '{print $1}' >"$EVIDENCE_DIR
 [[ $(readlink "$APP_ROOT/current") != $(<"$EVIDENCE_DIR/release.before-rerun") ]] || fail 'rerun did not replace release pointer'
 verify
 compose up -d --force-recreate --no-build; wait_healthy; verify
+compose stop ar-io-core
+if health; then fail 'health succeeded with AR.IO Core stopped'; fi
+compose start ar-io-core; wait_healthy; verify
 compose stop kubo
 if health; then fail 'health succeeded with Kubo stopped'; fi
 compose start kubo; wait_healthy; verify

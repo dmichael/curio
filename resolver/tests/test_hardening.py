@@ -155,7 +155,6 @@ async def test_health_reports_5xx_backend_as_down_and_404_as_up():
         result = await gateway_health(SETTINGS, client)
     assert result["backends"]["ipfs"]["ok"] is True
     assert result["backends"]["arweave"]["ok"] is False
-    assert result["backends"]["arweave_retained"]["ok"] is False
     assert result["healthy"] is False
 
 

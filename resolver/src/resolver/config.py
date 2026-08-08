@@ -18,13 +18,9 @@ class Settings(BaseSettings):
 
     # Gateways the resolver PROBES and fetches metadata from (on-box, localhost).
     ipfs_internal: str = "http://127.0.0.1:8080"
-    # Ordinary AR.IO Core's data API. Envoy remains Core's trusted upstream,
-    # but its short cold-route deadline must not sit in Curio's byte path.
+    # The one persistent AR.IO Core data API. Resolve, playback, and explicit
+    # keep verification all use this same cache.
     arweave_internal: str = "http://127.0.0.1:4000"
-    # Private native AR.IO Core used only for explicit Arweave keep intent.
-    # It has separate on-disk Core state from the ordinary evictable gateway.
-    arweave_retained_internal: str = "http://127.0.0.1:4001"
-    arweave_retention_db: str = ""
 
     # Public front-door URL takes precedence over a request/proxy origin.
     public_base_url: str = ""
@@ -115,7 +111,6 @@ class Settings(BaseSettings):
         fallback = self.public_base_url.rstrip("/") or "https://curio.invalid"
         self.ipfs_public_base = self.ipfs_public_base or fallback
         self.arweave_public_base = self.arweave_public_base or fallback
-        self.arweave_retention_db = self.arweave_retention_db or f"{self.static_root.rstrip('/')}/arweave-retained.sqlite3"
         return self
 
 

@@ -14,8 +14,6 @@ async def test_seed_keeps_http_and_data_metadata_on_final_native_planes(tmp_path
         ipfs_internal="http://ipfs.internal",
         ipfs_api="http://kubo.internal",
         arweave_internal="http://ar.internal",
-        arweave_retained_internal="http://retained.internal",
-        arweave_retention_db=str(tmp_path / "retained.sqlite3"),
         static_root=str(tmp_path / "media"),
         ssrf_dns_check=False,
     )
@@ -38,7 +36,7 @@ async def test_seed_keeps_http_and_data_metadata_on_final_native_planes(tmp_path
             return httpx.Response(200, headers={"content-type": "image/png"})
         if request.url.host == "ar.internal" and request.method == "HEAD":
             return httpx.Response(200, headers={"content-type": "image/png"})
-        if request.url.host == "retained.internal" and request.method == "GET":
+        if request.url.host == "ar.internal" and request.method == "GET":
             return httpx.Response(200, headers={"x-cache": "HIT"}, content=b"ar")
         if request.url.path == "/api/v0/pin/add":
             return httpx.Response(200, json={"Pins": ["bafyMEDIA"]})
@@ -49,7 +47,7 @@ async def test_seed_keeps_http_and_data_metadata_on_final_native_planes(tmp_path
         await run_seed(job, settings, client)
 
     assert job.status == "done", job.errors
-    assert (job.pinned, job.retained, job.captured) == (1, 1, 1)
+    assert (job.pinned, job.warmed, job.captured) == (1, 1, 1)
     assert not any("/api/v0/add" in request for request in seen)
     assert any("/api/v0/pin/add" in request for request in seen)
 
@@ -61,8 +59,6 @@ async def test_seed_does_not_claim_native_html_runtime_work_is_kept(tmp_path):
         ipfs_internal="http://ipfs.internal",
         ipfs_api="http://kubo.internal",
         arweave_internal="http://ar.internal",
-        arweave_retained_internal="http://retained.internal",
-        arweave_retention_db=str(tmp_path / "retained.sqlite3"),
         ssrf_dns_check=False,
     )
     seen: list[str] = []
@@ -85,7 +81,7 @@ async def test_seed_does_not_claim_native_html_runtime_work_is_kept(tmp_path):
         await run_seed(job, settings, client)
 
     assert job.status == "done"
-    assert (job.pinned, job.retained, job.captured) == (0, 0, 0)
+    assert (job.pinned, job.warmed, job.captured) == (0, 0, 0)
     assert job.failed == 2
     assert all("uncaptured dependencies" in error for error in job.errors)
-    assert all("pin/add" not in request and "retained.internal" not in request for request in seen)
+    assert all("pin/add" not in request for request in seen)
