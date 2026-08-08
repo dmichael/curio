@@ -1,112 +1,93 @@
-# Curio appliance specification
+# Appliance
 
-Status: implemented packaging and media-plane behavior at 0.2.0.
+Curio installs as the current Linux user. Docker Engine and the Compose plugin
+must already work for that user. The installer does not use `sudo`, install
+Docker, or alter firewall and network settings.
 
-## Deployment contract
+## Files
 
-Curio is a no-sudo, per-user Linux appliance. Docker Engine and `docker
-compose` must already be usable by the installing user. The installer does not
-install Docker, alter daemon settings, firewall rules, routers, DNS, or
-unrelated containers.
-
-By default it stores:
+Defaults follow XDG paths:
 
 ```text
-$XDG_CONFIG_HOME/curio/curio.env       configuration and curator token
-$XDG_DATA_HOME/curio/app/releases/     immutable installed application copies
-$XDG_DATA_HOME/curio/app/current        atomic symlink to the active release
-$XDG_DATA_HOME/curio/state/             persistent media and service state
-$XDG_BIN_HOME/curio                     operator wrapper
+~/.config/curio/curio.env             configuration and curator token
+~/.local/share/curio/app/releases/    installed application copies
+~/.local/share/curio/app/current      active release symlink
+~/.local/share/curio/state/           persistent state
+~/.local/bin/curio                    operator command
 ```
 
-`CURIO_APP_ROOT` and `CURIO_DATA_ROOT` may choose safe absolute non-root paths
-on first install. The installer creates configuration with mode 0600 and runs
-state-writing containers as the installing UID:GID.
+Set `CURIO_APP_ROOT` or `CURIO_DATA_ROOT` before the first install to use other
+absolute, non-root paths.
 
-## Compose graph
+## Services
 
-The complete graph has exactly three services:
+The Compose file runs three services:
 
-1. `resolver` — FastAPI REST, MCP, skills, static media, and same-origin native
-   gateway proxy.
-2. `kubo` — IPFS gateway/API and pin store.
-3. `ar-io-core` — one pinned AR.IO Core with persistent `/app/data` state.
+| Service | Purpose |
+|---|---|
+| `resolver` | REST, MCP, static media, and the public media routes |
+| `kubo` | IPFS fetch, serving, pinning, and peer traffic |
+| `ar-io-core` | Arweave fetch, persistent cache, and serving |
 
-Core uses embedded LMDB (`CHAIN_CACHE_TYPE=lmdb`), directly trusts
-`https://arweave.net`, and has direct public trusted gateway URLs plus an
-on-demand retrieval order that does not need Envoy. Observer work and ANS-104
-unbundling/indexing are disabled. `ENABLE_CHUNK_DATA_CACHE_CLEANUP=false` and
-there is no contiguous-cache cleanup threshold, so Curio does not automatically
-delete cached content. Existing historical state directories and obsolete
-configuration keys are left untouched by upgrades.
+AR.IO Core uses embedded LMDB and talks directly to Arweave nodes and gateways.
+It does not need Redis, Envoy, or Observer. Its automatic content cleanup is
+disabled.
 
-On first install the installer obtains `START_HEIGHT` with a small Node command
-inside the already pinned Core image; it does not require a host Node, jq,
-Redis, Envoy, or EDS files.
+## Ports
 
-## Network surface
+The resolver publishes port 8090 by default. This is the only public HTTP
+origin. Kubo publishes port 4001 over TCP and UDP for IPFS peers. Kubo's HTTP
+ports and AR.IO Core are private to Compose.
 
-There is one public HTTP origin:
+## Installation and updates
 
-| Host port | Service | Purpose |
-|---|---|---|
-| `8090/tcp` (or `CURIO_PORT`) | resolver | REST, OpenAPI, MCP, skills, `/media`, `/ipfs`, and `/arweave` |
+From a checkout:
 
-Kubo additionally publishes native swarm participation on `4001/tcp` and
-`4001/udp`. Kubo gateway/API and Core have no host binding. Consumers use
-`http(s)://<curio-origin>:8090/ipfs/...` and `/arweave/...`, never internal
-ports.
+```bash
+./appliance/install.sh
+```
 
-## Arweave behavior
+The installer writes a new application directory, switches the `current`
+symlink, and waits for all three services. If startup fails, it restores the
+previous symlink and deployment. It leaves persistent state alone.
 
-All `/arweave` reads route to the one Core. Resolver metadata reads, playback,
-and ordinary resolution can populate its persistent cache. An explicit keep
-fully fetches the exact transaction/path and then fully reads it again,
-requiring a native `X-Cache: HIT`. This is eager fetch/verification on the same
-Core, not movement between tiers and not a claim that Curio replicated data into
-the Arweave network. AR.IO has no Curio pin API.
-
-## Resolver and configuration
-
-Compose supplies:
+The operator command supports:
 
 ```text
-RESOLVER_IPFS_INTERNAL=http://kubo:8080
-RESOLVER_IPFS_API=http://kubo:5001
-RESOLVER_ARWEAVE_INTERNAL=http://ar-io-core:4000
-RESOLVER_ARWEAVE_COLD_TIMEOUT=300
-RESOLVER_STATIC_ROOT=/state/media
-RESOLVER_STATIC_CACHE_MAX_BYTES=1000000000
+curio status
+curio health
+curio logs resolver --follow
+curio version
+curio update --check
+curio update
+curio update --version vX.Y.Z
 ```
 
-The generated `curio.env` contains roots, host UID/GID, curator token, port,
-cache limits, and public/trusted-proxy origin settings. HTTP, inline data, and
-uploads use Curio static storage and never reach IPFS implicitly. IPFS keeps
-pin the canonical CID root. HTML runtime responses remain `live-dependent`.
+No release assets have been published yet, so remote installation and update
+commands cannot complete until the first release exists.
 
-## Installer and state
+## Configuration
 
-The installer stages a release, atomically switches `current`, builds the
-resolver, and starts Compose with `--wait --remove-orphans`. Thus upgrades
-remove obsolete Compose containers. If startup fails, it stops the failed graph,
-restores the prior symlink, and starts that prior graph, so rollback can restore
-its previous services. It never recursively deletes state, runs Docker pruning,
-IPFS garbage collection, or pin removal.
-
-Back up `curio.env` and state, especially:
+Common settings in `curio.env` include:
 
 ```text
-state/ipfs/
-state/ar-io/                    persistent Core state and first-install height
-state/media/                    static objects and SQLite catalogue
-state/overrides.toml
-state/favorites.json
+CURIO_PORT=8090
+CURIO_IPFS_STORAGE_MAX=20GB
+CURIO_STATIC_CACHE_MAX_BYTES=1000000000
+CURIO_ARWEAVE_COLD_TIMEOUT=300
+CURIO_PUBLIC_BASE_URL=
+CURIO_TRUSTED_PROXY_CIDRS=
 ```
 
-## Acceptance checks
+The installer also records the current user and group IDs and creates a random
+curator token. Do not share `curio.env`.
 
-A qualified deployment demonstrates all three services become healthy, only
-resolver `8090` and Kubo swarm `4001/tcp,4001/udp` publish host ports, first
-Arweave fetch followed by native `X-Cache:HIT`, persistence across recreation
-and reboot, Core failure/recovery, and installer rollback. See
-[appliance testing](appliance-testing.md).
+## Backup
+
+Stop Curio before a cold backup, then copy `curio.env` and the state directory.
+The important state is Kubo's repository, AR.IO Core's data, static media, and
+curator records.
+
+Old directories left by earlier development builds are not deleted during an
+upgrade. Remove them manually only after confirming that the current Compose
+file does not mount them.

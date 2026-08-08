@@ -1,60 +1,45 @@
 # Security
 
-## Deployment boundary
+Curio exposes one HTTP service on port 8090. Kubo and AR.IO HTTP interfaces stay
+inside the Compose network. Kubo port 4001 is public only for IPFS peer traffic.
 
-Curio can be placed behind a private-network or internet-facing front door; a
-network boundary is not authorization. Its one public HTTP origin is port
-`8090`, which serves REST, MCP, static media, and proxied IPFS/Arweave paths.
-Kubo and the one persistent AR.IO Core are internal Compose services.
-Kubo swarm `4001/tcp` and `4001/udp` are separately published for IPFS
-participation, not for Curio administration.
+Read-only resolution and media routes may be public. These actions require the
+curator bearer token:
 
-Read-only resolver and media routes may be public. Every mutation requires a
-bearer token: `POST /keep`, `POST /seed`, `POST /store`, mutable favorites and
-overrides, and `pin=1` actions on `/resolve` or `/wallet`. The installer writes
-a random `CURIO_CURATOR_TOKEN` to
-`$XDG_CONFIG_HOME/curio/curio.env`; protect that file (mode 0600) and send it
-as `Authorization: Bearer <token>`. An empty resolver token disables mutations.
+- keep and pin requests;
+- seed jobs;
+- uploads;
+- favorite changes;
+- override changes.
 
-Terminate TLS at a trusted front door or proxy. Direct requests derive returned
-Curio URLs from their request origin, and forwarded headers are ignored by
-default. `CURIO_PUBLIC_BASE_URL` explicitly overrides the request origin for a
-proxy deployment or non-request MCP invocation. Otherwise, set
-`CURIO_TRUSTED_PROXY_CIDRS` only to the IP/CIDR ranges of immediate trusted
-proxies to enable forwarded origin handling. Curio then accepts only a complete,
-valid RFC `Forwarded` origin or `X-Forwarded-Proto` with
-`X-Forwarded-Host`, and only when the connecting peer is in that allowlist.
-Never allowlist client ranges: a trusted proxy must strip or replace inbound
-forwarded headers before sending its own.
+The installer creates `CURIO_CURATOR_TOKEN` in
+`~/.config/curio/curio.env` with file mode 0600. Protect that file. If the
+resolver token is empty, mutations are disabled.
 
-Curio follows user- and metadata-supplied HTTP URLs. It resolves DNS before
-connecting, rejects prohibited address ranges, pins the connection to a checked
-address, and validates every redirect target. Body-size, redirect, concurrency,
-and timeout limits apply. Treat this as defense in depth: run the resolver with
-only the outbound access appropriate to its curator workload and keep Docker,
-Curio, and its dependencies updated.
+Use TLS when Curio is reachable over an untrusted network. Returned media URLs
+normally use the request origin. `CURIO_PUBLIC_BASE_URL` can set a fixed public
+origin. Forwarded origin headers are ignored unless the connecting proxy is
+listed in `CURIO_TRUSTED_PROXY_CIDRS`; trusted proxies must replace
+client-supplied forwarded headers.
 
-Kept IPFS content is pinned and Kubo is configured to participate. Arweave
-resolve/play and keep use one persistent Core; keep eagerly fetches and verifies
-local cache availability. This is not an AR.IO pin API or new Arweave
-replication. Neither is proof of public reachability: `/healthz` reports Kubo
-evidence conservatively and AR.IO reachability as unknown where Core has no
-probe.
+Curio fetches URLs found in requests and metadata. It rejects local and private
+network targets, checks DNS before connecting, checks redirects, and limits
+body size, redirects, concurrency, and request time. Network policy outside the
+container remains the operator's responsibility.
 
-The appliance contacts public IPFS peers/gateways, AR.IO upstreams, Blockscout,
-BENS, and TzKT as needed. Their availability, privacy practices, and returned
-content are outside Curio's control.
+Curio contacts IPFS peers and gateways, Arweave nodes and gateways, Blockscout,
+BENS, and TzKT. Their availability and privacy policies are outside Curio's
+control.
 
 ## Reporting a vulnerability
 
-Use GitHub's private vulnerability reporting:
+Use GitHub private vulnerability reporting:
 
 <https://github.com/dmichael/curio/security/advisories/new>
 
-Include the affected revision, deployment topology, reproduction steps, and
-impact. Do not open a public issue for an unpatched vulnerability.
+Include the affected revision, deployment details, reproduction steps, and
+impact. Do not publish an unpatched vulnerability in an issue.
 
 ## Supported versions
 
-Until a tagged release is published, security fixes apply to the current `main`
-branch. This policy will be revised when release branches exist.
+Until the first release, security fixes apply to the current `main` branch.

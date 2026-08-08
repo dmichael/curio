@@ -1,137 +1,103 @@
 ---
 name: curio
-description: Resolve media references into playable URLs on the Curio origin; explicitly keep selected IPFS, Arweave, HTTP, data, or uploaded works with curator authorization. Fetch this skill from GET /skill/SKILL.md on a running Curio for the service's instructions.
+description: Resolve NFT media through Curio and keep selected IPFS, Arweave, HTTP, data, or uploaded works.
 ---
 
-# Curio — agent instructions
+# Curio
 
-Curio resolves a reference to a locally served work. A successful response has
-`media_url` (and the compatibility field `resolved_url`) on the Curio origin;
-never send the caller to an upstream gateway as a successful result.
+Curio resolves media references and returns URLs on the Curio server. Use
+`GET /openapi.json` for the full schema.
 
-Use `GET /openapi.json` or `/docs` for exact schema details. This skill is
-served by the box at `GET /skill/SKILL.md`. The collector playbook is at
-`GET /skill/nft-preservation`.
-
-## Read-only resolution
+## Resolve
 
 ```text
 GET /resolve?ref=<reference>
-GET /c?ref=<reference>        # 302 for renderers that only accept a URL
+GET /c?ref=<reference>
 GET /wallet?ref=<wallet>
+GET /favorites
 GET /library
 GET /healthz
-GET /favorites
-GET /override
 ```
 
-`ref` may be an IPFS URI/path/gateway URL, `ar://txid[/path]`, an Arweave
-URL, HTTP(S), token metadata, on-chain `data:` metadata/media, or a Verse
-artwork page. `media_url` is always on the request's Curio origin for HTTP
-calls. Hand it to a renderer exactly as returned; filename query hints are
-functional for extension-sniffing renderers such as the Feral File FF1.
+References may be IPFS, Arweave, HTTP, `data:` metadata or media, or a Verse
+artwork page. A successful result contains `media_url` and `resolved_url` on the
+Curio origin.
 
-`playback_method: "play"` means static media; `"send"` means HTML. A runtime
-HTML result is `live-dependent`, not a claim that Curio preserved its scripts,
-assets, APIs, workers, or origin behavior. `resolved: false` means no local
-artifact could be served. `substituted: true` discloses an operator replacement
-and includes `substituted_ref` and `substitution_status`.
+Curio serves IPFS at `/ipfs/...`, Arweave at `/arweave/...`, and ordinary files
+at `/media/...`. `playback_method` is `play` for static media and `send` for
+HTML. `live-dependent` HTML may still need uncaptured network resources.
 
-Curio uses `/ipfs/<cid>/<path>` through Kubo, `/arweave/<txid>/<path>` through
-AR.IO, and `/media/<id>` for HTTP/data/uploads. HTTP, inline data, and uploads
-never enter IPFS implicitly.
+A substituted result names the replacement and its status.
 
-## Explicit keep and authentication
+## Authenticate changes
 
-Mutations require `Authorization: Bearer <CURIO_CURATOR_TOKEN>`. Read-only
-routes may be public. Use an explicit keep when preservation, rather than a
-cache hit, is intended:
-
-```bash
-curl -X POST -H 'Authorization: Bearer YOUR_TOKEN' --get \
-  'https://curio.example/keep' \
-  --data-urlencode 'ref=ipfs://bafy.../work.mp4'
-```
-
-`POST /keep?ref=...` returns only after its source-appropriate promotion:
-
-- IPFS pins the canonical DAG in Kubo and seeds it.
-- Arweave fully fetches and verifies the same persistent Core cache used for
-  resolve/play. It is not an AR.IO pin API or new Arweave replication.
-- HTTP, `data:`, and uploads promote the existing Curio static object.
-
-`GET /resolve?ref=...&pin=1` is an authenticated convenience action. For IPFS
-it schedules a background pin and reports `keep_state: "pending"`; that is not
-proof it completed. Static and Arweave promotions report their result in the
-response. Do not use `pin=1` for runtime HTML: it remains `live-dependent`.
-
-Favorites are also explicit curator intent:
+REST mutations require:
 
 ```text
-POST   /favorites?ref=<reference>&note=<optional>
-DELETE /favorites?ref=<reference>
+Authorization: Bearer <CURIO_CURATOR_TOKEN>
 ```
 
-A favorite promotes a final static or Arweave artifact immediately, schedules
-an IPFS pin, and does not make an HTML runtime preserved. Removing a favorite
-does not release bytes.
+MCP mutation tools take the same value as `curator_token`.
 
-## Wallet discovery and seeding
+## Keep one work
 
-`GET /wallet?ref=<wallet>` reads live inventory. `ref` accepts `0x...`,
-`name.eth`, `tz1...`, or `name.tez`; use `scope=held|published|created|contract`
-as supported by the chain. Ethereum mainnet discovery uses Blockscout/BENS;
-Tezos mainnet uses TzKT. `published` is Tezos first-mint history, not authorship;
-`created` is Tezos creator/author metadata. Ethereum has no keyless creator
-index. Other chains are not supported for wallet discovery.
-
-Start an authenticated whole-wallet keep job with:
-
-```bash
-curl -X POST -H 'Authorization: Bearer YOUR_TOKEN' --get \
-  'https://curio.example/seed' \
-  --data-urlencode 'ref=name.eth' \
-  --data-urlencode 'scope=held'
+```text
+POST /keep?ref=<reference>
 ```
 
-It returns `202` and a job id; poll `GET /seed/<id>` or list `GET /seed`.
-Seeding pins IPFS final artifacts, fetches/verifies Arweave final artifacts
-through the same Core, and promotes ordinary HTTP/data final artifacts in static
-storage. It does not move ordinary bytes into Kubo. Job history is in memory;
-kept media survives restart, job status does not.
+- IPFS keep pins the CID root in Kubo.
+- Arweave keep fully fetches and verifies the same persistent AR.IO Core used
+  by resolve and playback.
+- HTTP and `data:` keep marks the static object as kept.
 
-## Uploads, overrides, and status
+`GET /resolve?ref=...&pin=1` is a compatibility shortcut. IPFS pinning is
+asynchronous there; `pin_scheduled` does not mean it finished.
 
-Upload an operator-supplied static file:
+Adding a favorite also expresses keep intent. Removing a favorite does not
+delete media.
 
-```bash
-curl -X POST -H 'Authorization: Bearer YOUR_TOKEN' \
-  -F 'file=@master.mp4' 'https://curio.example/store'
+## Keep a wallet or catalog
+
+```text
+POST /seed?ref=<wallet>&scope=held
+GET /seed/<job-id>
 ```
 
-`POST /store` returns `id`, `media_url`, SHA-256 integrity, and
-`source_kind: "upload"`; it stores the file as kept Curio static media. It does
-not produce a CID and has no `expect_cid` parameter. Adding an upload does not
-make it a replacement by itself.
+Supported scopes are `held`, `published`, `created`, and `contract`, subject to
+chain support. Ethereum mainnet uses Blockscout and BENS. Tezos mainnet uses
+TzKT. `published` is Tezos first-mint history; `created` uses Tezos
+creator/author metadata. Ethereum has no keyless creator index.
 
-Manage a disclosed replacement with authenticated `POST /override` (JSON body
-with `ref`, `replacement`, and `status`) or `DELETE /override?ref=...`.
-Statuses are `canonical-recovered`, `captured-original`, `operator-attested`,
-and `alternate-master`. A replacement is never silent.
+Seed jobs keep final IPFS, Arweave, and static artifacts through their existing
+local services. Job history is in memory.
 
-`GET /library` separates Kubo pin status, same-Core Arweave cache diagnostics,
-and operator records. Resolve/play also populate that cache; explicit keep is
-an eager fetch/verification, not a replication claim. `/healthz`
-reports backend health plus conservative participation evidence; AR.IO public
-reachability can honestly be `unknown`.
+## Upload and replace
 
-## Origin and MCP
+```text
+POST /store                  multipart field: file
+POST /override               JSON body
+DELETE /override?ref=...
+POST /favorites?ref=...
+DELETE /favorites?ref=...
+```
 
-Connect streamable HTTP MCP at `/mcp`. MCP mutation tools take the curator
-token as `curator_token`; REST uses the bearer header. Direct HTTP URLs derive
-from the request origin. `CURIO_PUBLIC_BASE_URL` explicitly overrides that
-origin for proxy or non-request MCP deployments. Otherwise forwarded headers
-are ignored unless `CURIO_TRUSTED_PROXY_CIDRS` allowlists the immediate proxy's
-IP/CIDR range. An allowlisted peer can provide a complete valid RFC `Forwarded`
-origin or `X-Forwarded-Proto` plus `X-Forwarded-Host`; malformed or partial
-values are ignored. Do not allowlist client networks.
+Uploads stay in Curio's static store and return a `/media/...` URL. They do not
+produce an IPFS CID.
+
+Overrides use one of these statuses:
+
+- `canonical-recovered`
+- `captured-original`
+- `operator-attested`
+- `alternate-master`
+
+Curio reports every override as a substitution.
+
+## Notes
+
+AR.IO Core keeps fetched content in one persistent cache with automatic content
+cleanup disabled. Arweave keep is a forced download and local cache check, not a
+new Arweave replica.
+
+HTTP and inline media never enter IPFS automatically. Runtime HTML is not fully
+preserved unless its dependencies are also captured.

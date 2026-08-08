@@ -1,112 +1,68 @@
-# Curio design
+# Design
 
-## Contract
-
-Curio turns a reference into locally hosted media:
+Curio gives players one URL space for media stored in several different ways.
 
 ```text
-reference -> work -> source-appropriate local hosting -> Curio URL
+                         +-> Kubo --------> /ipfs/...
+request -> resolver -----+-> AR.IO Core --> /arweave/...
+                         +-> static store -> /media/...
 ```
 
-Every successful resolution returns `media_url` on the Curio origin. It never
-calls an upstream URL a successful playable result. One public origin routes
-`/ipfs/...` to Kubo, `/arweave/...` to AR.IO, and `/media/...` to Curio's static
-store. Internal service names and ports do not appear in consumer responses.
+Only the resolver is a public HTTP service. Kubo and AR.IO remain behind it.
 
-## Storage planes and retention
+## Three storage paths
 
-Curio does not flatten every work into IPFS.
+IPFS content stays in Kubo under its original CID. Keeping it pins the CID root.
 
-- **IPFS:** resolution uses Kubo's cache and serving keeps the original
-  CID/path. Explicit keep pins the canonical DAG in Kubo, which is Curio's
-  IPFS contribution to the network.
-- **Arweave:** resolve, play, and keep use one persistent AR.IO Core. Explicit
-  keep fully fetches the requested transaction/path, then fully reads it again
-  and requires Core's native cache hit. It verifies local serving at that time;
-  it is not an AR.IO pin API, a separate retention tier, or new replication in
-  the Arweave storage network. Core cleanup is disabled, so Curio does not
-  automatically delete cached content.
-- **HTTP, `data:`, and uploads:** Curio stores and serves bounded static files
-  under `/media/<id>`, with a SHA-256 record. They never enter Kubo implicitly.
-  Cross-protocol publication would need an explicit curator action and a new
-  identity; it is not implemented by the current API.
+Arweave content stays under its transaction and manifest identity. Curio uses
+one persistent AR.IO Core with automatic content cleanup disabled. Any Arweave
+content fetched during resolution or playback can remain in that store. The
+Arweave keep action forces a full fetch and verifies a local cache hit; there is
+no separate retention service.
 
-`cached` and `kept` are different states. Resolution may cache media. Explicit
-keep, favorite intent, an operator upload, or a seed promotes the final artifact
-on its own plane. Runtime HTML is `live-dependent`: capturing one response does
-not preserve dependencies, workers, APIs, or origin behavior, so keep refuses
-it rather than making a preservation claim.
+HTTP, `data:`, and uploaded media use Curio's static store. The ordinary cache
+has a size limit and evicts only unkept entries. Curio does not silently convert
+these files to IPFS.
 
-## Resolver behavior
+## Resolution
 
-Curio recognizes IPFS and gateway spellings, Arweave transaction/manifest
-paths, HTTP(S), `data:` URIs, token metadata, UnixFS wrappers, and Verse
-artwork pages. Metadata recursion selects animation/artifact fields first and
-otherwise chooses the largest probeable image candidate. Bare CID responses may
-add a filename hint for renderers such as the Feral File FF1 that infer playback
-from URL suffixes. Static media uses `play`; HTML uses `send`.
+The resolver understands common IPFS and Arweave forms, HTTP and inline
+metadata, UnixFS directory wrappers, and Verse pages. It follows metadata to the
+selected media and returns a URL on the Curio origin.
 
-A direct HTTP media response is fetched with SSRF checks, copied into static
-storage, and returned as a Curio URL. A direct `data:` media response is decoded
-into the same store. Source bytes are not returned as a success until Curio can
-serve them locally. A failed resolution says why.
+HTML can depend on resources that Curio has not captured. Such results are
+marked `live-dependent` instead of kept.
 
-The current resolver does not accept a chain contract/token pair as `/resolve`
-input or query a chain RPC for its token URI.
+## Curation
 
-## Curation, provenance, and chains
+Wallet endpoints use public Ethereum and Tezos indexers to find references.
+They do not prove ownership history, authorship, or authenticity. A seed job
+keeps the final media found for the selected wallet or catalog.
 
-`/wallet` reads live public indexers; it is discovery, not an ownership,
-authorship, or authenticity oracle. `/seed` is an authenticated background job
-that keeps final artifacts source-appropriately. Ethereum mainnet uses
-Blockscout/BENS for ERC-721/ERC-1155 holdings, ENS, and contract listings.
-Tezos mainnet uses TzKT for FA2 holdings, `.tez` names, first-minted,
-creator-attributed, and contract listings. Tezos `published` is first-minter
-history, not authorship; `created` uses creator/author metadata. Ethereum has
-no reliable keyless creator index.
+Overrides are explicit mappings for dead references. Substituted results carry
+the override status so clients can distinguish a recovered canonical object
+from an operator-selected alternative.
 
-An override maps a dead canonical reference to an operator-selected replacement
-and is always disclosed as `substituted` with a provenance status:
-`canonical-recovered`, `captured-original`, `operator-attested`, or
-`alternate-master`. A wallet is discovery context, not proof of creator or
-canonical bytes.
+## State
 
-## Network, trust, and participation
+The default state directory contains:
 
-The Compose graph has one HTTP ingress, resolver port `8090`; Kubo and the
-one AR.IO Core are private. Kubo swarm `4001/tcp` and `4001/udp` are published
-for native IPFS participation. Kubo and AR.IO are enabled by default. `/healthz`
-distinguishes backend health from participation evidence: advertised Kubo
-addresses are not an inbound reachability probe, and Core exposes no equivalent
-AR.IO reachability fact, so both can honestly remain `unknown`.
+```text
+ipfs/          Kubo repository and pins
+ar-io/         AR.IO Core data, LMDB, and SQLite state
+media/         static objects and catalogue
+overrides.toml curator replacements
+favorites.json curator selections
+```
 
-Read-only routes may be public. Mutations require the curator bearer token:
-keep/pin, seed, upload, favorite changes, and override changes. Source fetching
-checks literal addresses, DNS results, and each redirect target before
-connection, then applies bounded body, concurrency, and timeout limits.
+Back up this directory and `curio.env`. Arweave's local cache is useful, but it
+is not a claim that Curio added data to the Arweave storage network.
 
-For direct HTTP, the origin is derived from the request.
-`CURIO_PUBLIC_BASE_URL` explicitly overrides it. Without that setting,
-forwarded headers are ignored unless `CURIO_TRUSTED_PROXY_CIDRS` allowlists the
-immediate proxy's IP/CIDR range. An allowlisted peer may supply a complete,
-validated RFC `Forwarded` origin or `X-Forwarded-Proto` plus
-`X-Forwarded-Host`; malformed, partial, or direct-client headers are ignored.
-The same effective origin is used for REST URLs, MCP tool URLs, and MCP's
-Host/Origin check.
+## Network and authorization
 
-## Operations
+The resolver serves REST, MCP, and media on port 8090. Kubo publishes port 4001
+for IPFS peers. Other service ports stay private.
 
-The supported source install is per-user and no-sudo. It uses
-`$XDG_CONFIG_HOME/curio/curio.env`, `$XDG_DATA_HOME/curio/app/releases`, and
-`$XDG_DATA_HOME/curio/state` by default. The state tree contains Kubo data,
-persistent AR.IO Core state, static media, and operator records; back up
-those actual paths.
-
-`curio version`, `curio update --check`, `curio update`, and
-`curio update --version vX.Y.Z` are operator commands. The installed wrapper
-invokes the verified bootstrap: an exact version is passed as `CURIO_VERSION`,
-and no version selects the latest release URL. The bootstrap verifies the
-release archive checksum before running its installer; that installer atomically
-switches `current`, health-gates Compose, and restores the prior graph on
-failure. No release asset is currently published, so this release path is not
-available yet and updates are never automatic.
+Read-only routes may be public. Mutations require the curator token. Returned
+media URLs use the request origin unless an explicit public base or trusted
+proxy origin is configured.

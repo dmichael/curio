@@ -1,6 +1,4 @@
-"""The box serves its own skills: the API instructions plus shipped
-playbooks — there's no ecosystem convention for distributing skills yet,
-so this service's convention is that it self-serves them."""
+"""Curio serves its API and preservation skills."""
 
 
 def test_api_skill_served(http_client):
@@ -14,7 +12,8 @@ def test_api_skill_served(http_client):
 def test_shipped_preservation_skill_served(http_client):
     response = http_client.get("/skill/nft-preservation")
     assert response.status_code == 200
-    assert "recovery ladder" in response.text
+    assert "name: nft-preservation" in response.text
+    assert "# NFT media with Curio" in response.text
     # full path spelling too
     assert http_client.get("/skill/nft-preservation/SKILL.md").text == response.text
 
