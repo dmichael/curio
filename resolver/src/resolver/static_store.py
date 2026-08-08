@@ -1,9 +1,11 @@
 """Curio's bounded local HTTP/data media backend."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import mimetypes
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -21,21 +23,23 @@ class StaticStore:
     charged to that quota or removed by cache eviction.
     """
 
+    _SCHEMA_VERSION = 1
+    _initialized_paths: set[Path] = set()
+    _initialization_locks: dict[Path, threading.Lock] = {}
+    _initialization_locks_guard = threading.Lock()
+
     def __init__(self, root: str, cache_max_bytes: int = 1_000_000_000):
         self.root = Path(root)
         self.objects = self.root / "objects"
         self.db_path = self.root / "library.sqlite3"
         self.cache_max_bytes = cache_max_bytes
 
-    def _connection(self) -> sqlite3.Connection:
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.objects.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(self.db_path, timeout=30)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA busy_timeout = 30000")
-        db.execute("PRAGMA journal_mode=WAL")
-        # Serialize schema upgrades across multiple resolver processes.
-        db.execute("BEGIN IMMEDIATE")
+    @classmethod
+    def _initialization_lock(cls, db_path: Path) -> threading.Lock:
+        with cls._initialization_locks_guard:
+            return cls._initialization_locks.setdefault(db_path, threading.Lock())
+
+    def _migrate(self, db: sqlite3.Connection) -> None:
         db.execute(
             """CREATE TABLE IF NOT EXISTS media (
                 id TEXT PRIMARY KEY, digest TEXT NOT NULL, filename TEXT,
@@ -67,7 +71,45 @@ class StaticStore:
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS media_source_digest ON media(source_ref, digest)")
         db.execute("CREATE INDEX IF NOT EXISTS media_digest ON media(digest)")
         db.execute("CREATE INDEX IF NOT EXISTS media_cache_lru ON media(keep_state, accessed_at)")
-        db.commit()
+
+    def _ensure_initialized(self) -> None:
+        db_path = self.db_path.resolve()
+        with self._initialization_lock(db_path):
+            if db_path in self._initialized_paths:
+                return
+            lock_path = self.root / ".library.sqlite3.init.lock"
+            with lock_path.open("a") as lock_file:
+                # flock covers separate resolver processes on Linux.
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                try:
+                    db = sqlite3.connect(self.db_path, timeout=30)
+                    try:
+                        db.row_factory = sqlite3.Row
+                        db.execute("PRAGMA busy_timeout = 30000")
+                        version = db.execute("PRAGMA user_version").fetchone()[0]
+                        if version < self._SCHEMA_VERSION:
+                            db.execute("PRAGMA journal_mode=WAL")
+                            db.execute("BEGIN IMMEDIATE")
+                            try:
+                                self._migrate(db)
+                                db.execute(f"PRAGMA user_version = {self._SCHEMA_VERSION}")
+                                db.commit()
+                            except Exception:
+                                db.rollback()
+                                raise
+                    finally:
+                        db.close()
+                finally:
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
+            self._initialized_paths.add(db_path)
+
+    def _connection(self) -> sqlite3.Connection:
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.objects.mkdir(parents=True, exist_ok=True)
+        self._ensure_initialized()
+        db = sqlite3.connect(self.db_path, timeout=30)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA busy_timeout = 30000")
         return db
 
     @staticmethod

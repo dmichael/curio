@@ -1,5 +1,6 @@
 """Target media-model contracts, independent of real gateways."""
 import json
+import multiprocessing
 import socket
 from concurrent.futures import ThreadPoolExecutor
 
@@ -110,6 +111,61 @@ def test_static_store_deduplicates_concurrent_identity_inserts(tmp_path):
         assert db.execute("SELECT COUNT(*) FROM media").fetchone()[0] == 1
     finally:
         db.close()
+
+
+def _open_cold_static_store(root: str, barrier, results) -> None:
+    try:
+        barrier.wait(timeout=10)
+        db = StaticStore(root)._connection()
+        try:
+            results.put((db.execute("PRAGMA journal_mode").fetchone()[0], None))
+        finally:
+            db.close()
+    except Exception as error:
+        results.put((None, repr(error)))
+
+
+def test_static_store_repeated_concurrent_cold_starts(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    workers = 4
+    for attempt in range(8):
+        barrier = context.Barrier(workers)
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_open_cold_static_store,
+                args=(str(tmp_path / f"cold-start-{attempt}"), barrier, results),
+            )
+            for _ in range(workers)
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=15)
+        try:
+            assert [process.exitcode for process in processes] == [0] * workers
+            assert [results.get(timeout=2) for _ in processes] == [("wal", None)] * workers
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join()
+
+
+def test_static_store_initializes_schema_once_per_process(tmp_path, monkeypatch):
+    calls = 0
+    migrate = StaticStore._migrate
+
+    def counted_migrate(self, db):
+        nonlocal calls
+        calls += 1
+        migrate(self, db)
+
+    monkeypatch.setattr(StaticStore, "_migrate", counted_migrate)
+    for _ in range(2):
+        db = StaticStore(str(tmp_path))._connection()
+        db.close()
+    assert calls == 1
 
 
 def test_mutation_rejects_wrong_curator_token(http_client):
