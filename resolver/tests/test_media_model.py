@@ -164,7 +164,10 @@ def test_html_capture_is_live_dependent_and_keep_refuses(http_client, monkeypatc
 async def test_mcp_uses_configured_public_origin(monkeypatch):
     monkeypatch.setenv("RESOLVER_PUBLIC_BASE_URL", "https://curio.public")
     get_settings.cache_clear()
-    def handler(_request): raise AssertionError("no network")
+    def handler(request):
+        if request.method == "HEAD" and request.url.host == "127.0.0.1":
+            return httpx.Response(200, headers={"content-type": "image/png"})
+        raise AssertionError("unexpected network")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         mcp_server.set_client(client)
         content, _ = await mcp_server.mcp.call_tool("resolve", {"ref": "ipfs://bafyCID/a.png"})

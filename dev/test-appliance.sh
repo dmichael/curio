@@ -49,7 +49,7 @@ verify(){
 import json, pathlib, sys
 for c in json.loads(pathlib.Path(sys.argv[1]).read_text() or '[]'):
     name=c['Config']['Labels']['com.docker.compose.service']; ports=c['HostConfig'].get('PortBindings') or {}
-    if name in {'ar-io-core','ar-io-redis','ar-io-observer','ar-io-envoy'}: assert not ports, (name,ports)
+    if name in {'ar-io-core','ar-io-redis','ar-io-retained','ar-io-retained-redis','ar-io-observer','ar-io-envoy'}: assert not ports, (name,ports)
     if name=='kubo': assert set(ports) <= {'4001/tcp','4001/udp'}, ports
 PY
 }
@@ -76,6 +76,7 @@ printf '%s\n' "${ARWEAVE_SHA256,,}" >"$EVIDENCE_DIR/arweave.sha"
 compose stop ar-io-core ar-io-envoy
 fetch_arweave_fixture "$ARWEAVE_TXID" "$EVIDENCE_DIR/arweave.retained" "$EVIDENCE_DIR/arweave.retained.headers"
 [[ $(sha256sum "$EVIDENCE_DIR/arweave.retained" | awk '{print $1}') == "${ARWEAVE_SHA256,,}" ]] || fail 'retained AR.IO fixture checksum mismatch'
+grep -Eiq '^x-cache:[[:space:]]*HIT' "$EVIDENCE_DIR/arweave.retained.headers" || fail 'retained AR.IO fixture was not a native cache hit'
 compose start ar-io-core ar-io-envoy
 wait_healthy
 printf 'curio-persistence-%s\n' "$(date +%s)" >"$EVIDENCE_DIR/payload"

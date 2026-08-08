@@ -20,7 +20,7 @@ from typing import Any, NamedTuple
 
 import httpx
 
-from .arweave_retention import keep_arweave, retained_records
+from .arweave_retention import keep_arweave, retained_available, retained_records
 from .config import Settings
 from .favorites import get_favorites
 from .overrides import get_registry
@@ -109,7 +109,12 @@ async def pin_resolved(
     """Apply explicit keep intent on the source-native storage plane."""
     if not result.resolved:
         return None
-    ipfs = ipfs_parts(result.resolved_url)
+    # The public resolved URL may be a Curio proxy and original_ref may be a
+    # metadata document. Retention always targets the final native artifact.
+    # The fallback only supports older in-process callers that construct a
+    # lightweight result object; every Resolved instance carries final_ref.
+    final_ref = getattr(result, "final_ref", None) or result.original_ref
+    ipfs = ipfs_parts(final_ref) if final_ref else None
     if ipfs is not None:
         cid, path = ipfs
         response = await client.post(
@@ -119,10 +124,10 @@ async def pin_resolved(
         )
         response.raise_for_status()
         return "pinned"
-    if result.provider == "arweave" or result.source_kind == "arweave":
+    if getattr(result, "source_kind", None) == "arweave" or getattr(result, "provider", None) == "arweave":
         from .refs import arweave_parts
 
-        arweave = arweave_parts(result.original_ref)
+        arweave = arweave_parts(final_ref) if final_ref else None
         if arweave is None:
             return "failed"
         txid, path = arweave
@@ -268,20 +273,27 @@ async def _ipfs_status(settings: Settings, client: httpx.AsyncClient) -> dict[st
 
 async def _arweave_status(settings: Settings, client: httpx.AsyncClient) -> dict[str, Any]:
     retained = retained_records(settings)
-    txids = warmed_txids(settings)
-    if not txids:
-        return {
-            "retained": {
-                "kept": sum(record["state"] == "kept" for record in retained),
-                "pending": sum(record["state"] == "pending" for record in retained),
-                "failed": sum(record["state"] == "failed" for record in retained),
-                "operation": "isolated native retained-plane operation (not an AR.IO r81 pin API)",
-            },
-            "known_warmed": 0,
-            "currently_cached": 0,
-        }
+    registry_counts = {
+        state: sum(record["state"] == state for record in retained)
+        for state in ("kept", "pending", "failed")
+    }
+    kept_records = [record for record in retained if record["state"] == "kept"]
     sem = asyncio.Semaphore(settings.seed_concurrency)
 
+    async def retained_now(record: dict[str, str | None]) -> bool:
+        async with sem:
+            return await retained_available(str(record["txid"]), str(record["path"]), settings, client)
+
+    retained_hits = sum(await asyncio.gather(*(retained_now(record) for record in kept_records)))
+    retained_status = {
+        "registry": registry_counts,
+        "confirmed_available": retained_hits,
+        "degraded": len(kept_records) - retained_hits,
+        "operation": "isolated native retained-plane operation (not an AR.IO r81 pin API)",
+    }
+    txids = warmed_txids(settings)
+    if not txids:
+        return {"retained": retained_status, "known_warmed": 0, "currently_cached": 0}
     async def cached(txid: str) -> bool:
         # X-Cache HIT/MISS on GET/HEAD is the only cache introspection ar-io
         # offers. A failed HEAD counts as not-cached: it isn't servable now.
@@ -296,12 +308,7 @@ async def _arweave_status(settings: Settings, client: httpx.AsyncClient) -> dict
 
     hits = sum(await asyncio.gather(*(cached(txid) for txid in txids)))
     status: dict[str, Any] = {
-        "retained": {
-            "kept": sum(record["state"] == "kept" for record in retained),
-            "pending": sum(record["state"] == "pending" for record in retained),
-            "failed": sum(record["state"] == "failed" for record in retained),
-            "operation": "isolated native retained-plane operation (not an AR.IO r81 pin API)",
-        },
+        "retained": retained_status,
         "known_warmed": len(txids), "currently_cached": hits,
     }
     if hits != len(txids):

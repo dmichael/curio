@@ -62,6 +62,7 @@ assert retained['user'] == f'{__import__("os").getuid()}:{__import__("os").getgi
 assert retained['environment']['TRUSTED_NODE_URL']=='http://ar-io-envoy:3000'
 assert 'CONTIGUOUS_DATA_CACHE_CLEANUP_THRESHOLD' not in retained['environment']
 assert not retained.get('ports', [])
+assert not s['ar-io-retained-redis'].get('ports', [])
 assert 'user' not in s['ar-io-envoy']  # image must generate /etc/envoy config as root
 assert not next(v for v in s['ar-io-envoy']['volumes'] if v['target'] == '/data/envoy-eds').get('read_only', False)
 envoy=s['ar-io-envoy']['environment']

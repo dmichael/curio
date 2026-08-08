@@ -446,6 +446,7 @@ async def test_wallet_status_audit_and_creators():
                 }
             ],
         },
+        "http://ipfs.internal/ipfs/bafyART/work.png": {"status_code": 200, "headers": {"content-type": "image/png"}},
     }
     client, _ = fake_net(routes)
     async with client:

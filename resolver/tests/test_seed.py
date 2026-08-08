@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ SETTINGS = Settings(
     bens_base="http://bens.internal/api/v1/1",
     tzkt_base="http://tzkt.internal/v1",
     seed_recovery_gateways=["http://gw.fallback/ipfs"],
+    arweave_retention_db=f"/tmp/curio-seed-{os.getpid()}.sqlite3",
 )
 
 ETH_ADDR = "0xAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb"
@@ -88,7 +90,10 @@ async def test_eth_wallet_seed_pins_and_warms():
             "status_code": 200,
             "json": {"Pins": ["bafyIMG"]},
         },
-        f"http://127.0.0.1:4001/{TXID}": [{"status_code": 200, "content": b"0" * 100}, {"status_code": 200, "content": b"0" * 100}],
+        f"http://127.0.0.1:4001/{TXID}": [
+            {"status_code": 200, "content": b"0" * 100},
+            {"status_code": 200, "headers": {"x-cache": "HIT"}, "content": b"0" * 100},
+        ],
     }
     client, log = fake_net(routes)
     job = make_job(ETH_ADDR, "ethereum")
@@ -98,7 +103,7 @@ async def test_eth_wallet_seed_pins_and_warms():
     assert job.tokens == 2
     assert job.pinned == 1
     assert job.retained == 1 and job.warmed == 0  # explicit seed uses retained native plane
-    assert job.skipped == 0
+    assert job.skipped == 1  # duplicate CID was deduped across token spellings
     assert job.failed == 0
     assert sum("pin/add" in line for line in log) == 1  # deduped across tokens
 

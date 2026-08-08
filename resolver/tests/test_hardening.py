@@ -135,6 +135,7 @@ async def test_health_reports_5xx_backend_as_down_and_404_as_up():
         result = await gateway_health(SETTINGS, client)
     assert result["backends"]["ipfs"]["ok"] is True
     assert result["backends"]["arweave"]["ok"] is False
+    assert result["backends"]["arweave_retained"]["ok"] is False
     assert result["healthy"] is False
 
 
@@ -174,8 +175,8 @@ def test_cast_route_refuses_unresolved_refs(http_client):
     ok = http_client.get(
         "/c", params={"ref": "ipfs://bafyCID/art.png"}, follow_redirects=False
     )
-    assert ok.status_code == 302
-    assert "/ipfs/bafyCID/art.png" in ok.headers["location"]
+    assert ok.status_code == 422  # known suffix cannot bypass local availability
+    assert ok.json()["resolved"] is False
 
 
 # --- finding 1: seed admission control ---

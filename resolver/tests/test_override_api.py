@@ -43,9 +43,9 @@ def test_override_crud_round_trip(client):
     body = created.json()
     assert body["canonical_key"] == "ipfs://bafyDEAD/art.png"
     assert body["replaced"] is False
-    # disclosure: the (mechanical, no-network) replacement resolves
-    assert body["replacement_resolved"] is True
-    assert body["replacement_resolved_url"] == "http://testserver/ipfs/bafyALT/master.png"
+    # Disclosure reports actual local-backend availability, not URL shape.
+    assert body["replacement_resolved"] is False
+    assert body["replacement_resolved_url"] is None
 
     listed = client.get("/override").json()
     assert listed["count"] == 1

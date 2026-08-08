@@ -133,7 +133,7 @@ async def test_pin_resolved_warms_arweave_and_skips_unresolved():
 
     def handler(request: httpx.Request) -> httpx.Response:
         warmed.append(str(request.url))
-        return httpx.Response(200, content=b"bytes")
+        return httpx.Response(200, headers={"x-cache": "HIT"}, content=b"bytes")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         arweave = Resolved("ar://TX123", "http://box:3000/TX123", "play", "arweave", True)
@@ -155,7 +155,7 @@ def test_resolve_pin_option_schedules_and_default_does_not(http_client):
     pinned = http_client.get(
         "/resolve", params={"ref": "ipfs://bafyCID/art.png", "pin": 1}
     ).json()
-    assert pinned["pin_scheduled"] is True
+    assert pinned["pin_scheduled"] is False  # unavailable native backend is not an optimistic pin
 
     unresolvable = http_client.get(
         "/resolve", params={"ref": "not a reference", "pin": 1}
@@ -188,19 +188,21 @@ def test_favorite_crud_round_trip(client):
     body = created.json()
     assert body["key"] == "ipfs://bafyCID/art.png"
     assert body["note"] == "hall screen"
-    # a bare ipfs ref resolves mechanically (no network) but carries no title
-    assert body["resolved"] is True
-    assert body["resolved_url"] == "http://testserver/ipfs/bafyCID/art.png"
+    # An unavailable Kubo artifact is not advertised as renderer-ready.
+    assert body["resolved"] is False
+    assert body["resolved_url"] is None
+    assert body["final_ref"] == "ipfs://bafyCID/art.png"
+    assert body["source_ref"] == "ipfs://bafyCID/art.png"
     assert body["title"] is None
-    assert body["pin_scheduled"] is True  # favoriting makes the bytes durable
+    assert body["pin_scheduled"] is False
 
-    # the list is resolved and ready to play — no second /resolve call needed
+    # The list retains the discovery record but exposes the unavailable state.
     listed = client.get("/favorites").json()
     assert listed["count"] == 1
     entry = listed["favorites"][0]
     assert entry["ref"] == "ipfs://bafyCID/art.png"
-    assert entry["resolved"] is True
-    assert entry["resolved_url"] == "http://testserver/ipfs/bafyCID/art.png"
+    assert entry["resolved"] is False
+    assert entry["resolved_url"] is None
     assert entry["playback_method"] == "play"
 
     removed = client.request(

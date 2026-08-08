@@ -78,7 +78,10 @@ class Favorites:
     # and write), so in the single-event-loop process they cannot interleave
     # with another handler's mutation — no lock needed.
 
-    def add(self, ref: str, title: str | None = None, note: str | None = None) -> dict[str, Any]:
+    def add(
+        self, ref: str, title: str | None = None, note: str | None = None,
+        final_ref: str | None = None,
+    ) -> dict[str, Any]:
         """Add `ref` as a favorite, rewriting the file; returns the record."""
         table = self._load_for_write()
         ref = ref.strip()
@@ -90,6 +93,7 @@ class Favorites:
             "key": key,
             "title": title,
             "note": note,
+            "final_ref": final_ref,
             "added_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         self._write(table)
@@ -191,6 +195,7 @@ def _parse(text: str) -> dict[str, dict[str, Any]]:
             "key": canonical_ref_key(ref),
             "title": raw.get("title") if isinstance(raw.get("title"), str) else None,
             "note": raw.get("note") if isinstance(raw.get("note"), str) else None,
+            "final_ref": raw.get("final_ref") if isinstance(raw.get("final_ref"), str) else None,
             "added_at": raw.get("added_at") if isinstance(raw.get("added_at"), str) else None,
         }
     return table
@@ -202,13 +207,18 @@ async def _resolved(
     try:
         result = await resolve_ref(record["ref"], settings, client, origin=origin)
     except Exception:
-        return {**record, "resolved": False, "resolved_url": None, "playback_method": None}
+        return {
+            **record, "resolved": False, "resolved_url": None, "playback_method": None,
+            "source_ref": record.get("final_ref"),
+        }
     return {
         **record,
         "title": record["title"] or result.title,
         "resolved": result.resolved,
         "resolved_url": result.resolved_url if result.resolved else None,
         "playback_method": result.playback_method,
+        "final_ref": result.final_ref,
+        "source_ref": result.final_ref,
         "substituted": result.substituted,
     }
 

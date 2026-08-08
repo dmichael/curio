@@ -206,41 +206,23 @@ async def _run_seed_inner(
 ) -> None:
     # job.address was resolved by start_seed, before admission control.
     items = _enumerator(job.chain, job.scope, job.include_burned)
-    cids: dict[str, list[str]] = {}  # cid -> HTTP source URLs (ordered de-dupe)
-    arweave: dict[tuple[str, str], None] = {}
-    http_refs: dict[str, None] = {}
-    # Ordinary HTTP belongs to Curio's static backend when explicitly kept;
-    # wallet seeding never publishes or copies it into IPFS.
+    refs: dict[str, None] = {}
+    # Resolve every discovered input before deciding its storage plane. A
+    # collection often supplies HTTP/data metadata whose final artifact is
+    # IPFS or Arweave; retaining the metadata document is not enough.
     async for item in items(job.address, settings, client):
         job.tokens += 1
         for ref in _media_refs(item):
             job.refs_found += 1
-            ipfs = ipfs_parts(ref)
-            if ipfs is not None:
-                cid, path = ipfs
-                sources = cids.setdefault(cid, [])
-                # A bare-CID gateway URL is a byte-identical HTTP copy we
-                # can recover from if the IPFS fetch fails.
-                if not path.strip("/") and ref.startswith(("http://", "https://")) and ref not in sources:
-                    sources.append(ref)
-                continue
-            ar_parts = arweave_parts(ref)
-            if ar_parts is not None:
-                # Preserve manifest path identity, not merely the root txid.
-                arweave[ar_parts] = None
-                continue
-            if ref.startswith(("http://", "https://")):
-                http_refs[ref] = None
-                continue
-            job.skipped += 1
+            refs[ref] = None
         if limit is not None and job.tokens >= limit:
             break
 
     sem = asyncio.Semaphore(settings.seed_concurrency)
+    native_refs: set[str] = set()
+    native_refs_lock = asyncio.Lock()
     await asyncio.gather(
-        *(_pin_cid(cid, sources, job, settings, client, sem) for cid, sources in cids.items()),
-        *(_keep_txid(txid, path, job, settings, client, sem) for txid, path in arweave),
-        *(_keep_http(ref, job, settings, client, sem) for ref in http_refs),
+        *(_keep_ref(ref, job, settings, client, sem, native_refs, native_refs_lock) for ref in refs),
     )
 
 
@@ -375,21 +357,51 @@ async def _keep_txid(
         _note_error(job, f"retain {txid}{path}: native retained-plane hydration failed")
 
 
-async def _keep_http(
-    ref: str, job: SeedJob, settings: Settings, client: httpx.AsyncClient, sem: asyncio.Semaphore
+async def _keep_ref(
+    ref: str, job: SeedJob, settings: Settings, client: httpx.AsyncClient, sem: asyncio.Semaphore,
+    native_refs: set[str], native_refs_lock: asyncio.Lock,
 ) -> None:
-    """Resolve HTTP into Curio static storage and promote it; never call Kubo."""
-    async with sem:
-        try:
+    """Keep a discovered reference on the final artifact's native plane."""
+    try:
+        async with sem:
             result = await resolve_ref(ref, settings, client)
-        except (httpx.HTTPError, ValueError) as exc:
-            job.failed += 1
-            _note_error(job, f"retain HTTP {ref}: {type(exc).__name__}: {exc}")
-            return
-        if result.resolved and result.source_kind == "http" and "/media/" in result.resolved_url:
-            kept = StaticStore(settings.static_root).keep(result.resolved_url.rsplit("/", 1)[-1])
-            if kept:
-                job.captured += 1
-                return
+    except (httpx.HTTPError, ValueError) as exc:
         job.failed += 1
-        _note_error(job, f"retain HTTP {ref}: static promotion failed")
+        _note_error(job, f"retain {ref}: {type(exc).__name__}: {exc}")
+        return
+    final_ref = result.final_ref
+    ipfs = ipfs_parts(final_ref) if final_ref else None
+    arweave = arweave_parts(final_ref) if final_ref else None
+    # A CID pin covers every file below that CID; retained Arweave paths and
+    # static artifacts remain distinct identities.
+    native_key = f"ipfs:{ipfs[0]}" if ipfs else final_ref
+    async with native_refs_lock:
+        if native_key in native_refs:
+            job.skipped += 1
+            return
+        native_refs.add(native_key)
+    # A seed's explicit keep intent may make a cold IPFS/Arweave artifact
+    # locally servable. This is limited to an already-recognized native final
+    # ref; arbitrary HTTP/data bodies never enter Kubo.
+    if result.source_kind == "ipfs" and ipfs is not None:
+        cid, path = ipfs
+        sources = [ref] if not path.strip("/") and ref.startswith(("http://", "https://")) else []
+        await _pin_cid(cid, sources, job, settings, client, sem)
+        return
+    if result.source_kind == "arweave" and arweave is not None:
+        await _keep_txid(*arweave, job, settings, client, sem)
+        return
+    if not result.resolved:
+        job.failed += 1
+        _note_error(job, f"retain {ref}: final artifact is unavailable")
+        return
+    if result.keep_state == "live-dependent":
+        job.failed += 1
+        _note_error(job, f"retain {ref}: HTML runtime has uncaptured dependencies")
+        return
+    if result.source_kind in {"http", "data", "upload"} and "/media/" in result.resolved_url:
+        if StaticStore(settings.static_root).keep(result.resolved_url.rsplit("/", 1)[-1]):
+            job.captured += 1
+            return
+    job.failed += 1
+    _note_error(job, f"retain {ref}: final source has no promotable native artifact")

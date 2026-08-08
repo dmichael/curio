@@ -1,3 +1,5 @@
+import os
+
 import httpx
 import pytest
 
@@ -12,6 +14,7 @@ SETTINGS = Settings(
     ipfs_public_base="http://box:8080",
     arweave_public_base="http://box:3000",
     ssrf_dns_check=False,
+    arweave_retention_db=f"/tmp/curio-resolve-{os.getpid()}.sqlite3",
 )
 
 TXID = "abcdefghijklmnopqrstuvwxyz0123456789_ABCDEF"  # 43 chars
@@ -53,20 +56,28 @@ def no_net() -> httpx.AsyncClient:
         ("https://ipfs.io/ipfs/bafyCID/art.png", "http://box:8080/ipfs/bafyCID/art.png"),
     ],
 )
-async def test_ipfs_refs_with_extension_resolve_without_probing(ref, expected):
-    async with no_net() as client:
+async def test_ipfs_refs_with_extension_require_local_probe(ref, expected):
+    async with fake_net({"http://ipfs.internal/ipfs/bafyCID/art.png": {"status_code": 200}}) as client:
         result = await resolve_ref(ref, SETTINGS, client)
     assert result.resolved_url == expected
     assert result.resolved is True
     assert result.provider == "ipfs"
 
 
-async def test_existing_query_is_preserved_and_skips_the_probe():
-    async with no_net() as client:
+async def test_existing_query_is_preserved_after_local_probe():
+    async with fake_net({"http://ipfs.internal/ipfs/bafyCID": {"status_code": 200}}) as client:
         result = await resolve_ref(
             "https://ipfs.io/ipfs/bafyCID?filename=piece.mp4", SETTINGS, client
         )
     assert result.resolved_url == "http://box:8080/ipfs/bafyCID?filename=piece.mp4"
+
+
+async def test_dead_known_extension_native_refs_are_unresolved():
+    async with fake_net() as client:
+        ipfs = await resolve_ref("ipfs://bafyDEAD/art.png", SETTINGS, client)
+        arweave = await resolve_ref(f"ar://{'X' * 43}/art.png", SETTINGS, client)
+    assert not ipfs.resolved and "cannot serve" in (ipfs.note or "")
+    assert not arweave.resolved and "cannot serve" in (arweave.note or "")
 
 
 # --- reference parsing (refs.py) ---
@@ -148,12 +159,12 @@ async def test_bare_cid_html_runtime_work_is_sent_without_hint():
     assert result.playback_method == "send"
 
 
-async def test_bare_cid_probe_failure_degrades_to_plain_url():
+async def test_bare_cid_probe_failure_is_unresolved():
     async with fake_net() as client:  # every probe 404s
         result = await resolve_ref("ipfs://bafyCID", SETTINGS, client)
     assert result.resolved_url == "http://box:8080/ipfs/bafyCID"
-    assert result.resolved is True
-    assert result.note is not None
+    assert result.resolved is False
+    assert "cannot serve" in (result.note or "")
 
 
 async def test_directory_cid_descends_to_its_single_file():
@@ -274,7 +285,10 @@ async def test_json_cid_resolves_through_metadata_to_animation_url():
             "status_code": 200,
             "headers": {"content-type": "application/json"},
             "json": {"name": "Piece", "animation_url": "ipfs://bafyANIM/index.html"},
-        }
+        },
+        "http://ipfs.internal/ipfs/bafyANIM/index.html": {
+            "status_code": 200, "headers": {"content-type": "text/html"},
+        },
     }
     async with fake_net(routes) as client:
         result = await resolve_ref("ipfs://bafyMETA", SETTINGS, client)
@@ -356,6 +370,9 @@ async def test_verse_page_scrapes_token_uri_and_recurses():
             "headers": {"content-type": "application/json"},
             "json": {"name": "V", "animation_url": "ipfs://bafyANIM/index.html"},
         },
+        "http://ipfs.internal/ipfs/bafyANIM/index.html": {
+            "status_code": 200, "headers": {"content-type": "text/html"},
+        },
     }
     async with fake_net(routes) as client:
         result = await resolve_ref(VERSE_URL, SETTINGS, client)
@@ -417,7 +434,7 @@ async def test_base64_data_uri_metadata_recurses():
     payload = base64.b64encode(
         json.dumps({"name": "Onchain", "image": "ipfs://bafyIMG/one.png"}).encode()
     ).decode()
-    async with no_net() as client:
+    async with fake_net({"http://ipfs.internal/ipfs/bafyIMG/one.png": {"status_code": 200}}) as client:
         result = await resolve_ref(f"data:application/json;base64,{payload}", SETTINGS, client)
     assert result.resolved_url == "http://box:8080/ipfs/bafyIMG/one.png"
     assert result.title == "Onchain"
@@ -427,7 +444,7 @@ async def test_base64_data_uri_metadata_recurses():
 
 async def test_plain_data_uri_metadata_recurses():
     ref = 'data:application/json,{"animation_url":"ipfs://bafyANIM/index.html"}'
-    async with no_net() as client:
+    async with fake_net({"http://ipfs.internal/ipfs/bafyANIM/index.html": {"status_code": 200, "headers": {"content-type": "text/html"}}}) as client:
         result = await resolve_ref(ref, SETTINGS, client)
     assert result.resolved_url == "http://box:8080/ipfs/bafyANIM/index.html"
     assert result.playback_method == "send"

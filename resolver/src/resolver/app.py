@@ -158,11 +158,11 @@ async def resolve(
                 payload["keep_state"] = "kept"
             elif result.keep_state != "live-dependent":
                 payload["keep_state"] = "failed"
-        elif result.resolved and result.source_kind == "ipfs":
+        elif result.resolved and result.keep_state != "live-dependent" and result.source_kind == "ipfs":
             pin_in_background(result, get_settings(), app.state.client, why="resolve pin")
             payload["pin_scheduled"] = True
             payload["keep_state"] = "pending"
-        elif result.resolved and result.source_kind == "arweave":
+        elif result.resolved and result.keep_state != "live-dependent" and result.source_kind == "arweave":
             payload["pin_scheduled"] = False
             outcome = await pin_resolved(result, get_settings(), app.state.client, why="resolve keep")
             payload["keep_state"] = outcome or "failed"
@@ -400,10 +400,16 @@ async def favorite_add(
     except Exception:
         check = None
     try:
-        record = favorites.add(ref, title=check.title if check else None, note=note)
+        record = favorites.add(
+            ref, title=check.title if check else None, note=note,
+            final_ref=check.final_ref if check else None,
+        )
     except (DuplicateFavorite, FavoritesUnparseable) as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
-    pin_scheduled = bool(check and check.resolved and check.source_kind not in {"http", "data", "upload", "arweave"})
+    pin_scheduled = bool(
+        check and check.resolved and check.keep_state != "live-dependent"
+        and check.source_kind not in {"http", "data", "upload", "arweave"}
+    )
     promoted = False
     if check and check.resolved and check.source_kind in {"http", "data", "upload"}:
         # Static artifacts are kept in their own durable store, not copied to
@@ -413,7 +419,7 @@ async def favorite_add(
     elif pin_scheduled:
         pin_in_background(check, get_settings(), app.state.client, why="favorite")
         check.keep_state = "pending"
-    elif check and check.resolved and check.source_kind == "arweave":
+    elif check and check.resolved and check.keep_state != "live-dependent" and check.source_kind == "arweave":
         # Favorites are explicit keep intent. This is a private native Core
         # hydration, not a claim that r81 offers a pin endpoint.
         check.keep_state = (await pin_resolved(check, get_settings(), app.state.client, why="favorite")) or "failed"
@@ -423,6 +429,8 @@ async def favorite_add(
             "resolved": check.resolved if check else None,
             "resolved_url": check.resolved_url if check and check.resolved else None,
             "playback_method": check.playback_method if check else None,
+            "final_ref": check.final_ref if check else record.get("final_ref"),
+            "source_ref": check.final_ref if check else record.get("final_ref"),
             "pin_scheduled": pin_scheduled,
             "keep_state": check.keep_state if check else None,
             "promoted": promoted,
@@ -501,10 +509,10 @@ async def keep(request: Request, ref: str = Query(...), _: None = Depends(requir
     result = await resolve_ref(ref, get_settings(), app.state.client, origin=request_origin(request))
     if not result.resolved:
         return JSONResponse(result.as_dict(), status_code=422)
+    if result.keep_state == "live-dependent":
+        return JSONResponse({**result.as_dict(), "keep_state": "live-dependent",
+            "error": "HTML capture has uncaptured runtime dependencies"}, status_code=409)
     if result.source_kind in {"http", "data", "upload"}:
-        if result.keep_state == "live-dependent":
-            return JSONResponse({**result.as_dict(), "keep_state": "live-dependent",
-                "error": "HTML capture has uncaptured runtime dependencies"}, status_code=409)
         if not _promote_static(result):
             return JSONResponse({"error": "static media missing"}, status_code=404)
         result.keep_state = "kept"

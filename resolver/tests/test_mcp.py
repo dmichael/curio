@@ -12,6 +12,8 @@ from resolver.overrides import get_registry
 
 def no_net() -> httpx.AsyncClient:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD" and request.url.host == "127.0.0.1":
+            return httpx.Response(200, headers={"content-type": "image/png"})
         raise AssertionError(f"unexpected network call: {request.url}")
 
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -144,13 +146,15 @@ async def test_mcp_library_status_smoke():
             return httpx.Response(200, json={"Keys": {"bafyA": {"Type": "recursive"}}})
         if request.url.path == "/api/v0/repo/stat":
             return httpx.Response(200, json={"RepoSize": 4096, "NumObjects": 12})
+        if request.method == "HEAD" and request.url.host == "127.0.0.1":
+            return httpx.Response(200, headers={"x-cache": "HIT"})
         raise AssertionError(f"unexpected network call: {request.url}")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         mcp_server.set_client(client)
         payload = await call("library_status", {})
     assert payload["ipfs"] == {"pinned": 1, "repo_size_bytes": 4096, "repo_objects": 12}
-    assert set(payload["arweave"]["retained"]) == {"kept", "pending", "failed", "operation"}
+    assert set(payload["arweave"]["retained"]) == {"registry", "confirmed_available", "degraded", "operation"}
     assert "not an AR.IO r81 pin API" in payload["arweave"]["retained"]["operation"]
     assert payload["registry"] == {"overrides": None, "favorites": None, "captures": None}
 

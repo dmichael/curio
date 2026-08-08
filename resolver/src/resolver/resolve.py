@@ -114,11 +114,16 @@ class Resolved:
     substituted_ref: str | None = None
     substitution_status: str | None = None
     source_kind: str | None = None
+    # The actual source-native media identity after metadata recursion.  This
+    # deliberately differs from original_ref, which remains the caller's
+    # discovery input (often a metadata document).
+    final_ref: str | None = None
     keep_state: str = "cached"
     integrity: dict[str, str] | None = None
 
     def as_dict(self) -> dict[str, object]:
         payload = asdict(self)
+        payload["source_ref"] = self.final_ref
         # media_url is the product contract; resolved_url remains temporarily
         # for existing API consumers.
         payload["media_url"] = self.resolved_url
@@ -147,7 +152,10 @@ def external_url_ok(url: str) -> bool:
 
 def _is_internal_gateway(url: str, settings: Settings) -> bool:
     return any(url == base.rstrip("/") or url.startswith(base.rstrip("/") + "/")
-               for base in (settings.ipfs_internal, settings.arweave_internal))
+               for base in (
+                   settings.ipfs_internal, settings.arweave_internal,
+                   settings.arweave_retained_internal,
+               ))
 
 
 async def _validated_addresses(url: str, settings: Settings) -> list[str] | None:
@@ -251,7 +259,10 @@ def _fetch_allowed(url: str, settings: Settings) -> bool:
     pass the external-URL check. A URL only counts as a gateway URL when it
     is exactly the base or a path under it — a bare prefix test would let
     look-alike ports through (e.g. 127.0.0.1:30001 vs the :3000 gateway)."""
-    for base in (settings.ipfs_internal, settings.arweave_internal):
+    for base in (
+        settings.ipfs_internal, settings.arweave_internal,
+        settings.arweave_retained_internal,
+    ):
         base = base.rstrip("/")
         if url == base or url.startswith(base + "/"):
             return True
@@ -285,7 +296,12 @@ def _internal_fetch_url(ref: str, settings: Settings) -> str:
     arweave = arweave_parts(ref)
     if arweave is not None:
         txid, path = arweave
-        return f"{settings.arweave_internal}/{txid}{path}"
+        base = (
+            settings.arweave_retained_internal
+            if retained_state(txid, path, settings) == "kept"
+            else settings.arweave_internal
+        )
+        return f"{base.rstrip('/')}/{txid}{path}"
     return ref
 
 
@@ -398,22 +414,24 @@ async def _resolve_ipfs(
     query = urlparse(ref).query
     public = f"{origin.rstrip('/') if origin else settings.ipfs_public_base}/ipfs/{cid}{path}"
     internal = f"{settings.ipfs_internal}/ipfs/{cid}{path}"
+    native_ref = f"ipfs://{cid}{path}"
     if query:
         public = f"{public}?{query}"
 
+    # Even a familiar suffix is only a rendering hint.  A successful resolve
+    # means Kubo can serve the requested artifact now.
+    headers = await probe_headers(client, internal)
+    if headers is None:
+        return Resolved(
+            ref, public, "play", "ipfs", False, source_kind="ipfs", final_ref=native_ref,
+            note="local IPFS backend cannot serve this artifact",
+        )
     seg = (path or cid).rsplit("/", 1)[-1]
     ext = extension_of(seg)
     if ext == "json":
         return await _resolve_token_metadata(ref, internal, "ipfs", settings, client, depth)
 
-    if query or ext in KNOWN_EXTENSIONS:
-        # A known media/HTML extension (or an existing query, e.g. ?filename=)
-        # already satisfies the FF1's extension sniff — no probe needed.
-        # Unknown extensions fall through to the probe.
-        return Resolved(ref, public, infer_playback_method(path or cid), "ipfs", True)
-
-    headers = await probe_headers(client, internal)
-    content_type = headers.get("content-type") if headers is not None else None
+    content_type = headers.get("content-type")
     main = _main_content_type(content_type)
 
     if main == "application/json":
@@ -425,15 +443,19 @@ async def _resolve_ipfs(
         if descended is not None:
             return descended
     if main == "text/html":
-        return Resolved(ref, public, "send", "ipfs", True, content_type=content_type)
+        return Resolved(
+            ref, public, "send", "ipfs", True, content_type=content_type,
+            source_kind="ipfs", final_ref=native_ref, keep_state="live-dependent",
+        )
 
-    ext = ext_from_content_type(content_type)
-    if ext:
-        public = f"{public}?filename=art.{ext}"
-    note = None if headers is not None else "gateway probe failed; no filename hint"
+    hinted_ext = ext_from_content_type(content_type)
+    if hinted_ext and not query and ext not in KNOWN_EXTENSIONS:
+        public = f"{public}?filename=art.{hinted_ext}"
+    method = infer_playback_method(path or cid)
     return Resolved(
-        ref, public, infer_playback_method(path or cid), "ipfs", True,
-        content_type=content_type, note=note,
+        ref, public, method, "ipfs", True, content_type=content_type,
+        source_kind="ipfs", final_ref=native_ref,
+        keep_state="live-dependent" if method == "send" else "cached",
     )
 
 
@@ -478,31 +500,43 @@ async def _resolve_arweave(
     # beneath one manifest txid).
     query = urlparse(ref).query
     public = f"{origin.rstrip('/') if origin else settings.arweave_public_base}/arweave/{txid}{path}"
-    internal = f"{settings.arweave_internal}/{txid}{path}"
+    native_ref = f"ar://{txid}{path}"
     if query:
         public = f"{public}?{query}"
 
-    headers = await probe_headers(client, internal)
-    content_type = headers.get("content-type") if headers is not None else None
-    main = _main_content_type(content_type)
-    # Kept identity is confirmed against the private Core, never inferred
-    # from the ordinary Envoy's evictable cache headers.
+    # A registry-kept identity is exclusively served from the retained Core.
+    # Do this before every probe and metadata fetch: ordinary Envoy bytes must
+    # never mask a missing retained artifact.
     state = retained_state(txid, path, settings)
-    retained = state == "kept" and await retained_available(txid, path, settings, client)
+    if state == "kept" and not await retained_available(txid, path, settings, client):
+        return Resolved(
+            ref, public, "play", "arweave", False, source_kind="arweave", final_ref=native_ref,
+            keep_state="degraded",
+            note="retained AR.IO plane is unavailable; not falling back for kept identity",
+        )
+    retained = state == "kept"
+    base = settings.arweave_retained_internal if retained else settings.arweave_internal
+    internal = f"{base.rstrip('/')}/{txid}{path}"
+    headers = await probe_headers(client, internal)
+    if headers is None or (retained and headers.get("x-cache", "").strip().lower() != "hit"):
+        return Resolved(
+            ref, public, "play", "arweave", False, source_kind="arweave", final_ref=native_ref,
+            keep_state="degraded" if retained else "cached",
+            note=("retained AR.IO plane is unavailable; not falling back for kept identity"
+                  if retained else "local AR.IO backend cannot serve this artifact"),
+        )
+    content_type = headers.get("content-type")
+    main = _main_content_type(content_type)
 
     if main == "application/json":
-        result = await _resolve_token_metadata(ref, internal, "arweave", settings, client, depth)
-        if retained:
-            result.keep_state = "kept"
-        elif state == "kept":
-            result.keep_state = "degraded"
-            result.note = "retained AR.IO plane is unavailable; not falling back for kept identity"
-        return result
+        # The metadata identity may be retained while its final media is not;
+        # recursion reports the final artifact's own keep state.
+        return await _resolve_token_metadata(ref, internal, "arweave", settings, client, depth)
     method = "send" if main == "text/html" else "play"
     return Resolved(
         ref, public, method, "arweave", True, content_type=content_type,
-        keep_state="kept" if retained else ("degraded" if state == "kept" else "cached"),
-        note="retained AR.IO plane is unavailable; not falling back for kept identity" if state == "kept" and not retained else None,
+        source_kind="arweave", final_ref=native_ref,
+        keep_state=("live-dependent" if main == "text/html" else "kept" if retained else "cached"),
     )
 
 
@@ -562,14 +596,17 @@ async def _resolve_direct_fetch(
                                filename=seg or None, source_ref=ref)
         temporary = None  # put_file atomically moved it
     except (httpx.HTTPError, ValueError, OSError, json.JSONDecodeError) as exc:
-        return Resolved(ref, ref, "play", "http", False, note=f"media fetch failed: {exc}", source_kind="http")
+        return Resolved(
+            ref, ref, "play", "http", False, note=f"media fetch failed: {exc}",
+            source_kind="http", final_ref=ref,
+        )
     finally:
         if temporary:
             Path(temporary).unlink(missing_ok=True)
     public_origin = origin.rstrip("/") if origin else settings.ipfs_public_base.rstrip("/")
     url = f"{public_origin}/media/{entry['id']}"
     method = "send" if _main_content_type(content_type) == "text/html" else infer_playback_method(path)
-    return Resolved(ref, url, method, "http", True, content_type=content_type, source_kind="http",
+    return Resolved(ref, url, method, "http", True, content_type=content_type, source_kind="http", final_ref=ref,
         keep_state="live-dependent" if _main_content_type(content_type) == "text/html" else "cached",
         integrity={"algorithm": "sha256", "digest": str(entry["digest"])})
 
@@ -619,7 +656,7 @@ async def _resolve_data_uri(
     """
     match = _DATA_URI_RE.match(ref)
     if match is None:
-        return Resolved(ref, ref, "play", "data", False, note="malformed data: URI")
+        return Resolved(ref, ref, "play", "data", False, note="malformed data: URI", final_ref=ref)
     params, payload = match.group(1).split(";"), match.group(2)
     mediatype = params[0].strip().lower() or "text/plain"
     is_base64 = any(p.strip().lower() == "base64" for p in params[1:])
@@ -627,7 +664,7 @@ async def _resolve_data_uri(
     # can only shrink. This prevents a giant tokenURI from allocating first.
     encoded_limit = settings.data_max_bytes * (4 // 3 + 1) + 16
     if len(payload) > encoded_limit:
-        return Resolved(ref, ref, "play", "data", False, note="data: URI exceeds configured size limit")
+        return Resolved(ref, ref, "play", "data", False, note="data: URI exceeds configured size limit", final_ref=ref)
 
     if mediatype == "application/json":
         try:
@@ -640,22 +677,22 @@ async def _resolve_data_uri(
                 raise ValueError("data: URI exceeds configured size limit")
             metadata: Any = json.loads(text)
         except ValueError as exc:
-            return Resolved(ref, ref, "play", "data", False, note=f"data: URI decode failed: {exc}")
+            return Resolved(ref, ref, "play", "data", False, note=f"data: URI decode failed: {exc}", final_ref=ref)
         if not isinstance(metadata, dict):
-            return Resolved(ref, ref, "play", "data", False, note="metadata is not a JSON object")
+            return Resolved(ref, ref, "play", "data", False, note="metadata is not a JSON object", final_ref=ref)
         return await _resolve_metadata_dict(ref, metadata, "data", settings, client, depth)
 
     try:
         data = base64.b64decode(payload, validate=True) if is_base64 else unquote(payload).encode()
     except ValueError as exc:
-        return Resolved(ref, ref, "play", "data", False, note=f"data: URI decode failed: {exc}")
+        return Resolved(ref, ref, "play", "data", False, note=f"data: URI decode failed: {exc}", final_ref=ref)
     if len(data) > settings.data_max_bytes:
-        return Resolved(ref, ref, "play", "data", False, note="data: URI exceeds configured size limit")
+        return Resolved(ref, ref, "play", "data", False, note="data: URI exceeds configured size limit", final_ref=ref)
     entry = StaticStore(settings.static_root).put(data, media_type=mediatype, filename=None, source_ref=ref)
     base = origin.rstrip("/") if origin else settings.ipfs_public_base.rstrip("/")
     method = "send" if mediatype == "text/html" else "play"
     return Resolved(ref, f"{base}/media/{entry['id']}", method, "data", True, content_type=mediatype,
-        source_kind="data", keep_state="live-dependent" if mediatype == "text/html" else "cached",
+        source_kind="data", final_ref=ref, keep_state="live-dependent" if mediatype == "text/html" else "cached",
         integrity={"algorithm": "sha256", "digest": str(entry["digest"])})
 
 

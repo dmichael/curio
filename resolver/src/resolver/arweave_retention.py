@@ -76,21 +76,21 @@ def retained_state(txid: str, path: str, settings: Settings) -> str | None:
     db = _connection(settings)
     try:
         row = db.execute("SELECT state FROM retained_arweave WHERE txid=? AND path=?", (txid, path)).fetchone()
-        # A kept txid can be served at a manifest subpath that was not the
-        # original keep target. Keep identity at txid level without inventing
-        # a second generic object store.
-        if row is None:
-            row = db.execute("SELECT state FROM retained_arweave WHERE txid=? AND state='kept' LIMIT 1", (txid,)).fetchone()
         return str(row["state"]) if row is not None else None
     finally:
         db.close()
 
 
-async def _consume(client: httpx.AsyncClient, url: str, timeout: float) -> None:
+def _native_hit(response: httpx.Response) -> bool:
+    return response.headers.get("x-cache", "").strip().lower() == "hit"
+
+
+async def _consume(client: httpx.AsyncClient, url: str, timeout: float) -> httpx.Headers:
     async with client.stream("GET", url, timeout=timeout) as response:
         response.raise_for_status()
         async for _ in response.aiter_bytes(65536):
             pass
+        return response.headers
 
 
 def _url(txid: str, path: str, settings: Settings) -> str:
@@ -98,19 +98,25 @@ def _url(txid: str, path: str, settings: Settings) -> str:
 
 
 async def keep_arweave(txid: str, path: str, settings: Settings, client: httpx.AsyncClient) -> str:
-    """Hydrate then prove a subsequent private-native read before marking kept.
+    """Hydrate then prove a fully-consumed native retained-cache hit.
 
-    The second fully consumed response is deliberately not a cache-header
-    heuristic: it proves the retained Core can serve the original txid/path.
-    Failures remain durable registry evidence rather than false ``kept``.
+    The first read permits the retained Core to hydrate.  The post-hydration
+    read must be a native ``X-Cache: HIT``; two successful upstream reads do
+    not prove that the retained plane owns the artifact.
     """
     record_intent(txid, path, settings)
     try:
         url = _url(txid, path, settings)
         await _consume(client, url, settings.seed_pin_timeout)
-        await _consume(client, url, settings.seed_pin_timeout)
+        headers = await _consume(client, url, settings.seed_pin_timeout)
     except (httpx.HTTPError, ValueError) as exc:
         _set_state(txid, path, "failed", settings, f"{type(exc).__name__}: {exc}")
+        return "failed"
+    if headers.get("x-cache", "").strip().lower() != "hit":
+        _set_state(
+            txid, path, "failed", settings,
+            "retained native cache proof missing: expected X-Cache: HIT after hydration",
+        )
         return "failed"
     _set_state(txid, path, "kept", settings)
     return "kept"
@@ -122,6 +128,6 @@ async def retained_available(txid: str, path: str, settings: Settings, client: h
         return False
     try:
         response = await client.head(_url(txid, path, settings), timeout=10.0)
-        return response.is_success
+        return response.is_success and _native_hit(response)
     except httpx.HTTPError:
         return False

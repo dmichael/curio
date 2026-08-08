@@ -75,6 +75,8 @@ def fake_net(routes: dict[str, dict] | None = None) -> httpx.AsyncClient:
 
 def no_net() -> httpx.AsyncClient:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "HEAD" and request.url.host == "ipfs.internal":
+            return httpx.Response(200, headers={"content-type": "image/png"})
         raise AssertionError(f"unexpected network call: {request.method} {request.url}")
 
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))

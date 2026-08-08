@@ -102,7 +102,7 @@ async def test_pin_resolved_arweave_warm_records_the_caller_why(tmp_path):
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b"art bytes")
+        return httpx.Response(200, headers={"x-cache": "HIT"}, content=b"art bytes")
 
     async with client_for(handler) as client:
         outcome = await pin_resolved(result, settings, client, why="favorite")
@@ -237,6 +237,30 @@ async def test_library_status_counts_all_three_planes(tmp_path):
     assert status["registry"] == {"overrides": None, "favorites": None, "captures": 0}
 
 
+async def test_library_status_distinguishes_retained_registry_from_live_hits(tmp_path):
+    settings = SETTINGS.model_copy(update={
+        "arweave_retained_internal": "http://retained.internal",
+        "arweave_retention_db": str(tmp_path / "retained.sqlite3"),
+    })
+    from resolver.arweave_retention import keep_arweave
+
+    async with client_for(lambda _: httpx.Response(200, headers={"x-cache": "HIT"}, content=b"x")) as client:
+        assert await keep_arweave("L" * 43, "", settings, client) == "kept"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        kubo = kubo_handler(request)
+        if kubo is not None:
+            return kubo
+        assert request.url.host == "retained.internal"
+        return httpx.Response(200, headers={"x-cache": "MISS"})
+
+    async with client_for(handler) as client:
+        status = await library_status(settings, client)
+    retained = status["arweave"]["retained"]
+    assert retained["registry"] == {"kept": 1, "pending": 0, "failed": 0}
+    assert retained["confirmed_available"] == 0 and retained["degraded"] == 1
+
+
 async def test_library_status_degrades_per_plane():
     # Kubo down, ledger disabled, no operator state: still a 3-section answer.
     def handler(request: httpx.Request) -> httpx.Response:
@@ -246,7 +270,8 @@ async def test_library_status_degrades_per_plane():
         status = await library_status(SETTINGS, client)
 
     assert "error" in status["ipfs"]
-    assert set(status["arweave"]["retained"]) == {"kept", "pending", "failed", "operation"}
+    assert set(status["arweave"]["retained"]) == {"registry", "confirmed_available", "degraded", "operation"}
+    assert set(status["arweave"]["retained"]["registry"]) == {"kept", "pending", "failed"}
     assert "retained-plane" in status["arweave"]["retained"]["operation"]
     assert status["registry"] == {"overrides": None, "favorites": None, "captures": None}
 
@@ -292,5 +317,6 @@ def test_library_route_reports_the_three_planes(library_env):
     assert set(body) == {"ipfs", "arweave", "registry"}
     assert body["ipfs"]["pinned"] == 3
     assert body["arweave"]["known_warmed"] == 1 and body["arweave"]["currently_cached"] == 1
-    assert body["arweave"]["retained"]["kept"] == 0
+    assert body["arweave"]["retained"]["registry"]["kept"] == 0
+    assert body["arweave"]["retained"]["confirmed_available"] == 0
     assert body["registry"] == {"overrides": 0, "favorites": 0, "captures": 0}

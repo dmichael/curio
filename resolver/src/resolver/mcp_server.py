@@ -116,11 +116,11 @@ async def resolve(
                 payload["keep_state"] = "kept"
             elif result.keep_state != "live-dependent":
                 payload["keep_state"] = "failed"
-        elif result.resolved and result.source_kind == "ipfs":
+        elif result.resolved and result.keep_state != "live-dependent" and result.source_kind == "ipfs":
             pin_in_background(result, get_settings(), _require_client(), why="resolve pin")
             payload["pin_scheduled"] = True
             payload["keep_state"] = "pending"
-        elif result.resolved and result.source_kind == "arweave":
+        elif result.resolved and result.keep_state != "live-dependent" and result.source_kind == "arweave":
             payload["pin_scheduled"] = False
             payload["keep_state"] = (await pin_resolved(result, get_settings(), _require_client(), why="resolve keep")) or "failed"
         else:
@@ -360,10 +360,16 @@ async def add_favorite(
     except Exception:
         check = None
     try:
-        record = favorites.add(ref, title=check.title if check else None, note=note)
+        record = favorites.add(
+            ref, title=check.title if check else None, note=note,
+            final_ref=check.final_ref if check else None,
+        )
     except FavoriteError as exc:
         raise ValueError(str(exc)) from exc
-    pin_scheduled = bool(check and check.resolved and check.source_kind not in {"http", "data", "upload", "arweave"})
+    pin_scheduled = bool(
+        check and check.resolved and check.keep_state != "live-dependent"
+        and check.source_kind not in {"http", "data", "upload", "arweave"}
+    )
     promoted = False
     if check and check.resolved and check.source_kind in {"http", "data", "upload"}:
         promoted = check.keep_state != "live-dependent" and _promote_static(check)
@@ -371,11 +377,13 @@ async def add_favorite(
     elif pin_scheduled:
         pin_in_background(check, get_settings(), _require_client())
         check.keep_state = "pending"
-    elif check and check.resolved and check.source_kind == "arweave":
+    elif check and check.resolved and check.keep_state != "live-dependent" and check.source_kind == "arweave":
         check.keep_state = (await pin_resolved(check, get_settings(), _require_client(), why="favorite")) or "failed"
     return {
         **record,
         "resolved": check.resolved if check else None,
+        "final_ref": check.final_ref if check else record.get("final_ref"),
+        "source_ref": check.final_ref if check else record.get("final_ref"),
         "pin_scheduled": pin_scheduled,
         "promoted": promoted,
         "keep_state": check.keep_state if check else None,
