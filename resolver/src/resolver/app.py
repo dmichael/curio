@@ -1,25 +1,3 @@
-"""HTTP surface for the resolver.
-
-  GET  /resolve?ref=<anything>  -> JSON {resolved_url, playback_method, ...}
-  GET  /c?ref=<anything>        -> 302 to the resolved URL (for dumb renderers)
-  GET  /wallet?ref=<wallet|name> -> live normalized NFT inventory (browse/pick)
-  POST /seed?ref=<wallet|name>  -> 202 + job; pin/warm everything the wallet holds
-  GET  /seed, /seed/{id}        -> seed job status
-  GET  /override[?raw=1]        -> the operator's exception registry (JSON | TOML)
-  POST /override                -> add/replace an override (JSON body)
-  DELETE /override?ref=         -> remove an override
-  GET  /favorites                -> the household's favorites (browse/pick)
-  POST /favorites?ref=&note=     -> add a favorite (any spelling of the ref)
-  DELETE /favorites?ref=         -> remove a favorite
-  POST /store                   -> multipart upload -> Curio static storage + provenance
-  GET  /library                 -> cross-plane library status (pins and cache diagnostics)
-  GET  /skill[/<name>]          -> agent instructions + shipped skills, self-served
-  GET  /healthz                 -> on-box gateway reachability
-  /mcp                          -> MCP (streamable HTTP): same capabilities as tools
-
-Schema docs are FastAPI's stock /docs + /openapi.json.
-"""
-
 from __future__ import annotations
 
 import tempfile
@@ -152,15 +130,11 @@ async def resolve(
 async def cast(request: Request, ref: str = Query(..., description="Any media reference")):
     result = await resolve_ref(ref, get_settings(), app.state.client, origin=request_origin(request))
     if not result.resolved:
-        # Redirecting a renderer at an unresolved ref would point it at
-        # garbage or at the metadata document itself.
         return JSONResponse(result.as_dict(), status_code=422)
     return RedirectResponse(result.resolved_url, status_code=302)
 
 
 def _wallet_error(exc: Exception) -> JSONResponse:
-    # A bad scope is the caller's mistake (400); everything else raised here
-    # — name resolution, indexer trouble — is an upstream failure (502).
     caller_mistake = isinstance(exc, ValueError) and "scope" in str(exc)
     return JSONResponse(
         {"error": f"{type(exc).__name__}: {exc}"},
@@ -193,9 +167,6 @@ async def wallet(
             status_code=400,
         )
     if pin:
-        # Pinning a wallet's holdings IS a seed job — reuse its admission
-        # control, recovery, and capture instead of a bare pin loop. The
-        # browse result still returns even when the job is refused.
         try:
             job = await start_seed(
                 ref, get_settings(), app.state.client,
@@ -247,9 +218,7 @@ async def seed_job(job_id: str):
 
 
 class OverrideBody(BaseModel):
-    """POST /override input. `status` stays a plain str on purpose: validation
-    runs through overrides.validate_entry so errors keep the house
-    `{"error": …}` shape instead of FastAPI's 422 envelope."""
+    """Override input validated by overrides.validate_entry."""
 
     ref: str
     replacement: str
@@ -442,7 +411,7 @@ async def store(
             temporary, media_type=file.content_type, filename=file.filename,
             source_ref=f"upload:{file.filename}", keep_state="kept",
         )
-        temporary = None  # put_file consumes or removes it in every path.
+        temporary = None
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -490,8 +459,7 @@ async def media(file_id: str):
     if item is None:
         return JSONResponse({"error": "media not found"}, status_code=404)
     record, path = item
-    # No filename= here: Starlette otherwise emits Content-Disposition:
-    # attachment, which tells browsers/media renderers not to play inline.
+    # filename= would make Starlette send Content-Disposition: attachment.
     return FileResponse(path, media_type=record.get("media_type") or "application/octet-stream")
 
 
@@ -538,9 +506,7 @@ async def arweave_gateway(request: Request, path: str):
 
 
 _SKILL_DIR = Path(__file__).parent / "skill"
-# Whitelist built at import — the API skill plus any skills shipped inside
-# the package (skill/<name>/SKILL.md). Serving only dict members (never the
-# raw request path) forecloses path traversal.
+# Serve only this import-time whitelist, never a request-derived path.
 _SKILL_FILES = {
     "SKILL.md": _SKILL_DIR / "SKILL.md",
     **{f"{p.parent.name}/SKILL.md": p for p in sorted(_SKILL_DIR.glob("*/SKILL.md"))},
@@ -578,7 +544,7 @@ async def healthz():
     return JSONResponse(result, status_code=200 if result["healthy"] else 503)
 
 
-# Mounted last so explicit routes win; the MCP app serves /mcp and 404s the rest.
+# Mount last so explicit REST and media routes take precedence.
 app.mount("/", mcp.streamable_http_app())
 
 
@@ -591,7 +557,5 @@ def main() -> None:
         level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
     )
     settings = get_settings()
-    # Origin handling is performed explicitly in request_origin(). Uvicorn's
-    # proxy middleware must stay off or its localhost default would consume
-    # X-Forwarded-* before Curio can apply its CIDR allowlist.
+    # Keep Uvicorn's proxy middleware off so Curio applies its CIDR allowlist.
     uvicorn.run(app, host=settings.host, port=settings.port, proxy_headers=False)

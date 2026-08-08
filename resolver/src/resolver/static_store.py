@@ -16,11 +16,10 @@ class CacheQuotaError(ValueError):
 
 
 class StaticStore:
-    """Content-addressed objects plus source records.
+    """Content-addressed objects and source records.
 
-    Kept records are durable library content. All other records share one
-    evictable object quota; a digest with any kept record is deliberately not
-    charged to that quota or removed by cache eviction.
+    Kept records are durable. Other records share an evictable quota; digests
+    with kept records are excluded from both the quota and eviction.
     """
 
     _SCHEMA_VERSION = 1
@@ -151,9 +150,7 @@ class StaticStore:
             )
         removed: list[str] = []
         while self._cache_bytes(db) + needed > self.cache_max_bytes:
-            # Object-level LRU: a shared digest remains recent when any source
-            # record is accessed. HAVING excludes every digest kept by any
-            # record, so cache cleanup never unlinks durable content.
+            # Object-level LRU; digests with kept records are never evicted.
             victim = db.execute("""SELECT digest FROM media GROUP BY digest
                 HAVING SUM(CASE WHEN keep_state = 'kept' THEN 1 ELSE 0 END) = 0
                 ORDER BY MAX(accessed_at) ASC, digest ASC LIMIT 1""").fetchone()
@@ -161,31 +158,26 @@ class StaticStore:
                 raise CacheQuotaError("static cache quota has no evictable objects")
             digest = str(victim["digest"])
             db.execute("DELETE FROM media WHERE digest = ? AND keep_state != 'kept'", (digest,))
-            # The HAVING predicate above made this a no-kept object. Keep this
-            # check defensive for future schema/state changes.
             if db.execute("SELECT 1 FROM media WHERE digest = ?", (digest,)).fetchone() is None:
                 removed.append(digest)
         return removed
 
     def put_file(self, temporary: Path, *, media_type: str | None, filename: str | None,
                  source_ref: str | None, keep_state: str = "cached") -> dict[str, object]:
-        """Atomically promote a bounded temporary file into the object store."""
-        digest_hash = hashlib.sha256()
+        hasher = hashlib.sha256()
         size = 0
         with temporary.open("rb") as source:
             for chunk in iter(lambda: source.read(65536), b""):
-                digest_hash.update(chunk)
+                hasher.update(chunk)
                 size += len(chunk)
-        digest = digest_hash.hexdigest()
+        digest = hasher.hexdigest()
         source_identity = self._source_identity(source_ref, digest)
         path = self.objects / digest
         db = self._connection()
         removed: list[str] = []
         moved = False
         try:
-            # Serializes quota calculation, eviction, and the unique insert
-            # across resolver workers/processes. The unique key remains the
-            # race-safe backstop for old or externally-created catalogues.
+            # Serialize quota calculation, eviction, and insertion across workers.
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute(
                 "SELECT id, bytes, media_type, keep_state FROM media WHERE source_ref = ? AND digest = ?",
@@ -221,15 +213,13 @@ class StaticStore:
         except Exception:
             db.rollback()
             if moved:
-                # No successful row can refer to a just-moved object after a
-                # rolled-back immediate transaction.
+                # A rolled-back transaction cannot reference a just-moved object.
                 path.unlink(missing_ok=True)
             raise
         finally:
             db.close()
             temporary.unlink(missing_ok=True)
-        # Files disappear only after records commit. A shared digest is never
-        # in this list while any source record still references it.
+        # Remove objects only after records commit and no record references them.
         for old_digest in removed:
             (self.objects / old_digest).unlink(missing_ok=True)
         return {"id": file_id, "digest": digest, "bytes": size,

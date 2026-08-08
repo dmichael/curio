@@ -1,15 +1,3 @@
-"""MCP surface for Curio: the same capabilities as the REST API,
-exposed as Model Context Protocol tools over streamable HTTP at /mcp.
-
-An agent that is merely *connected* to this box (vs told about it) discovers
-resolve/browse/seed as typed tools automatically. The server's instructions
-are the same self-served SKILL.md the REST surface exposes at /skill — one
-source of truth for how to use Curio.
-
-Tools are hand-curated wrappers over the internals (not generated from the
-OpenAPI schema) so names and descriptions are agent-quality.
-"""
-
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -37,15 +25,10 @@ mcp = FastMCP(
     "curio",
     instructions=_SKILL_PATH.read_text(),
     stateless_http=True,
-    # app.py applies equivalent same-origin Host/Origin validation before
-    # this mounted transport. FastMCP's static allow-list cannot represent a
-    # request-derived deployment origin, so its localhost-only policy would
-    # reject every legitimate reverse-proxy/public Host.
+    # app.py validates request-derived origins before this mounted transport.
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
-# The shared AsyncClient is owned by the FastAPI lifespan; it hands us a
-# reference at startup.
 _client: httpx.AsyncClient | None = None
 
 
@@ -71,8 +54,7 @@ def _mcp_origin(ctx: Context | None = None) -> str:
                 raise ValueError("invalid MCP Host")
             return origin
         except (AttributeError, ValueError):
-            # Direct/in-process calls have no request. HTTP MCP traffic is
-            # rejected by app.py's pre-route Host guard before this fallback.
+            # HTTP traffic is rejected by app.py's Host guard before fallback.
             pass
     settings = get_settings()
     return settings.public_base_url.rstrip("/") or settings.ipfs_public_base.rstrip("/")

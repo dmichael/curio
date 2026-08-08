@@ -63,16 +63,20 @@ async def create_override(
     entry = validate_entry(entry_data)
     replaced = registry.upsert(entry, replace=replace)
     try:
-        # Disclosure, never a gate: the write already happened.
-        check = await resolve_ref(entry.replacement, settings, client, origin=origin())
+        # Replacement availability does not gate the write.
+        replacement_result = await resolve_ref(entry.replacement, settings, client, origin=origin())
     except Exception:
-        check = None
+        replacement_result = None
     return {
         "entry": asdict(entry),
         "canonical_key": canonical_ref_key(entry.ref),
         "replaced": replaced,
-        "replacement_resolved": check.resolved if check else None,
-        "replacement_resolved_url": check.resolved_url if check and check.resolved else None,
+        "replacement_resolved": replacement_result.resolved if replacement_result else None,
+        "replacement_resolved_url": (
+            replacement_result.resolved_url
+            if replacement_result and replacement_result.resolved
+            else None
+        ),
     }
 
 
@@ -98,7 +102,7 @@ async def create_favorite(
 ) -> FavoriteCreation:
     """Record a favorite, enrich it opportunistically, and retain its media."""
     try:
-        # Enrichment, never a gate: a resolve hiccup must not block the pick.
+        # A resolution failure must not prevent favoriting.
         result = await resolve_ref(ref, settings, client, origin=origin())
     except Exception:
         result = None
