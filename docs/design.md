@@ -87,11 +87,14 @@ keep/pin, seed, upload, favorite changes, and override changes. Source fetching
 checks literal addresses, DNS results, and each redirect target before
 connection, then applies bounded body, concurrency, and timeout limits.
 
-For direct HTTP, the origin is derived from the request. A proxy deployment can
-set `CURIO_PUBLIC_BASE_URL` for its external origin. Forwarded-header trust is
-not implemented at this revision; `CURIO_TRUSTED_PROXY_HEADERS` is not a
-supported setting. The target model calls for opt-in trusted proxy handling, so
-this is an implementation gap rather than an implied security feature.
+For direct HTTP, the origin is derived from the request.
+`CURIO_PUBLIC_BASE_URL` explicitly overrides it. Without that setting,
+forwarded headers are ignored unless `CURIO_TRUSTED_PROXY_CIDRS` allowlists the
+immediate proxy's IP/CIDR range. An allowlisted peer may supply a complete,
+validated RFC `Forwarded` origin or `X-Forwarded-Proto` plus
+`X-Forwarded-Host`; malformed, partial, or direct-client headers are ignored.
+The same effective origin is used for REST URLs, MCP tool URLs, and MCP's
+Host/Origin check.
 
 ## Operations
 
@@ -102,9 +105,10 @@ ordinary and retained AR.IO state, static media, and operator records; back up
 those actual paths.
 
 `curio version`, `curio update --check`, `curio update`, and
-`curio update --version vX.Y.Z` exist as operator commands. The installer uses
-an atomic `current` release symlink and restores the prior graph after failed
-health. The remote bootstrap verifies a release archive checksum before running
-it, but no release asset is currently published and the source-install update
-path does not yet fetch/select verified releases. Operators must not infer an
-automatic or already-available release updater.
+`curio update --version vX.Y.Z` are operator commands. The installed wrapper
+invokes the verified bootstrap: an exact version is passed as `CURIO_VERSION`,
+and no version selects the latest release URL. The bootstrap verifies the
+release archive checksum before running its installer; that installer atomically
+switches `current`, health-gates Compose, and restores the prior graph on
+failure. No release asset is currently published, so this release path is not
+available yet and updates are never automatic.

@@ -27,7 +27,6 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from importlib import metadata
 from pathlib import Path
-from urllib.parse import urlparse
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, UploadFile
@@ -54,6 +53,7 @@ from .favorites import (
 from .health import gateway_health
 from .library import library_status, pin_in_background, pin_resolved
 from .mcp_server import mcp, set_client
+from .origin import effective_origin, normalize_origin
 from .overrides import (
     DuplicateOverride,
     OverrideNotFound,
@@ -99,21 +99,19 @@ async def mcp_same_origin_guard(request: Request, call_next):
     This runs before the mounted MCP transport.
     """
     if request.url.path.startswith("/mcp"):
-        host = request.headers.get("host", "")
-        if not host or any(c in host for c in "\r\n/@\\") or host.startswith("."):
+        effective = normalize_origin(request_origin(request))
+        if effective is None:
             return JSONResponse({"error": "invalid MCP Host"}, status_code=421)
         origin = request.headers.get("origin")
-        if origin:
-            parsed = urlparse(origin)
-            if parsed.scheme not in {"http", "https"} or parsed.netloc != host or parsed.path not in {"", "/"}:
-                return JSONResponse({"error": "invalid MCP Origin"}, status_code=403)
+        if origin and normalize_origin(origin) != effective:
+            return JSONResponse({"error": "invalid MCP Origin"}, status_code=403)
     return await call_next(request)
 
 
 def request_origin(request: Request) -> str:
-    """The public front door, never an untrusted forwarded header or Docker URL."""
-    configured = get_settings().public_base_url.rstrip("/")
-    return configured or str(request.base_url).rstrip("/")
+    """The configured, trusted-forwarded, or direct public front door."""
+    settings = get_settings()
+    return effective_origin(request, settings.public_base_url, settings.trusted_proxy_cidrs)
 
 
 def _promote_static(result) -> bool:
@@ -642,4 +640,7 @@ def main() -> None:
         level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s"
     )
     settings = get_settings()
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    # Origin handling is performed explicitly in request_origin(). Uvicorn's
+    # proxy middleware must stay off or its localhost default would consume
+    # X-Forwarded-* before Curio can apply its CIDR allowlist.
+    uvicorn.run(app, host=settings.host, port=settings.port, proxy_headers=False)

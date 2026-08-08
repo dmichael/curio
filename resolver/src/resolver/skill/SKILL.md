@@ -128,6 +128,9 @@ reachability can honestly be `unknown`.
 
 Connect streamable HTTP MCP at `/mcp`. MCP mutation tools take the curator
 token as `curator_token`; REST uses the bearer header. Direct HTTP URLs derive
-from the request origin. `CURIO_PUBLIC_BASE_URL` is the fallback for non-request
-MCP/proxy deployments. Forwarded headers are not trusted or consumed at this
-revision, so do not assume a `CURIO_TRUSTED_PROXY_HEADERS` setting exists.
+from the request origin. `CURIO_PUBLIC_BASE_URL` explicitly overrides that
+origin for proxy or non-request MCP deployments. Otherwise forwarded headers
+are ignored unless `CURIO_TRUSTED_PROXY_CIDRS` allowlists the immediate proxy's
+IP/CIDR range. An allowlisted peer can provide a complete valid RFC `Forwarded`
+origin or `X-Forwarded-Proto` plus `X-Forwarded-Host`; malformed or partial
+values are ignored. Do not allowlist client networks.

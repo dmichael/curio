@@ -46,11 +46,14 @@ curio update
 curio update --version vX.Y.Z
 ```
 
-`curio update` is operator-invoked and the installer rolls back `current` when
-the replacement graph fails health. The checked-in/source installer does not
-yet fetch or select verified release artifacts; `update --check` depends on a
-published `VERSION` file and `update --version` is not a release selector yet.
-Use a verified release bootstrap only once release assets are published.
+`curio update` is operator-invoked. The installed wrapper invokes its verified
+release bootstrap: no version selects the latest release URL, while
+`--version vX.Y.Z` passes that exact tag as `CURIO_VERSION`. The bootstrap
+verifies the archive checksum before it runs the archived installer; that
+installer health-gates Compose and rolls `current` back on failure.
+`update --check` still needs a published `VERSION` file. No release assets are
+currently published, so installation and updates through the release URL cannot
+succeed yet.
 
 ## Resolution coverage
 
@@ -131,10 +134,12 @@ Arweave paths. Kubo and both ordinary and retained AR.IO native planes remain
 on the Compose network. Kubo additionally publishes swarm `4001/tcp` and
 `4001/udp` for participation.
 
-Direct HTTP requests derive returned URLs from the request origin. A reverse
-proxy must preserve the external Host/scheme or set `CURIO_PUBLIC_BASE_URL`.
-Forwarded headers are **not currently consumed**, so there is no trusted-proxy
-header opt-in at this revision; this remains a documented implementation gap.
+Direct HTTP requests derive returned URLs from the request origin.
+`CURIO_PUBLIC_BASE_URL` explicitly overrides that origin. Otherwise, forwarded
+origins are ignored by default. To trust an immediate reverse proxy, set
+`CURIO_TRUSTED_PROXY_CIDRS` to its IP/CIDR range; only then does Curio accept a
+complete, valid RFC `Forwarded` origin or the `X-Forwarded-Proto` plus
+`X-Forwarded-Host` pair. Do not allowlist client networks or broad ranges.
 
 `/healthz` reports backend reachability and participation evidence. Kubo and
 AR.IO are enabled by default, but neither a running daemon nor advertised

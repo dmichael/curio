@@ -283,7 +283,7 @@ Curio does not need a permanent marketplace index. It may query indexers live, t
 
 Curio does not assume a LAN address and does not require `CURIO_LAN_ADDRESS` or an equivalent setting.
 
-A client already knows the Curio origin it contacted. Returned URLs use that origin. Reverse-proxy deployments can provide the trusted external origin through standard forwarded headers.
+A client already knows the Curio origin it contacted. Returned URLs use that origin. A configured public base overrides it. Reverse-proxy deployments may provide the external origin through RFC `Forwarded` or `X-Forwarded-Proto` plus `X-Forwarded-Host`, but only when the immediate proxy IP/CIDR is explicitly allowlisted; direct-client and malformed/partial forwarded headers are ignored.
 
 The public installer must not require `sudo`. A per-user installation can place application files, configuration, and state under XDG paths and use Docker or another container runtime available to that user.
 

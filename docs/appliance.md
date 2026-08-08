@@ -1,7 +1,7 @@
 # Curio appliance specification
 
-Status: implemented packaging and media-plane behavior at 0.2.0, with the
-release/bootstrap and trusted-proxy gaps noted below.
+Status: implemented packaging, media-plane behavior, and opt-in trusted-proxy
+origin handling at 0.2.0.
 
 ## Deployment contract
 
@@ -103,14 +103,19 @@ RESOLVER_ARWEAVE_RETENTION_DB=/state/arweave-retained.sqlite3
 
 The generated `curio.env` contains `CURIO_APP_ROOT`, `CURIO_DATA_ROOT`, host
 UID/GID, `CURIO_CURATOR_TOKEN`, `CURIO_PORT`, cache limits, and
-`CURIO_PUBLIC_BASE_URL`. Do not add `CURIO_LAN_ADDRESS`: Curio uses one request
-origin, not a configured LAN address.
+`CURIO_PUBLIC_BASE_URL`, and `CURIO_TRUSTED_PROXY_CIDRS`. Do not add
+`CURIO_LAN_ADDRESS`: Curio uses one request origin, not a configured LAN
+address.
 
-For direct requests, returned URLs derive from the request origin. Set
-`CURIO_PUBLIC_BASE_URL` when an external proxy name must be used for proxied or
-non-request MCP calls. Forwarded headers are not consumed in this revision;
-there is no working `CURIO_TRUSTED_PROXY_HEADERS` setting. Opt-in trusted-proxy
-header handling remains required target work.
+For direct requests, returned URLs derive from the request origin.
+`CURIO_PUBLIC_BASE_URL` explicitly overrides it for proxied or non-request MCP
+calls. Otherwise, forwarded headers remain ignored until
+`CURIO_TRUSTED_PROXY_CIDRS` contains the immediate proxy's IP/CIDR range. Only
+an allowlisted peer may provide a complete valid RFC `Forwarded` origin or an
+`X-Forwarded-Proto` plus `X-Forwarded-Host` pair. Do not allowlist clients or
+broad networks; proxy configurations must overwrite client-supplied forwarded
+headers. REST, MCP results, and the MCP Host/Origin guard use this same
+effective origin.
 
 HTTP, inline data, and uploads use Curio static storage and never reach IPFS
 implicitly. IPFS keeps pin the canonical DAG and seed through Kubo. Arweave
@@ -141,11 +146,13 @@ curio update
 curio update --version vX.Y.Z
 ```
 
-Updates are operator initiated and install rollback is implemented. However,
-the source-install wrapper currently reinvokes its installed source installer:
-`update --check` needs a published `VERSION` asset and `--version` validates
-syntax but does not yet select/download that release. Do not represent these as
-a complete verified updater until the wrapper invokes verified release artifacts.
+Updates are operator initiated. The installed wrapper invokes its verified
+bootstrap: `update --version vX.Y.Z` passes that exact tag as `CURIO_VERSION`,
+while `update` selects the latest-release URL. The bootstrap verifies the
+archive checksum before it runs the archived installer, which health-gates
+Compose and rolls back `current` on failure. `update --check` still needs a
+published `VERSION` asset. No release assets are currently published, so the
+release installer and updater cannot succeed yet.
 
 ## State and backup
 

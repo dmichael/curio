@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .origin import normalize_origin, parse_trusted_proxy_cidrs
 
 
 class Settings(BaseSettings):
@@ -24,10 +26,11 @@ class Settings(BaseSettings):
     arweave_retained_internal: str = "http://127.0.0.1:4001"
     arweave_retention_db: str = ""
 
-    # Public front-door URL for non-request callers (notably MCP).  Set this
-    # behind a reverse proxy; forwarded headers are deliberately not trusted
-    # from arbitrary direct clients.
+    # Public front-door URL takes precedence over a request/proxy origin.
     public_base_url: str = ""
+    # Comma-separated IP/CIDR ranges for immediate reverse proxies. Empty is
+    # fail-closed: Forwarded and X-Forwarded-* headers are ignored.
+    trusted_proxy_cidrs: str = ""
     # Compatibility values for direct resolve_ref callers. HTTP requests use
     # their request origin; MCP uses public_base_url or a non-routable marker.
     ipfs_public_base: str = ""
@@ -81,6 +84,24 @@ class Settings(BaseSettings):
     # Public gateways tried as HTTP-recovery sources for CIDs whose IPFS
     # fetch fails — their caches often outlive the original providers.
     seed_recovery_gateways: list[str] = ["https://ipfs.io/ipfs", "https://dweb.link/ipfs"]
+
+    @field_validator("public_base_url")
+    @classmethod
+    def _valid_public_base_url(cls, value: str) -> str:
+        if not value:
+            return ""
+        origin = normalize_origin(value)
+        if origin is None:
+            raise ValueError("public_base_url must be an http(s) origin with no path or userinfo")
+        return origin
+
+    @field_validator("trusted_proxy_cidrs")
+    @classmethod
+    def _valid_trusted_proxy_cidrs(cls, value: str) -> str:
+        # Parse at startup so a typo cannot silently disable an intended trust
+        # boundary. Keep the original compact representation for the request path.
+        parse_trusted_proxy_cidrs(value)
+        return value
 
     @model_validator(mode="after")
     def _default_public_to_internal(self) -> Settings:

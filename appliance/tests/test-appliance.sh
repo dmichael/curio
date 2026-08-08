@@ -6,6 +6,7 @@ TMP=$(mktemp -d)
 trap 'if [[ -f $TMP/pyproject.orig ]]; then cp "$TMP/pyproject.orig" "$ROOT/resolver/pyproject.toml"; fi; rm -rf -- "$TMP"' EXIT
 fail() { echo "test-appliance: $*" >&2; exit 1; }
 for command in python3 tar sha256sum; do command -v "$command" >/dev/null || fail "$command is required"; done
+grep -q 'RESOLVER_TRUSTED_PROXY_CIDRS: ${CURIO_TRUSTED_PROXY_CIDRS:-}' "$ROOT/appliance/compose.yaml" || fail 'Compose does not map trusted proxy CIDRs'
 
 # Bootstrap checksum and requested-version verification must happen before the
 # embedded installer runs. A fake installer records that it was reached.
@@ -77,6 +78,7 @@ assert not s['ar-io-envoy'].get('ports',[])
 assert s['resolver']['environment']['RESOLVER_ARWEAVE_INTERNAL']=='http://ar-io-core:4000'
 assert s['resolver']['environment']['RESOLVER_ARWEAVE_RETAINED_INTERNAL']=='http://ar-io-retained:4000'
 assert s['resolver']['environment']['RESOLVER_ARWEAVE_COLD_TIMEOUT']=='300'
+assert s['resolver']['environment']['RESOLVER_TRUSTED_PROXY_CIDRS']==''
 assert 'RESOLVER_IPFS_PUBLIC_BASE' not in s['resolver']['environment']
 PY
 else
@@ -127,6 +129,7 @@ chmod +x "$TMP/bin/mv"; : >"$TMP/docker.log"
 XDG_DATA_HOME="$TMP/xdg-data" XDG_CONFIG_HOME="$TMP/xdg-config" XDG_BIN_HOME="$TMP/bin-out" CURIO_APP_ROOT="$TMP/custom-app" CURIO_DATA_ROOT="$TMP/custom-state" CURIO_DOCKER_LOG="$TMP/docker.log" PATH="$TMP/bin:$PATH" "$ROOT/appliance/install.sh" >/dev/null
 [[ -L $TMP/custom-app/current ]] || fail 'installer did not create current release pointer'
 [[ -d $TMP/custom-state/ipfs && -f $TMP/xdg-config/curio/curio.env ]] || fail 'installer did not persist user state'
+grep -q '^CURIO_TRUSTED_PROXY_CIDRS=$' "$TMP/xdg-config/curio/curio.env" || fail 'installer did not persist trusted proxy setting'
 [[ $(<"$TMP/custom-state/ar-io/start-height.env") == START_HEIGHT=123456 ]] || fail 'first install did not discover AR.IO height'
 [[ $(<"$TMP/custom-state/ar-io-retained/start-height.env") == START_HEIGHT=123456 ]] || fail 'installer did not initialize retained AR.IO state'
 [[ -f "$TMP/custom-state/ar-io/envoy-eds/arweave_full_nodes.json" && -f "$TMP/custom-state/ar-io/envoy-eds/arweave_partial_nodes.json" ]] || fail 'installer did not preseed user-owned Envoy EDS files'
@@ -152,6 +155,18 @@ if XDG_DATA_HOME="$TMP/xdg-data" XDG_CONFIG_HOME="$TMP/xdg-config" XDG_BIN_HOME=
 [[ $(readlink "$TMP/custom-app/current") == "$second_pointer" ]] || fail 'failed install did not roll back current pointer'
 [[ $(grep -c 'up -d' "$TMP/docker.log") -eq $((up_before + 2)) ]] || fail 'failed install did not restore prior Compose deployment'
 grep -q 'down --remove-orphans' "$TMP/docker.log" || fail 'failed install did not remove partial Compose project'
+# The installed wrapper must call the root verified bootstrap (not the
+# appliance installer directly), preserving an exact tag and empty/latest mode.
+grep -q 'Verified Curio release bootstrap' "$TMP/custom-app/current/install.sh" || fail 'installed update target is not the verified bootstrap'
+cat >"$TMP/custom-app/current/install.sh" <<EOF
+#!/bin/sh
+printf 'version=%s app=%s\\n' "\${CURIO_VERSION-unset}" "\${CURIO_APP_ROOT-unset}" >>"$TMP/wrapper-update.log"
+EOF
+chmod +x "$TMP/custom-app/current/install.sh"
+CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update --version v0.2.1
+CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update
+[[ $(sed -n '1p' "$TMP/wrapper-update.log") == "version=v0.2.1 app=$TMP/custom-app" ]] || fail 'wrapper did not propagate exact update version to bootstrap'
+[[ $(sed -n '2p' "$TMP/wrapper-update.log") == "version= app=$TMP/custom-app" ]] || fail 'wrapper did not invoke latest bootstrap mode'
 CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_DOCKER_LOG="$TMP/docker.log" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" status
 
 grep -q -- '--file .*custom-app/current/compose.yaml' "$TMP/docker.log" || fail 'wrapper did not discover configured custom app root'

@@ -17,11 +17,15 @@ a random `CURIO_CURATOR_TOKEN` to
 as `Authorization: Bearer <token>`. An empty resolver token disables mutations.
 
 Terminate TLS at a trusted front door or proxy. Direct requests derive returned
-Curio URLs from their request origin. `CURIO_PUBLIC_BASE_URL` can set an
-external origin for a proxy deployment or non-request MCP invocation. This
-revision does **not** trust `Forwarded` or `X-Forwarded-*` headers, despite the
-target model requiring an explicit trusted-proxy mode. Do not assume those
-headers change returned URLs.
+Curio URLs from their request origin, and forwarded headers are ignored by
+default. `CURIO_PUBLIC_BASE_URL` explicitly overrides the request origin for a
+proxy deployment or non-request MCP invocation. Otherwise, set
+`CURIO_TRUSTED_PROXY_CIDRS` only to the IP/CIDR ranges of immediate trusted
+proxies to enable forwarded origin handling. Curio then accepts only a complete,
+valid RFC `Forwarded` origin or `X-Forwarded-Proto` with
+`X-Forwarded-Host`, and only when the connecting peer is in that allowlist.
+Never allowlist client ranges: a trusted proxy must strip or replace inbound
+forwarded headers before sending its own.
 
 Curio follows user- and metadata-supplied HTTP URLs. It resolves DNS before
 connecting, rejects prohibited address ranges, pins the connection to a checked

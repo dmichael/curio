@@ -25,6 +25,7 @@ from .favorites import FavoriteError, Favorites, get_favorites, list_resolved
 from .health import gateway_health
 from .library import library_status as _library_status
 from .library import pin_in_background, pin_resolved
+from .origin import effective_origin
 from .overrides import OverrideError, OverrideRegistry, get_registry, validate_entry
 from .refs import canonical_ref_key
 from .resolve import resolve_ref
@@ -66,7 +67,8 @@ def _mcp_origin(ctx: Context | None = None) -> str:
     if ctx is not None:
         try:
             request = ctx.request_context.request
-            return str(request.base_url).rstrip("/")
+            settings = get_settings()
+            return effective_origin(request, settings.public_base_url, settings.trusted_proxy_cidrs)
         except (AttributeError, ValueError):
             pass  # direct/in-process tool invocation has no HTTP request
     settings = get_settings()

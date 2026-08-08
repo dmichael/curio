@@ -76,6 +76,38 @@ def test_mcp_transport_uses_nonlocal_request_origin(http_client):
     assert "http://curio.example/ipfs/bafyCID/a.png" in response.text
 
 
+def test_mcp_transport_uses_trusted_forwarded_origin_and_guard(http_client, monkeypatch):
+    """The mounted MCP transport and Host/Origin guard share proxy origin logic."""
+    monkeypatch.setenv("RESOLVER_TRUSTED_PROXY_CIDRS", "127.0.0.0/8")
+    get_settings.cache_clear()
+    headers = {
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+        "Host": "resolver.internal:8090",
+        "Origin": "https://curio.example",
+        "Forwarded": "for=198.51.100.7;proto=https;host=curio.example",
+    }
+    initialize = {"jsonrpc": "2.0", "id": 31, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"},
+    }}
+    old_client = http_client._transport.client
+    http_client._transport.client = ("127.0.0.1", 50000)
+    try:
+        assert http_client.post("/mcp", headers=headers, json=initialize).status_code == 200
+        assert http_client.post("/mcp", headers=headers, json={
+            "jsonrpc": "2.0", "method": "notifications/initialized", "params": {},
+        }).status_code == 202
+        response = http_client.post("/mcp", headers=headers, json={
+            "jsonrpc": "2.0", "id": 32, "method": "tools/call",
+            "params": {"name": "resolve", "arguments": {"ref": "ipfs://bafyCID/a.png"}},
+        })
+    finally:
+        http_client._transport.client = old_client
+        get_settings.cache_clear()
+    assert response.status_code == 200
+    assert "https://curio.example/ipfs/bafyCID/a.png" in response.text
+
+
 async def test_mcp_resolve_tool_round_trips():
     async with no_net() as client:
         mcp_server.set_client(client)
