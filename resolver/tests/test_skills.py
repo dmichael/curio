@@ -6,7 +6,7 @@ so this service's convention is that it self-serves them."""
 def test_api_skill_served(http_client):
     response = http_client.get("/skill")
     assert response.status_code == 200
-    assert "content-sidecar" in response.text
+    assert "name: curio" in response.text
     # the canonical-path alias still works
     assert http_client.get("/skill/SKILL.md").text == response.text
 

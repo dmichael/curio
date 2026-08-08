@@ -1,6 +1,7 @@
-"""FF1-specific fixups. See docs/design.md and the ff1 repo memory notes.
+"""Renderer fixups the resolver owns — learned from driving a real FF1,
+harmless to other consumers. See docs/design.md and the ff1 repo memory notes.
 
-These encode three quirks learned from driving the FF1:
+These encode three quirks:
   1. A bare IPFS CID URL (no filename/extension) renders as an *iframe*, not
      media. Appending `?filename=art.<ext>` forces media rendering.
   2. NFT metadata often lists several image URLs; the biggest bytes wins, and

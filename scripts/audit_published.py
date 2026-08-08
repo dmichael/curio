@@ -2,8 +2,11 @@
 """Audit the resolution status of a wallet's published (first-minted) catalog.
 
 Reads the /wallet?scope=published listing, resolves each token's primary_ref
-against the sidecar in browse mode (no pin), and classifies each work as
+against Curio in browse mode (no pin), and classifies each work as
 alive / substituted / dead. Pure read: nothing is pinned.
+
+Usage: python3 scripts/audit_published.py <curio-base> [listing.json] [out.json]
+       (listing defaults to published.json, output to audit_result.json)
 """
 import json
 import sys
@@ -12,9 +15,11 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-BOX = "http://192.168.1.132:8090"
-LISTING = sys.argv[1] if len(sys.argv) > 1 else "published.json"
-OUT = sys.argv[2] if len(sys.argv) > 2 else "audit_result.json"
+if len(sys.argv) < 2:
+    sys.exit("usage: audit_published.py <curio-base> [listing.json] [out.json]")
+BOX = sys.argv[1].rstrip("/")
+LISTING = sys.argv[2] if len(sys.argv) > 2 else "published.json"
+OUT = sys.argv[3] if len(sys.argv) > 3 else "audit_result.json"
 
 # Tezos Domains contract — .tez registrations, not artworks
 DOMAINS = "KT1GBZmSxmnKJXGMdMLbugPfLyUPmuLSMwKS"

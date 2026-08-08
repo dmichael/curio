@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Split a first-minted catalog into authored vs collected using TzKT creators.
 
-first-minter (the sidecar's 'published' scope) includes fxhash editions the
+first-minter (Curio's 'published' scope) includes fxhash editions the
 wallet merely minted/collected. TzKT token metadata carries a creators/authors
 list; if the wallet is in it, the work is authored, else collected.
+
+Usage: python3 scripts/split_authored.py <published.json> <tz-wallet-address> <out.json>
 """
 import json
 import sys
 import urllib.request
 
-WALLET = "tz1P1C4uKkNkSLwbu9h3mEaheoWwNwpwgUbA"
+if len(sys.argv) < 4:
+    sys.exit("usage: split_authored.py <published.json> <tz-wallet-address> <out.json>")
 LISTING = sys.argv[1]
+WALLET = sys.argv[2]
 DOMAINS = "KT1GBZmSxmnKJXGMdMLbugPfLyUPmuLSMwKS"
 
 
@@ -54,7 +58,7 @@ def main():
     json.dump(
         {"authored": authored, "collected": collected,
          "unknown": [t for t, _ in unknown]},
-        open(sys.argv[2], "w"), indent=1)
+        open(sys.argv[3], "w"), indent=1)
 
 
 if __name__ == "__main__":

@@ -19,8 +19,8 @@ from resolver.favorites import (
     FavoritesUnparseable,
     get_favorites,
 )
+from resolver.library import pin_resolved
 from resolver.resolve import Resolved
-from resolver.seed import pin_resolved
 
 # --- store ---------------------------------------------------------------
 

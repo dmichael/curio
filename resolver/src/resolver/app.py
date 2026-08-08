@@ -42,7 +42,8 @@ from .favorites import (
     get_favorites,
     list_resolved,
 )
-from .health import gateway_health, library_status
+from .health import gateway_health
+from .library import library_status, pin_in_background
 from .mcp_server import mcp, set_client
 from .overrides import (
     DuplicateOverride,
@@ -54,15 +55,9 @@ from .overrides import (
 )
 from .refs import canonical_ref_key
 from .resolve import resolve_ref
-from .seed import (
-    TooManySeedJobs,
-    get_job,
-    list_jobs,
-    list_wallet_tokens,
-    pin_in_background,
-    start_seed,
-)
+from .seed import TooManySeedJobs, get_job, list_jobs, start_seed
 from .store import CidMismatch, store_upload
+from .wallets import list_wallet_tokens
 
 
 @asynccontextmanager
@@ -80,7 +75,13 @@ async def lifespan(app: FastAPI):
             await app.state.client.aclose()
 
 
-app = FastAPI(title="content-resolver", lifespan=lifespan)
+app = FastAPI(title="Curio", lifespan=lifespan)
+
+_SCOPE_DESCRIPTION = (
+    "'held' = holdings; 'published' = works the wallet first-minted (Tezos only); "
+    "'created' = works the wallet authored, i.e. creators/authors metadata, fully-burned "
+    "dropped (Tezos only); 'contract' = every token of a token-contract address (both chains)"
+)
 
 
 @app.get("/resolve")
@@ -124,7 +125,7 @@ async def wallet(
     ref: str = Query(..., description="Wallet address or name: 0x…, name.eth, tz1…, name.tez"),
     limit: int | None = Query(None, ge=1, description="Stop after this many tokens"),
     pin: bool = Query(False, description="Also pin everything listed (starts a seed job)"),
-    scope: str = Query("held", description="'held' = holdings; 'published' = works the wallet first-minted (Tezos only); 'created' = works the wallet authored, i.e. creators/authors metadata, fully-burned dropped (Tezos only); 'contract' = every token of a token-contract address (both chains)"),
+    scope: str = Query("held", description=_SCOPE_DESCRIPTION),
     status: bool = Query(False, description="Also resolve each primary_ref and classify it (ok/substituted/unreachable/unresolvable/no-ref) — the audit view"),
     include_burned: bool = Query(False, description="created scope only: keep fully-burned creations (default drops them — destroyed on purpose)"),
 ):
@@ -160,7 +161,7 @@ async def wallet(
 async def seed(
     ref: str = Query(..., description="Wallet address or name: 0x…, name.eth, tz1…, name.tez"),
     limit: int | None = Query(None, ge=1, description="Stop after this many tokens (for testing/incremental runs)"),
-    scope: str = Query("held", description="'held' = holdings; 'published' = works the wallet first-minted (Tezos only); 'created' = works the wallet authored, i.e. creators/authors metadata, fully-burned dropped (Tezos only); 'contract' = every token of a token-contract address (both chains)"),
+    scope: str = Query("held", description=_SCOPE_DESCRIPTION),
     include_burned: bool = Query(False, description="created scope only: keep fully-burned creations (default drops them — destroyed on purpose)"),
 ):
     try:

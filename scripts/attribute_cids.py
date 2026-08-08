@@ -20,7 +20,7 @@ CID_RE = re.compile(r"(?:Qm[1-9A-HJ-NP-Za-km-z]{44}|baf[a-z0-9]{20,})")
 
 def fetch_json(url: str):
     # Cloudflare-fronted APIs (Blockscout, objkt) 403 requests without a UA.
-    request = urllib.request.Request(url, headers={"User-Agent": "content-sidecar-scripts/0.1"})
+    request = urllib.request.Request(url, headers={"User-Agent": "curio-scripts/0.1"})
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.load(response)
 

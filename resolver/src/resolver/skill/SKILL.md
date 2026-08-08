@@ -1,9 +1,9 @@
 ---
-name: content-sidecar
-description: Resolve any media reference (IPFS, Arweave, NFT tokenURI, verse.works page, direct URL) into a LAN-playable URL, and seed the box's content cache from a wallet. Fetched live from the sidecar itself at GET /skill/SKILL.md — the box is the source of truth for how to use it.
+name: curio
+description: Resolve any media reference (IPFS, Arweave, NFT tokenURI, verse.works page, direct URL) into a LAN-playable URL, and seed the box's content cache from a wallet. Fetched live from Curio itself at GET /skill/SKILL.md — the box is the source of truth for how to use it.
 ---
 
-# Content sidecar — agent instructions
+# Curio — agent instructions
 
 **No registration, no stored state.** Resolve works on arbitrary refs with zero
 setup — unpinned content is fetched on demand and lands in the gateway cache.
@@ -11,7 +11,7 @@ Seeding is a one-shot imperative ("make this wallet's holdings durable now"),
 not a subscription; the only state it leaves is pins. Cache = incidental,
 pins = the library.
 
-These instructions are served by the sidecar they describe (`GET /skill/SKILL.md`),
+These instructions are served by the Curio instance they describe (`GET /skill/SKILL.md`),
 so they always match the running service. The machine-readable API schema is at
 `GET /openapi.json` (interactive: `/docs`). Prefer this file for *how to use*
 the service; prefer the schema for exact parameter shapes.
@@ -22,7 +22,7 @@ the service; prefer the schema for exact parameter shapes.
 an unknown `/skill/<name>` 404s with the list of what's available.
 
 **MCP:** the same capabilities are exposed as MCP tools (streamable HTTP) at
-`/mcp` — connect the sidecar as an MCP server (`"url": "http://<sidecar-ip>:8090/mcp"`)
+`/mcp` — connect Curio as an MCP server (`"url": "http://<curio-ip>:8090/mcp"`)
 and the tools `resolve`, `wallet_tokens`, `seed_wallet`, `seed_status`,
 `health`, `library_status`, `list_overrides`, `add_override`,
 `remove_override`, `list_favorites`, `add_favorite`, and `remove_favorite`
@@ -107,7 +107,7 @@ Caveats:
   are never served automatically; they exist so the operator *can* point a
   dead ref at them later.
 - Failures: first 20 in the job's `errors`, complete record in the service
-  journal (`journalctl -u content-resolver` on the box).
+  journal (`journalctl -u content-resolver` on the Curio host).
 - Re-running a seed is safe and cheap — pins are idempotent, so a second pass
   just retries the failures. `limit=<n>` runs a partial/test seed.
 - `scope=published` (Tezos only) seeds what the wallet *first-minted* instead
@@ -124,7 +124,7 @@ Caveats:
 ## Store bytes on the box
 
 - `POST /store` (multipart, REST only — binary doesn't travel over MCP):
-  `curl -F file=@master.mp4 'http://<sidecar-ip>:8090/store'` streams the file
+  `curl -F file=@master.mp4 'http://<curio-ip>:8090/store'` streams the file
   into the box's Kubo, pinned, CIDv1, and records provenance (filename, size,
   sha256, content type, time) in the capture ledger. Returns `cid`,
   `resolved_url`, and the provenance fields.

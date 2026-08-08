@@ -3,7 +3,7 @@
 These are the server-dependent references — viewer pages, render proxies,
 platform CDNs. Groups them by host and flags the HTML-viewer-shaped ones.
 
-Usage: python3 scripts/list_http_refs.py <sidecar-base> <wallet> [wallet...]
+Usage: python3 scripts/list_http_refs.py <curio-base> <wallet> [wallet...]
 """
 
 import json

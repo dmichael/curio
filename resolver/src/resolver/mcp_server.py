@@ -1,10 +1,10 @@
-"""MCP surface for the sidecar: the same capabilities as the REST API,
+"""MCP surface for Curio: the same capabilities as the REST API,
 exposed as Model Context Protocol tools over streamable HTTP at /mcp.
 
 An agent that is merely *connected* to this box (vs told about it) discovers
 resolve/browse/seed as typed tools automatically. The server's instructions
 are the same self-served SKILL.md the REST surface exposes at /skill — one
-source of truth for how to use the sidecar.
+source of truth for how to use Curio.
 
 Tools are hand-curated wrappers over the internals (not generated from the
 OpenAPI schema) so names and descriptions are agent-quality.
@@ -23,16 +23,18 @@ from mcp.server.transport_security import TransportSecuritySettings
 from .config import get_settings
 from .favorites import FavoriteError, Favorites, get_favorites, list_resolved
 from .health import gateway_health
-from .health import library_status as _library_status
+from .library import library_status as _library_status
+from .library import pin_in_background
 from .overrides import OverrideError, OverrideRegistry, get_registry, validate_entry
 from .refs import canonical_ref_key
 from .resolve import resolve_ref
-from .seed import get_job, list_jobs, list_wallet_tokens, pin_in_background, start_seed
+from .seed import get_job, list_jobs, start_seed
+from .wallets import list_wallet_tokens
 
 _SKILL_PATH = Path(__file__).parent / "skill" / "SKILL.md"
 
 mcp = FastMCP(
-    "content-sidecar",
+    "curio",
     instructions=_SKILL_PATH.read_text(),
     stateless_http=True,
     # The transport's DNS-rebinding protection only accepts localhost Host
@@ -53,7 +55,7 @@ def set_client(client: httpx.AsyncClient) -> None:
 
 def _require_client() -> httpx.AsyncClient:
     if _client is None:
-        raise RuntimeError("sidecar HTTP client not initialized")
+        raise RuntimeError("Curio HTTP client not initialized")
     return _client
 
 

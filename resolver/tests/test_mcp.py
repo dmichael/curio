@@ -142,5 +142,5 @@ async def test_mcp_override_tools_error_when_disabled(monkeypatch):
 
 
 async def test_mcp_instructions_come_from_the_skill():
-    assert "content-sidecar" in (mcp.instructions or "")
+    assert "# Curio" in (mcp.instructions or "")
     assert "/resolve" in (mcp.instructions or "")

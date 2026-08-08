@@ -19,7 +19,7 @@ import httpx
 from fastapi import UploadFile
 
 from .config import Settings
-from .seed import captures_file
+from .library import captures_file
 
 
 class CidMismatch(Exception):

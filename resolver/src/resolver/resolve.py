@@ -1,11 +1,11 @@
 """Reference resolution: any media reference -> a box-local playable URL.
 
-Phase 1, mechanical (no network):
+Mechanical (no network):
   - ipfs://CID/path, /ipfs/CID/path, https://<any-gw>/ipfs/CID  -> box IPFS gateway
   - ar://txid, https://arweave.net/txid                         -> box Arweave gateway
   - direct http(s) media with a real extension                  -> passthrough
 
-Phase 1, network (probes go to the INTERNAL gateways so the box's own
+Network (probes go to the INTERNAL gateways so the box's own
 pins/cache are used; consumers get the PUBLIC base):
   - extension-less refs -> Content-Type probe -> ?filename=art.<ext> hint (ipfs),
     send-vs-play from the real content type
@@ -18,8 +18,8 @@ Every step first consults the operator's override registry (overrides.py):
 a ref whose canonical content is gone resolves to its recorded replacement,
 marked `substituted` with a provenance status — never silently.
 
-Phase 2 (TODO — needs chain access):
-  - ENS / wallet / tx hash / contract+tokenId -> tokenURI -> recurse
+Not built: ENS / wallet / tx / contract+tokenId resolution (needs an
+RPC/indexer path chosen for the service; see docs/design.md § Open decisions).
 """
 
 from __future__ import annotations
@@ -45,12 +45,9 @@ from .fixups import (
     probe_headers,
 )
 from .overrides import get_registry
-from .refs import arweave_parts, arweave_txid, ipfs_parts
+from .refs import arweave_parts, ipfs_parts
 
-__all__ = [
-    "Resolved", "resolve_ref", "pick_media_field", "external_url_ok",
-    "ipfs_parts", "arweave_parts", "arweave_txid",
-]
+__all__ = ["Resolved", "resolve_ref", "pick_media_field", "external_url_ok"]
 
 _VERSE_HOSTS = {"verse.works", "www.verse.works"}
 _META_IMAGE_RE = re.compile(

@@ -1,0 +1,26 @@
+# Disposable ARM64 Linux appliance test VM for Apple Silicon Macs.
+# Create/start from the repository root with:
+#   limactl start --name=curio-appliance-test dev/lima.yaml
+# The home mount inherited from Lima is read-only; Curio state stays on the
+# guest's native filesystem so Linux ownership and atomic writes are real.
+minimumLimaVersion: 2.0.0
+
+base:
+  - template:docker-rootful
+
+arch: aarch64
+vmType: vz
+cpus: 4
+memory: 6GiB
+disk: 60GiB
+
+portForwards:
+  - guestPort: 3000
+    hostPort: 13000
+    static: true
+  - guestPort: 8080
+    hostPort: 13080
+    static: true
+  - guestPort: 8090
+    hostPort: 13090
+    static: true

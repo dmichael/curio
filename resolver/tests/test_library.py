@@ -1,4 +1,4 @@
-"""Warm ledger (seed.py) and cross-plane library status (health.py, /library)."""
+"""Warm/capture ledgers and cross-plane library status (library.py, /library)."""
 
 import asyncio
 import json
@@ -10,9 +10,9 @@ import pytest
 from resolver import app as app_module
 from resolver.config import Settings, get_settings
 from resolver.favorites import get_favorites
-from resolver.health import library_status
+from resolver.library import library_status, pin_resolved, record_warm, warmed_txids
 from resolver.overrides import get_registry
-from resolver.seed import SeedJob, _warm_txid, pin_resolved, record_warm, warmed_txids
+from resolver.seed import SeedJob, _warm_txid, run_seed
 
 SETTINGS = Settings(
     ipfs_internal="http://ipfs.internal",
@@ -23,6 +23,26 @@ SETTINGS = Settings(
 
 def client_for(handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def fake_net(routes: dict[str, dict | list]) -> tuple[httpx.AsyncClient, list[str]]:
+    """Client over a routing table; also returns the request log.
+
+    A list value serves its entries to successive requests (last one sticks),
+    for endpoints whose behavior changes between calls.
+    """
+    log: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        log.append(f"{request.method} {request.url}")
+        spec = routes.get(f"{request.method} {request.url}") or routes.get(str(request.url))
+        if isinstance(spec, list):
+            spec = spec.pop(0) if len(spec) > 1 else spec[0]
+        if spec is None:
+            return httpx.Response(404)
+        return httpx.Response(**spec)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler)), log
 
 
 # --- warm ledger ------------------------------------------------------------
@@ -91,6 +111,106 @@ async def test_pin_resolved_arweave_warm_records_the_caller_why(tmp_path):
     assert warmed_txids(settings) == ["txFAV"]
     record = json.loads((tmp_path / "warmed.jsonl").read_text())
     assert record["why"] == "favorite"
+
+
+# --- capture ledger (seed-driven) --------------------------------------------
+
+SEED_SETTINGS = SETTINGS.model_copy(update={"blockscout_base": "http://bs.internal/api/v2"})
+
+ETH_ADDR = "0xAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb"
+CAPTURE_URL = "https://hodlers.example/art/149.mp4"
+CAPTURE_BYTES = b"the only copy of these bytes"
+
+
+def make_job(ref: str, chain: str) -> SeedJob:
+    # run_seed expects the address already resolved (start_seed's job);
+    # these direct-run tests all use address-shaped refs.
+    return SeedJob(id="test1234", ref=ref, chain=chain, address=ref, started_at="t")
+
+
+def capture_routes():
+    return {
+        f"http://bs.internal/api/v2/addresses/{ETH_ADDR}/nft?type=ERC-721%2CERC-1155": {
+            "status_code": 200,
+            "json": {
+                "items": [{"id": "149", "metadata": {"animation_url": CAPTURE_URL}}],
+                "next_page_params": None,
+            },
+        },
+        CAPTURE_URL: {
+            "status_code": 200,
+            "headers": {"content-type": "video/mp4"},
+            "content": CAPTURE_BYTES,
+        },
+        "POST http://kubo.internal/api/v0/add?cid-version=1": {
+            "status_code": 200,
+            "json": {"Name": "captured", "Hash": "bafyCAPTURED", "Size": "28"},
+        },
+    }
+
+
+async def test_http_only_media_is_captured_with_provenance(tmp_path):
+    import hashlib
+
+    settings = SEED_SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path)})
+    client, _ = fake_net(capture_routes())
+    job = make_job(ETH_ADDR, "ethereum")
+    async with client:
+        await run_seed(job, settings, client)
+    assert job.status == "done", job.errors
+    assert job.captured == 1
+    assert job.skipped == 0
+    assert job.failed == 0
+
+    lines = (tmp_path / "captures.jsonl").read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["source"] == CAPTURE_URL
+    assert record["cid"] == "bafyCAPTURED"
+    assert record["sha256"] == hashlib.sha256(CAPTURE_BYTES).hexdigest()
+    assert record["bytes"] == len(CAPTURE_BYTES)
+    assert record["content_type"] == "video/mp4"
+    assert record["wallet"] == ETH_ADDR
+
+
+async def test_capture_is_once_per_url_across_jobs(tmp_path):
+    settings = SEED_SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path)})
+    first, _ = fake_net(capture_routes())
+    async with first:
+        await run_seed(make_job(ETH_ADDR, "ethereum"), settings, first)
+
+    second, log = fake_net(capture_routes())
+    job = make_job(ETH_ADDR, "ethereum")
+    async with second:
+        await run_seed(job, settings, second)
+    assert job.status == "done", job.errors
+    assert job.captured == 1  # idempotent, like re-pinning
+    assert not any(CAPTURE_URL in line for line in log)  # no re-download
+    assert len((tmp_path / "captures.jsonl").read_text().splitlines()) == 1
+
+
+async def test_http_media_is_skipped_when_capture_is_off():
+    client, _ = fake_net(capture_routes())
+    job = make_job(ETH_ADDR, "ethereum")
+    async with client:
+        await run_seed(job, SEED_SETTINGS, client)
+    assert job.status == "done", job.errors
+    assert job.captured == 0
+    assert job.skipped == 1
+
+
+async def test_capture_failure_is_counted_not_fatal(tmp_path):
+    settings = SEED_SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path)})
+    routes = capture_routes()
+    routes[CAPTURE_URL] = {"status_code": 410}  # the domain died mid-seed
+    client, _ = fake_net(routes)
+    job = make_job(ETH_ADDR, "ethereum")
+    async with client:
+        await run_seed(job, settings, client)
+    assert job.status == "done"
+    assert job.captured == 0
+    assert job.failed == 1
+    assert not (tmp_path / "captures.jsonl").exists()
 
 
 # --- library_status ----------------------------------------------------------

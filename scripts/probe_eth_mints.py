@@ -5,7 +5,7 @@ transfers FROM the zero address TO the wallet (mint events). This pages the
 whole transfer history and reports every such mint — evidence for (or
 against) building scope=published on this shape.
 
-Usage: python3 scripts/probe_eth_mints.py [address]
+Usage: python3 scripts/probe_eth_mints.py <0x-wallet-address>
 """
 
 import json
@@ -16,7 +16,7 @@ import urllib.request
 
 BASE = "https://eth.blockscout.com/api/v2"
 ZERO = "0x0000000000000000000000000000000000000000"
-UA = "ff1-content-sidecar probe (household archive tooling)"  # default urllib UA gets 403'd
+UA = "curio probe (household archive tooling)"  # default urllib UA gets 403'd
 
 
 def main() -> None:

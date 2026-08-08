@@ -1,11 +1,11 @@
 ---
 name: nft-preservation
-description: Triage and repair dead or dying NFT media (IPFS, Arweave, plain-HTTP) using the content sidecar — the recovery ladder, provenance tiers, collection sweeps, and runtime-work preservation. Invoke when a work won't resolve or play, when auditing wallets or a published catalog for rot, or when deciding how to pin/repair/attest collection media.
+description: Triage and repair dead or dying NFT media (IPFS, Arweave, plain-HTTP) using Curio — the recovery ladder, provenance tiers, collection sweeps, and runtime-work preservation. Invoke when a work won't resolve or play, when auditing wallets or a published catalog for rot, or when deciding how to pin/repair/attest collection media.
 ---
 
 # NFT preservation — the collector's playbook
 
-Distilled from real recoveries. The sidecar's own API docs live at
+Distilled from real recoveries. Curio's own API docs live at
 `GET /skill` on the box (and ride along as MCP instructions); this skill is
 the layer above: *how to think and what to do* when media is dying.
 

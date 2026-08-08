@@ -4,12 +4,16 @@ __pycache__/
 venv/
 *.egg-info/
 build/
+dist/
 .env
 .pytest_cache/
 .DS_Store
-deploy/.build/
-deploy/inventory.ini
-deploy/overrides.toml
+# Legacy site-specific Ansible deployment is kept locally only. The public
+# appliance installer is the single supported deployment path.
+deploy/
+
+# Local agent/recovery working notes are not release artifacts.
+appliance-implementation-prompt.md
 MEMORY.md
 memory-notes/
 recovery-handoff-prompt.md

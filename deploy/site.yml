@@ -1,6 +1,0 @@
----
-- name: Content sidecar
-  hosts: content_sidecar
-  become: true
-  roles:
-    - content_resolver
