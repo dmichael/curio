@@ -18,12 +18,20 @@ class Settings(BaseSettings):
     ipfs_internal: str = "http://127.0.0.1:8080"
     arweave_internal: str = "http://127.0.0.1:3000"
 
-    # Gateway base handed back to CONSUMERS (what appears in resolved URLs).
-    # Must be reachable by the consumer, so on a LAN set these to the box's IP
-    # — an IP, not an mDNS name: renderers like the FF1 don't resolve .local.
-    # Unset, they fall back to the internal gateways (fine for localhost use).
+    # Deprecated compatibility values used only when resolve_ref is called
+    # outside an HTTP request. The HTTP surface derives one public origin from
+    # the request (or explicitly trusted forwarded headers).
     ipfs_public_base: str = ""
     arweave_public_base: str = ""
+    trusted_proxy_headers: bool = False
+
+    # Curio's own HTTP backend. Its SQLite catalogue is authoritative for
+    # retention metadata; object files are addressed by their SHA-256 digest.
+    static_root: str = "/tmp/curio-media"
+    static_max_bytes: int = Field(default=1_073_741_824, gt=0)
+
+    # Empty means curator mutations are disabled rather than public.
+    curator_token: str = ""
 
     # Operator-curated exception registry (overrides.py, docs/design.md):
     # a TOML file mapping dead canonical refs to replacements. Empty disables
@@ -61,8 +69,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _default_public_to_internal(self) -> Settings:
-        self.ipfs_public_base = self.ipfs_public_base or self.ipfs_internal
-        self.arweave_public_base = self.arweave_public_base or self.arweave_internal
+        # HTTP requests replace these with their actual request origin. The
+        # fallback is the resolver front door for non-request callers (MCP),
+        # never an internal gateway address.
+        fallback = f"http://localhost:{self.port}"
+        self.ipfs_public_base = self.ipfs_public_base or fallback
+        self.arweave_public_base = self.arweave_public_base or fallback
         return self
 
 

@@ -137,8 +137,8 @@ async def test_pin_resolved_warms_arweave_and_skips_unresolved():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         arweave = Resolved("ar://TX123", "http://box:3000/TX123", "play", "arweave", True)
-        assert await pin_resolved(arweave, PIN_SETTINGS, client) == "warmed"
-        assert warmed == ["http://box:3000/TX123"]
+        assert await pin_resolved(arweave, PIN_SETTINGS, client) == "unsupported"
+        assert warmed == []  # r81 cache warming is not durable retention
 
         dead = Resolved("ipfs://bafyDEAD", "ipfs://bafyDEAD", "play", "ipfs", False)
         assert await pin_resolved(dead, PIN_SETTINGS, client) is None  # nothing fetched
@@ -190,7 +190,7 @@ def test_favorite_crud_round_trip(client):
     assert body["note"] == "hall screen"
     # a bare ipfs ref resolves mechanically (no network) but carries no title
     assert body["resolved"] is True
-    assert body["resolved_url"] == "http://box:8080/ipfs/bafyCID/art.png"
+    assert body["resolved_url"] == "http://testserver/ipfs/bafyCID/art.png"
     assert body["title"] is None
     assert body["pin_scheduled"] is True  # favoriting makes the bytes durable
 
@@ -200,7 +200,7 @@ def test_favorite_crud_round_trip(client):
     entry = listed["favorites"][0]
     assert entry["ref"] == "ipfs://bafyCID/art.png"
     assert entry["resolved"] is True
-    assert entry["resolved_url"] == "http://box:8080/ipfs/bafyCID/art.png"
+    assert entry["resolved_url"] == "http://testserver/ipfs/bafyCID/art.png"
     assert entry["playback_method"] == "play"
 
     removed = client.request(

@@ -1,163 +1,56 @@
 #!/bin/sh
-set -u
+set -eu
 
-COMPOSE_FILE=${CURIO_COMPOSE_FILE:-/opt/curio/compose.yaml}
-ENV_FILE=${CURIO_ENV_FILE:-/etc/curio/curio.env}
-PROJECT_NAME=${CURIO_PROJECT_NAME:-curio}
+DATA_HOME=${XDG_DATA_HOME:-"$HOME/.local/share"}
+CONFIG_HOME=${XDG_CONFIG_HOME:-"$HOME/.config"}
+APP_ROOT=${CURIO_APP_ROOT:-"$DATA_HOME/curio/app"}
+ENV_FILE=${CURIO_ENV_FILE:-"$CONFIG_HOME/curio/curio.env"}
 DOCKER_BIN=${CURIO_DOCKER_BIN:-docker}
-SERVICES="resolver kubo ar-io-core ar-io-envoy ar-io-redis ar-io-observer"
+PROJECT_NAME=${CURIO_PROJECT_NAME:-curio}
+COMPOSE_FILE=${CURIO_COMPOSE_FILE:-"$APP_ROOT/compose.yaml"}
 
-usage() {
-    cat <<'EOF'
-Usage:
-  curio start
-  curio stop
-  curio restart [service]
-  curio status
-  curio health
-  curio logs [service] [--follow] [--tail N]
-EOF
-}
-
-fail() {
-    echo "curio: $*" >&2
-    exit 1
-}
-
-compose() {
-    "$DOCKER_BIN" compose \
-        --project-name "$PROJECT_NAME" \
-        --env-file "$ENV_FILE" \
-        --file "$COMPOSE_FILE" \
-        "$@"
-}
-
-valid_service() {
-    wanted=$1
-    for service in $SERVICES; do
-        [ "$wanted" = "$service" ] && return 0
-    done
-    return 1
-}
-
+fail() { echo "curio: $*" >&2; exit 1; }
 require_installation() {
-    [ -f "$COMPOSE_FILE" ] || fail "installation not found: missing $COMPOSE_FILE"
-    [ -f "$ENV_FILE" ] || fail "configuration not found: missing $ENV_FILE"
-    command -v "$DOCKER_BIN" >/dev/null 2>&1 || fail "Docker is not installed or not in PATH"
-    "$DOCKER_BIN" compose version >/dev/null 2>&1 \
-        || fail "the Docker Compose plugin is unavailable"
+    [ -f "$COMPOSE_FILE" ] || fail "installation not found: $COMPOSE_FILE"
+    [ -f "$ENV_FILE" ] || fail "configuration not found: $ENV_FILE"
+    command -v "$DOCKER_BIN" >/dev/null 2>&1 || fail "Docker is not available"
 }
-
-show_health() {
-    result=0
-    for service in $SERVICES; do
-        container_id=$(compose ps --all --quiet "$service" 2>/dev/null || true)
-        if [ -z "$container_id" ]; then
-            echo "FAIL $service: no container"
-            result=1
-            continue
-        fi
-
-        state=$("$DOCKER_BIN" inspect --format '{{.State.Status}}' "$container_id" 2>/dev/null || true)
-        health=$("$DOCKER_BIN" inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id" 2>/dev/null || true)
-        if [ "$state" != "running" ]; then
-            echo "FAIL $service: ${state:-unknown state}"
-            result=1
-        elif [ "$health" = "unhealthy" ] || [ "$health" = "starting" ] || [ -z "$health" ]; then
-            echo "FAIL $service: health=${health:-unknown}"
-            result=1
-        else
-            if [ "$health" = "none" ]; then
-                echo "OK   $service: running"
-            else
-                echo "OK   $service: $health"
-            fi
-        fi
-    done
-
-    echo "--- resolver aggregate ---"
-    if ! compose exec -T resolver python - <<'PY'
-import json
-import sys
-import urllib.error
-import urllib.request
-
-try:
-    with urllib.request.urlopen("http://127.0.0.1:8090/healthz", timeout=5) as response:
-        payload = response.read().decode()
-        status = response.status
-except urllib.error.HTTPError as exc:
-    payload = exc.read().decode()
-    status = exc.code
-except Exception as exc:
-    print(f"FAIL resolver: {type(exc).__name__}: {exc}")
-    raise SystemExit(1)
-
-try:
-    print(json.dumps(json.loads(payload), indent=2, sort_keys=True))
-except json.JSONDecodeError:
-    print(payload)
-if status != 200:
-    raise SystemExit(1)
-PY
-    then
-        result=1
+compose() { "$DOCKER_BIN" compose --project-name "$PROJECT_NAME" --env-file "$ENV_FILE" --file "$COMPOSE_FILE" "$@"; }
+version() { [ -f "$APP_ROOT/VERSION" ] || fail "installed version is unavailable"; cat "$APP_ROOT/VERSION"; }
+release_base() { printf '%s' "${CURIO_RELEASE_BASE_URL:-https://github.com/${CURIO_GITHUB_REPOSITORY:-dmichael/curio}/releases}"; }
+check_update() {
+    command -v curl >/dev/null 2>&1 || fail "curl is required for update checks"
+    latest=$(curl -fsSL "$(release_base)/latest/download/VERSION" 2>/dev/null || true)
+    if [ -z "$latest" ]; then
+        echo "update check unavailable: release does not publish VERSION" >&2
+        return 1
     fi
-    return "$result"
+    current=$(version)
+    printf 'installed %s; latest %s\n' "$current" "$latest"
+    [ "v$current" != "$latest" ]
+}
+update() {
+    requested=${1:-}
+    [ -z "$requested" ] || case "$requested" in v[0-9]*.[0-9]*.[0-9]*) ;; *) fail "version must look like vX.Y.Z";; esac
+    require_installation
+    # The installed bootstrap verifies the archive checksum and checks that
+    # the archive package version agrees with the requested release tag.
+    CURIO_VERSION="$requested" "$APP_ROOT/install.sh"
 }
 
-require_installation
-
-command=${1:-}
-[ -n "$command" ] || { usage >&2; exit 2; }
-shift
-
+command=${1:-}; [ -n "$command" ] || fail "usage: curio {start|stop|restart|status|logs|health|version|update}"
+shift || true
 case "$command" in
-    start)
-        [ "$#" -eq 0 ] || fail "start does not accept a service; use restart [service]"
-        exec "$DOCKER_BIN" compose --project-name "$PROJECT_NAME" --env-file "$ENV_FILE" --file "$COMPOSE_FILE" up --detach
-        ;;
-    stop)
-        [ "$#" -eq 0 ] || fail "stop does not accept a service"
-        exec "$DOCKER_BIN" compose --project-name "$PROJECT_NAME" --env-file "$ENV_FILE" --file "$COMPOSE_FILE" stop
-        ;;
-    restart)
-        [ "$#" -le 1 ] || fail "restart accepts at most one service"
-        if [ "$#" -eq 1 ]; then
-            valid_service "$1" || fail "unknown service '$1' (want one of: $SERVICES)"
-        fi
-        exec "$DOCKER_BIN" compose --project-name "$PROJECT_NAME" --env-file "$ENV_FILE" --file "$COMPOSE_FILE" restart "$@"
-        ;;
-    status)
-        [ "$#" -eq 0 ] || fail "status does not accept arguments"
-        exec "$DOCKER_BIN" compose --project-name "$PROJECT_NAME" --env-file "$ENV_FILE" --file "$COMPOSE_FILE" ps
-        ;;
-    health)
-        [ "$#" -eq 0 ] || fail "health does not accept arguments"
-        show_health
-        ;;
-    logs)
-        service=""
-        if [ "$#" -gt 0 ]; then
-            case "$1" in
-                -*) ;;
-                *)
-                    valid_service "$1" || fail "unknown service '$1' (want one of: $SERVICES)"
-                    service=$1
-                    shift
-                    ;;
-            esac
-        fi
-        if [ -n "$service" ]; then
-            set -- "$@" "$service"
-        fi
-        exec "$DOCKER_BIN" compose --project-name "$PROJECT_NAME" --env-file "$ENV_FILE" --file "$COMPOSE_FILE" logs --tail 200 "$@"
-        ;;
-    -h|--help|help)
-        usage
-        ;;
-    *)
-        usage >&2
-        fail "unknown command '$command'"
-        ;;
+    version) [ "$#" -eq 0 ] || fail "version takes no arguments"; version ;;
+    update)
+        case "${1:-}" in
+            --check) [ "$#" -eq 1 ] || fail "update --check takes no other arguments"; check_update ;;
+            --version) [ "$#" -eq 2 ] || fail "usage: curio update --version vX.Y.Z"; update "$2" ;;
+            '') update ;;
+            *) fail "usage: curio update [--check|--version vX.Y.Z]" ;;
+        esac ;;
+    start|stop|status|logs) require_installation; exec compose "$command" "$@" ;;
+    restart) require_installation; exec compose restart "$@" ;;
+    health) require_installation; exec compose exec -T resolver python -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8090/healthz").read().decode())' ;;
+    *) fail "unknown command '$command'" ;;
 esac

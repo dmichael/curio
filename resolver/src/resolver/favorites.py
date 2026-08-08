@@ -197,10 +197,10 @@ def _parse(text: str) -> dict[str, dict[str, Any]]:
 
 
 async def _resolved(
-    record: dict[str, Any], settings: Settings, client: httpx.AsyncClient
+    record: dict[str, Any], settings: Settings, client: httpx.AsyncClient, origin: str | None = None
 ) -> dict[str, Any]:
     try:
-        result = await resolve_ref(record["ref"], settings, client)
+        result = await resolve_ref(record["ref"], settings, client, origin=origin)
     except Exception:
         return {**record, "resolved": False, "resolved_url": None, "playback_method": None}
     return {
@@ -214,7 +214,7 @@ async def _resolved(
 
 
 async def list_resolved(
-    favorites: Favorites, settings: Settings, client: httpx.AsyncClient
+    favorites: Favorites, settings: Settings, client: httpx.AsyncClient, origin: str | None = None
 ) -> list[dict[str, Any]]:
     """Every favorite with its live resolution attached.
 
@@ -224,7 +224,7 @@ async def list_resolved(
     entry (resolved: false) — one dead ref must not stall the list.
     """
     records = favorites.list_favorites()
-    return list(await asyncio.gather(*(_resolved(r, settings, client) for r in records)))
+    return list(await asyncio.gather(*(_resolved(r, settings, client, origin) for r in records)))
 
 
 @lru_cache

@@ -5,7 +5,6 @@ manager in the lifespan is start-once-per-process); settings vary per test
 via env + lru_cache clearing.
 """
 
-import json
 import tomllib
 
 import httpx
@@ -46,7 +45,7 @@ def test_override_crud_round_trip(client):
     assert body["replaced"] is False
     # disclosure: the (mechanical, no-network) replacement resolves
     assert body["replacement_resolved"] is True
-    assert body["replacement_resolved_url"] == "http://box:8080/ipfs/bafyALT/master.png"
+    assert body["replacement_resolved_url"] == "http://testserver/ipfs/bafyALT/master.png"
 
     listed = client.get("/override").json()
     assert listed["count"] == 1
@@ -62,7 +61,7 @@ def test_override_crud_round_trip(client):
     ).json()
     assert resolved["substituted"] is True
     assert resolved["substitution_status"] == "alternate-master"
-    assert resolved["resolved_url"] == "http://box:8080/ipfs/bafyALT/master.png"
+    assert resolved["resolved_url"] == "http://testserver/ipfs/bafyALT/master.png"
 
     removed = client.request("DELETE", "/override", params={"ref": "/ipfs/bafyDEAD/art.png"})
     assert removed.status_code == 200
@@ -123,11 +122,10 @@ def test_store_route_uploads_and_records(client, tmp_path):
         app_module.app.state.client = real
     assert response.status_code == 201
     body = response.json()
-    assert body["cid"] == "bafySTORED"
-    assert body["resolved_url"] == "http://box:8080/ipfs/bafySTORED"
-    record = json.loads((tmp_path / "captures" / "captures.jsonl").read_text())
-    assert record["source"] == "upload:m.png"
-    assert record["bytes"] == len(b"png-bytes")
+    assert body["source_kind"] == "upload"
+    assert body["keep_state"] == "kept"
+    assert body["media_url"].startswith("http://testserver/media/")
+    assert body["integrity"]["algorithm"] == "sha256"
 
 
 def test_store_route_disabled_without_capture_dir(http_client, monkeypatch):
@@ -135,7 +133,7 @@ def test_store_route_disabled_without_capture_dir(http_client, monkeypatch):
     get_settings.cache_clear()
     try:
         response = http_client.post("/store", files={"file": ("m.png", b"x", "image/png")})
-        assert response.status_code == 503
-        assert "RESOLVER_SEED_CAPTURE_DIR" in response.json()["error"]
+        assert response.status_code == 201
+        assert response.json()["source_kind"] == "upload"
     finally:
         get_settings.cache_clear()

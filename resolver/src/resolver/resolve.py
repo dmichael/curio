@@ -46,6 +46,7 @@ from .fixups import (
 )
 from .overrides import get_registry
 from .refs import arweave_parts, ipfs_parts
+from .static_store import StaticStore
 
 __all__ = ["Resolved", "resolve_ref", "pick_media_field", "external_url_ok"]
 
@@ -83,9 +84,17 @@ class Resolved:
     substituted: bool = False
     substituted_ref: str | None = None
     substitution_status: str | None = None
+    source_kind: str | None = None
+    keep_state: str = "cached"
+    integrity: dict[str, str] | None = None
 
     def as_dict(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        # media_url is the product contract; resolved_url remains temporarily
+        # for existing API consumers.
+        payload["media_url"] = self.resolved_url
+        payload["media_type"] = self.content_type
+        return payload
 
 
 def external_url_ok(url: str) -> bool:
@@ -196,6 +205,7 @@ async def resolve_ref(
     settings: Settings,
     client: httpx.AsyncClient,
     _depth: int = 0,
+    origin: str | None = None,
 ) -> Resolved:
     """Resolve a reference to a box-local playable URL.
 
@@ -204,6 +214,13 @@ async def resolve_ref(
     rather than raising.
     """
     ref = ref.strip()
+    if origin:
+        # Recursive resolver calls inherit this request origin through Settings,
+        # even where legacy helpers do not take an origin argument.
+        settings = settings.model_copy(update={
+            "ipfs_public_base": origin.rstrip("/"),
+            "arweave_public_base": origin.rstrip("/"),
+        })
     if _depth > _MAX_DEPTH:
         return Resolved(ref, ref, "play", None, False, note="recursion limit reached")
 
@@ -224,31 +241,35 @@ async def resolve_ref(
     ipfs = ipfs_parts(ref)
     if ipfs is not None:
         cid, path = ipfs
-        return await _resolve_ipfs(ref, cid, path, settings, client, _depth)
+        result = await _resolve_ipfs(ref, cid, path, settings, client, _depth, origin)
+        result.source_kind = result.source_kind or "ipfs"
+        return result
 
     arweave = arweave_parts(ref)
     if arweave is not None:
         txid, path = arweave
-        return await _resolve_arweave(ref, txid, path, settings, client, _depth)
+        result = await _resolve_arweave(ref, txid, path, settings, client, _depth, origin)
+        result.source_kind = result.source_kind or "arweave"
+        return result
 
     if ref.startswith("data:"):
-        return await _resolve_data_uri(ref, settings, client, _depth)
+        return await _resolve_data_uri(ref, settings, client, _depth, origin)
 
     parsed = urlparse(ref)
     if parsed.hostname in _VERSE_HOSTS and parsed.path.startswith("/artworks/"):
-        return await _resolve_verse(ref, settings, client, _depth)
+        return await _resolve_verse(ref, settings, client, _depth, origin)
 
     if parsed.scheme in {"http", "https"}:
-        return await _resolve_direct(ref, parsed.path, settings, client, _depth)
+        return await _resolve_direct(ref, parsed.path, settings, client, _depth, origin)
 
     return Resolved(ref, ref, "play", None, False, note="unrecognized reference")
 
 
 async def _resolve_ipfs(
-    ref: str, cid: str, path: str, settings: Settings, client, depth: int
+    ref: str, cid: str, path: str, settings: Settings, client, depth: int, origin: str | None
 ) -> Resolved:
     query = urlparse(ref).query
-    public = f"{settings.ipfs_public_base}/ipfs/{cid}{path}"
+    public = f"{origin.rstrip('/') if origin else settings.ipfs_public_base}/ipfs/{cid}{path}"
     internal = f"{settings.ipfs_internal}/ipfs/{cid}{path}"
     if query:
         public = f"{public}?{query}"
@@ -323,13 +344,13 @@ async def _resolve_ipfs_dir(
 
 
 async def _resolve_arweave(
-    ref: str, txid: str, path: str, settings: Settings, client, depth: int
+    ref: str, txid: str, path: str, settings: Settings, client, depth: int, origin: str | None
 ) -> Resolved:
     # The path is part of the identity: Arweave path manifests resolve
     # txid/sub/path to a distinct resource (e.g. per-token metadata files
     # beneath one manifest txid).
     query = urlparse(ref).query
-    public = f"{settings.arweave_public_base}/{txid}{path}"
+    public = f"{origin.rstrip('/') if origin else settings.arweave_public_base}/arweave/{txid}{path}"
     internal = f"{settings.arweave_internal}/{txid}{path}"
     if query:
         public = f"{public}?{query}"
@@ -345,26 +366,40 @@ async def _resolve_arweave(
 
 
 async def _resolve_direct(
-    ref: str, path: str, settings: Settings, client, depth: int
+    ref: str, path: str, settings: Settings, client, depth: int, origin: str | None
 ) -> Resolved:
     seg = path.rsplit("/", 1)[-1]
     ext = extension_of(seg)
-    if ext in KNOWN_EXTENSIONS and ext != "json":
-        return Resolved(ref, ref, infer_playback_method(path), None, True)
     if not external_url_ok(ref):
         # Everything past here fetches/probes the URL — refuse internal targets.
         return Resolved(ref, ref, "play", None, False, note="refusing to fetch internal/private URL")
     if ext == "json":
         return await _resolve_token_metadata(ref, ref, "token-metadata", settings, client, depth)
 
-    headers = await probe_headers(client, ref)
-    content_type = headers.get("content-type") if headers is not None else None
-    main = _main_content_type(content_type)
-
-    if main == "application/json":
-        return await _resolve_token_metadata(ref, ref, "token-metadata", settings, client, depth)
-    method = "send" if main == "text/html" else infer_playback_method(path)
-    return Resolved(ref, ref, method, None, True, content_type=content_type)
+    # HTTP is copied to Curio's static backend; it is never added to Kubo.
+    try:
+        async with client.stream("GET", ref, follow_redirects=False) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("content-type")
+            if _main_content_type(content_type) == "application/json":
+                text = await _bounded_text(client, ref, settings.fetch_max_bytes)
+                return await _resolve_metadata_dict(ref, json.loads(text), "token-metadata", settings, client, depth)
+            chunks: list[bytes] = []
+            size = 0
+            async for chunk in response.aiter_bytes(65536):
+                size += len(chunk)
+                if size > settings.static_max_bytes:
+                    raise ValueError(f"response larger than {settings.static_max_bytes} bytes")
+                chunks.append(chunk)
+    except (httpx.HTTPError, ValueError) as exc:
+        return Resolved(ref, ref, "play", "http", False, note=f"media fetch failed: {exc}", source_kind="http")
+    entry = StaticStore(settings.static_root).put(b"".join(chunks), media_type=content_type,
+        filename=seg or None, source_ref=ref)
+    public_origin = origin.rstrip("/") if origin else settings.ipfs_public_base.rstrip("/")
+    url = f"{public_origin}/media/{entry['id']}"
+    method = "send" if _main_content_type(content_type) == "text/html" else infer_playback_method(path)
+    return Resolved(ref, url, method, "http", True, content_type=content_type, source_kind="http",
+        integrity={"algorithm": "sha256", "digest": str(entry["digest"])})
 
 
 async def _resolve_token_metadata(
@@ -402,7 +437,7 @@ _DATA_URI_RE = re.compile(r"^data:([^,]*),(.*)$", re.DOTALL)
 
 
 async def _resolve_data_uri(
-    ref: str, settings: Settings, client, depth: int
+    ref: str, settings: Settings, client, depth: int, origin: str | None
 ) -> Resolved:
     """RFC 2397 data: URIs — the tokenURI form of fully on-chain works.
 
@@ -431,8 +466,15 @@ async def _resolve_data_uri(
             return Resolved(ref, ref, "play", "data", False, note="metadata is not a JSON object")
         return await _resolve_metadata_dict(ref, metadata, "data", settings, client, depth)
 
+    try:
+        data = base64.b64decode(payload, validate=True) if is_base64 else unquote(payload).encode()
+    except ValueError as exc:
+        return Resolved(ref, ref, "play", "data", False, note=f"data: URI decode failed: {exc}")
+    entry = StaticStore(settings.static_root).put(data, media_type=mediatype, filename=None, source_ref=ref)
+    base = origin.rstrip("/") if origin else settings.ipfs_public_base.rstrip("/")
     method = "send" if mediatype == "text/html" else "play"
-    return Resolved(ref, ref, method, "data", True, content_type=mediatype)
+    return Resolved(ref, f"{base}/media/{entry['id']}", method, "data", True, content_type=mediatype,
+        source_kind="data", integrity={"algorithm": "sha256", "digest": str(entry["digest"])})
 
 
 def pick_media_field(metadata: dict[str, Any]) -> str | None:
@@ -473,7 +515,7 @@ def _verse_scrape_urls(ref: str) -> list[str]:
 
 
 async def _resolve_verse(
-    ref: str, settings: Settings, client, depth: int
+    ref: str, settings: Settings, client, depth: int, origin: str | None
 ) -> Resolved:
     note = "no tokenUri/iframeUrl/og:image found in verse page"
     for page_url in _verse_scrape_urls(ref):

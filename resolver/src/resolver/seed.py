@@ -1,20 +1,14 @@
-"""Seed the box's caches from a wallet: pin IPFS media, warm the Arweave cache.
+"""Seed native IPFS references discovered from a wallet.
 
 `POST /seed?ref=<0x…|name.eth|tz1…|name.tez>` enumerates the wallet's NFTs
 (wallets.py: Blockscout for Ethereum, TzKT for Tezos — keyless public APIs),
 extracts every content-addressed media reference from token metadata, then:
 
   - IPFS refs    -> `pin add` on the box's Kubo API (fetches and keeps the DAG)
-  - Arweave refs -> a full GET through the box's ar-io gateway (caches on read)
-  - plain http   -> captured into Kubo with provenance recorded (when
-    `seed_capture_dir` is set), else counted as skipped
+  - Arweave refs -> reported as cache-only (r81 cannot retain selected data)
+  - plain http   -> skipped; curator action stores it in Curio's static backend
 
-Capture exists because unhashed HTTP media is exactly what vanishes without
-recourse: there is no content address to recover against once the domain
-dies. Capturing while the URL still answers records source, time, size,
-sha256, and the new CID — the strongest provenance an unhashed work can get.
-Serving a captured copy later is an operator decision made in the override
-registry (overrides.py), never automatic.
+Wallet seeding never moves ordinary HTTP bytes into IPFS.
 
 Seeding is a background job: POST returns 202 with a job id immediately;
 poll GET /seed/{id}. Jobs live in memory only — a restart forgets history
@@ -37,7 +31,7 @@ from datetime import datetime, timezone
 import httpx
 
 from .config import Settings
-from .library import _captured_sources, captures_file, ingest_url, keep_task, record_warm
+from .library import ingest_url, keep_task, record_warm
 from .refs import arweave_txid, ipfs_parts
 from .resolve import external_url_ok
 from .wallets import (
@@ -68,7 +62,7 @@ class SeedJob:
     pinned: int = 0
     recovered: int = 0  # pinned via HTTP-copy recovery after IPFS fetch failed
     warmed: int = 0
-    captured: int = 0  # unhashed HTTP media archived into Kubo with provenance
+    captured: int = 0  # retained for wire compatibility; automatic capture is disabled
     skipped: int = 0
     failed: int = 0
     errors: list[str] = field(default_factory=list)
@@ -211,7 +205,8 @@ async def _run_seed_inner(
     items = _enumerator(job.chain, job.scope, job.include_burned)
     cids: dict[str, list[str]] = {}  # cid -> HTTP source URLs (ordered de-dupe)
     txids: dict[str, None] = {}
-    captures: dict[str, None] = {}  # unhashed HTTP media (ordered de-dupe)
+    # Ordinary HTTP belongs to Curio's static backend when explicitly kept;
+    # wallet seeding never publishes or copies it into IPFS.
     async for item in items(job.address, settings, client):
         job.tokens += 1
         for ref in _media_refs(item):
@@ -229,19 +224,16 @@ async def _run_seed_inner(
             if txid is not None:
                 txids[txid] = None
                 continue
-            if settings.seed_capture_dir and external_url_ok(ref):
-                captures[ref] = None
-                continue
             job.skipped += 1
         if limit is not None and job.tokens >= limit:
             break
 
-    already_captured = _captured_sources(settings) if captures else set()
     sem = asyncio.Semaphore(settings.seed_concurrency)
+    # r81 cannot promote a transaction cache entry to durable retention.
+    # Do not imply preservation by issuing an ordinary cache warm.
+    job.skipped += len(txids)
     await asyncio.gather(
         *(_pin_cid(cid, sources, job, settings, client, sem) for cid, sources in cids.items()),
-        *(_warm_txid(txid, job, settings, client, sem) for txid in txids),
-        *(_capture_url(url, job, settings, client, sem, already_captured) for url in captures),
     )
 
 
@@ -366,50 +358,3 @@ async def _warm_txid(
             job.failed += 1
             _note_error(job, f"warm {txid}: {type(exc).__name__}: {exc}")
             _log.warning("seed %s: warm %s failed: %s: %s", job.id, txid, type(exc).__name__, exc)
-
-
-async def _capture_url(
-    url: str,
-    job: SeedJob,
-    settings: Settings,
-    client: httpx.AsyncClient,
-    sem: asyncio.Semaphore,
-    already: set[str],
-) -> None:
-    """Archive an unhashed HTTP media ref while its URL still answers.
-
-    Bytes go into Kubo (added with CIDv1 and pinned); provenance — source
-    URL, capture time, size, sha256, content type, the new CID — is appended
-    to captures.jsonl. The captured copy is never served automatically:
-    pointing a dead canonical ref at it is an operator decision, made in the
-    override registry with status `captured-original`.
-    """
-    async with sem:
-        if url in already:
-            job.captured += 1  # idempotent, like re-pinning
-            return
-        try:
-            ingested = await ingest_url(
-                client, url, settings, add_params={"cid-version": "1"}, compute_sha256=True
-            )
-            record = {
-                "source": url,
-                "cid": ingested.cid,
-                "sha256": ingested.sha256,
-                "bytes": ingested.size,
-                "content_type": ingested.content_type,
-                "captured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "wallet": job.ref,
-            }
-            path = captures_file(settings)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a") as fh:
-                fh.write(json.dumps(record) + "\n")
-        except (httpx.HTTPError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
-            job.failed += 1
-            _note_error(job, f"capture {url}: {type(exc).__name__}: {exc}")
-            _log.warning("seed %s: capture %s failed: %s: %s", job.id, url, type(exc).__name__, exc)
-            return
-        already.add(url)
-        job.captured += 1
-        _log.info("seed %s: captured %s -> %s (%d bytes)", job.id, url, ingested.cid, ingested.size)

@@ -69,6 +69,7 @@ async def test_mcp_override_tools_round_trip(override_env):
                 "replacement": "ipfs://bafyALT/master.png",
                 "status": "alternate-master",
                 "note": "test master",
+                "curator_token": "test-curator-token",
             },
         )
         assert added["replaced"] is False
@@ -78,7 +79,7 @@ async def test_mcp_override_tools_round_trip(override_env):
         assert listed["count"] == 1
         assert listed["entries"][0]["note"] == "test master"
 
-        removed = await call("remove_override", {"ref": "/ipfs/bafyDEAD/art.png"})
+        removed = await call("remove_override", {"ref": "/ipfs/bafyDEAD/art.png", "curator_token": "test-curator-token"})
         assert removed["removed"]["ref"] == "ipfs://bafyDEAD/art.png"
         assert (await call("list_overrides", {}))["count"] == 0
 
@@ -97,7 +98,7 @@ async def test_mcp_favorite_tools_round_trip(favorites_env):
     async with no_net() as client:
         mcp_server.set_client(client)
         added = await call(
-            "add_favorite", {"ref": "ipfs://bafyFAV/art.png", "note": "living room"}
+            "add_favorite", {"ref": "ipfs://bafyFAV/art.png", "note": "living room", "curator_token": "test-curator-token"}
         )
         assert added["key"] == "ipfs://bafyFAV/art.png"
         assert added["resolved"] is True
@@ -109,7 +110,7 @@ async def test_mcp_favorite_tools_round_trip(favorites_env):
         assert listed["favorites"][0]["resolved"] is True
         assert listed["favorites"][0]["resolved_url"].endswith("/ipfs/bafyFAV/art.png")
 
-        removed = await call("remove_favorite", {"ref": "/ipfs/bafyFAV/art.png"})
+        removed = await call("remove_favorite", {"ref": "/ipfs/bafyFAV/art.png", "curator_token": "test-curator-token"})
         assert removed["removed"]["ref"] == "ipfs://bafyFAV/art.png"
         assert (await call("list_favorites", {}))["count"] == 0
 
@@ -126,8 +127,8 @@ async def test_mcp_library_status_smoke():
         mcp_server.set_client(client)
         payload = await call("library_status", {})
     assert payload["ipfs"] == {"pinned": 1, "repo_size_bytes": 4096, "repo_objects": 12}
-    # capture disabled by default: empty ledger, no eviction note
-    assert payload["arweave"] == {"known_warmed": 0, "currently_cached": 0}
+    assert payload["arweave"]["kept"] == "unsupported"
+    assert "r81" in payload["arweave"]["technical_blocker"]
     assert payload["registry"] == {"overrides": None, "favorites": None, "captures": None}
 
 

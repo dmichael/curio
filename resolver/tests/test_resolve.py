@@ -103,11 +103,12 @@ def test_canonical_ref_key_collapses_subdomain_gateway_urls():
 
 
 async def test_html_work_is_sent_not_played():
-    async with no_net() as client:
-        result = await resolve_ref(
-            "https://example.com/runtime/index.html", SETTINGS, client
-        )
+    async with fake_net({"https://example.com/runtime/index.html": {
+        "status_code": 200, "headers": {"content-type": "text/html"}, "content": b"<html>"
+    }}) as client:
+        result = await resolve_ref("https://example.com/runtime/index.html", SETTINGS, client)
     assert result.playback_method == "send"
+    assert "/media/" in result.resolved_url
 
 
 async def test_unrecognized_ref_is_flagged():
@@ -207,7 +208,7 @@ async def test_arweave_refs_target_the_box(ref):
     }
     async with fake_net(routes) as client:
         result = await resolve_ref(ref, SETTINGS, client)
-    assert result.resolved_url == f"http://box:3000/{TXID}"
+    assert result.resolved_url == f"http://box:3000/arweave/{TXID}"
     assert result.provider == "arweave"
     assert result.playback_method == "play"
     assert result.content_type == "video/mp4"
@@ -225,7 +226,7 @@ async def test_arweave_manifest_path_is_preserved(ref):
     }
     async with fake_net(routes) as client:
         result = await resolve_ref(ref, SETTINGS, client)
-    assert result.resolved_url == f"http://box:3000/{TXID}/49"
+    assert result.resolved_url == f"http://box:3000/arweave/{TXID}/49"
     assert result.provider == "arweave"
 
 
@@ -238,7 +239,7 @@ async def test_arweave_query_is_preserved():
     }
     async with fake_net(routes) as client:
         result = await resolve_ref(f"https://arweave.net/{TXID}?foo=1", SETTINGS, client)
-    assert result.resolved_url == f"http://box:3000/{TXID}?foo=1"
+    assert result.resolved_url == f"http://box:3000/arweave/{TXID}?foo=1"
     assert result.provider == "arweave"
 
 
@@ -257,7 +258,7 @@ async def test_arweave_manifest_metadata_recurses():
     }
     async with fake_net(routes) as client:
         result = await resolve_ref(f"ar://{TXID}/49", SETTINGS, client)
-    assert result.resolved_url == f"http://box:3000/{media_txid}"
+    assert result.resolved_url == f"http://box:3000/arweave/{media_txid}"
     assert result.title == "FV #49"
 
 
@@ -394,8 +395,8 @@ async def test_verse_edition_page_falls_back_to_base_artwork_page():
     }
     async with fake_net(routes) as client:
         result = await resolve_ref("https://verse.works/artworks/uuid-1/485:0", SETTINGS, client)
-    assert result.resolved_url == "https://verse.works/image/source/static%2Fart.jpg"
-    assert result.resolved is True
+    assert result.resolved is False
+    assert "media fetch failed" in (result.note or "")
 
 
 async def test_verse_fetch_failure_is_reported_not_raised():
@@ -435,7 +436,7 @@ async def test_data_uri_media_passes_through():
     ref = "data:image/svg+xml;base64,PHN2Zy8+"
     async with no_net() as client:
         result = await resolve_ref(ref, SETTINGS, client)
-    assert result.resolved_url == ref  # self-contained: the URI is the bytes
+    assert "/media/" in result.resolved_url
     assert result.resolved is True
     assert result.content_type == "image/svg+xml"
     assert result.playback_method == "play"

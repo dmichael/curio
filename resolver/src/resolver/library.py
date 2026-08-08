@@ -19,7 +19,6 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple
-from urllib.parse import urlparse
 
 import httpx
 
@@ -124,18 +123,10 @@ async def pin_resolved(
         response.raise_for_status()
         return "pinned"
     if result.provider == "arweave":
-        async with client.stream(
-            "GET", result.resolved_url, timeout=settings.seed_pin_timeout
-        ) as response:
-            response.raise_for_status()
-            async for _ in response.aiter_bytes(65536):
-                pass
-        # The resolved URL is the box gateway's /{txid}[/path]; the ledger
-        # tracks the txid — the unit the cache (and /library) checks.
-        txid = urlparse(result.resolved_url).path.lstrip("/").partition("/")[0]
-        if txid:
-            record_warm(txid, settings, why=why)
-        return "warmed"
+        # AR.IO r81 can warm a cache by reading, but exposes no supported
+        # selected-object retention control. Calling that durable would be
+        # dishonest, so a keep action fails rather than merely warming it.
+        return "unsupported"
     return None
 
 
@@ -278,7 +269,8 @@ async def _ipfs_status(settings: Settings, client: httpx.AsyncClient) -> dict[st
 async def _arweave_status(settings: Settings, client: httpx.AsyncClient) -> dict[str, Any]:
     txids = warmed_txids(settings)
     if not txids:
-        return {"known_warmed": 0, "currently_cached": 0}
+        return {"kept": "unsupported", "technical_blocker":
+                "AR.IO r81 exposes no selected-data eviction protection API", "known_cached": 0}
     sem = asyncio.Semaphore(settings.seed_concurrency)
 
     async def cached(txid: str) -> bool:

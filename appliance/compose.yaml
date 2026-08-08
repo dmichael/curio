@@ -2,39 +2,37 @@ name: curio
 
 services:
   resolver:
-    image: curio-resolver:0.1.0
+    image: curio-resolver:0.2.0
     build:
-      context: ${CURIO_RESOLVER_BUILD_CONTEXT:-/opt/curio/resolver}
+      context: ${CURIO_APP_ROOT:?set CURIO_APP_ROOT}/resolver
       dockerfile: Dockerfile
     restart: unless-stopped
+    user: "${CURIO_HOST_UID:?set CURIO_HOST_UID}:${CURIO_HOST_GID:?set CURIO_HOST_GID}"
     environment:
       RESOLVER_HOST: 0.0.0.0
       RESOLVER_PORT: "8090"
       RESOLVER_IPFS_INTERNAL: http://kubo:8080
       RESOLVER_IPFS_API: http://kubo:5001
       RESOLVER_ARWEAVE_INTERNAL: http://ar-io-envoy:3000
-      RESOLVER_IPFS_PUBLIC_BASE: http://${CURIO_LAN_ADDRESS:?set CURIO_LAN_ADDRESS in curio.env}:8080
-      RESOLVER_ARWEAVE_PUBLIC_BASE: http://${CURIO_LAN_ADDRESS:?set CURIO_LAN_ADDRESS in curio.env}:3000
+      RESOLVER_STATIC_ROOT: /state/media
       RESOLVER_OVERRIDES_PATH: /state/overrides.toml
       RESOLVER_FAVORITES_PATH: /state/favorites.json
-      RESOLVER_SEED_CAPTURE_DIR: /state/captures
+      RESOLVER_CURATOR_TOKEN: ${CURIO_CURATOR_TOKEN:?set CURIO_CURATOR_TOKEN in curio.env}
+      RESOLVER_TRUSTED_PROXY_HEADERS: ${CURIO_TRUSTED_PROXY_HEADERS:-false}
     volumes:
       - type: bind
-        source: ${CURIO_DATA_ROOT:-/var/lib/curio}/resolver
+        source: ${CURIO_DATA_ROOT:?set CURIO_DATA_ROOT}
         target: /state
     ports:
-      - "8090:8090"
+      - "${CURIO_PORT:-8090}:8090"
     depends_on:
-      kubo:
-        condition: service_healthy
-      ar-io-envoy:
-        condition: service_healthy
-    networks:
-      - curio
+      kubo: {condition: service_healthy}
+      ar-io-envoy: {condition: service_healthy}
+    networks: [curio]
 
   kubo:
     image: ipfs/kubo:v0.40.1@sha256:9c70a3dba0b5f362bf99317a02384a194f5c91cf5388abdb8fe7d64d83dd20bb
-    user: "1000:100"
+    user: "${CURIO_HOST_UID:?set CURIO_HOST_UID}:${CURIO_HOST_GID:?set CURIO_HOST_GID}"
     restart: unless-stopped
     environment:
       IPFS_PATH: /data/ipfs
@@ -42,149 +40,68 @@ services:
       CURIO_IPFS_STORAGE_MAX: ${CURIO_IPFS_STORAGE_MAX:-20GB}
     volumes:
       - type: bind
-        source: ${CURIO_DATA_ROOT:-/var/lib/curio}/ipfs
+        source: ${CURIO_DATA_ROOT}/ipfs
         target: /data/ipfs
       - type: bind
-        source: ${CURIO_APPLIANCE_ROOT:-/opt/curio}/kubo-init.sh
+        source: ${CURIO_APP_ROOT}/kubo-init.sh
         target: /container-init.d/10-curio-config.sh
         read_only: true
+    # Gateway/API remain private. Swarm is an intentional participation endpoint.
     ports:
-      - "8080:8080"
+      - "4001:4001/tcp"
+      - "4001:4001/udp"
     healthcheck:
       test: ["CMD-SHELL", "ipfs --api=/ip4/127.0.0.1/tcp/5001 id >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       start_period: 15s
       retries: 12
-    networks:
-      - curio
+    networks: [curio]
 
   ar-io-redis:
     image: redis:7.4.7-alpine@sha256:02f2cc4882f8bf87c79a220ac958f58c700bdec0dfb9b9ea61b62fb0e8f1bfcf
-    user: "999:1000"
+    user: "${CURIO_HOST_UID:?set CURIO_HOST_UID}:${CURIO_HOST_GID:?set CURIO_HOST_GID}"
     restart: unless-stopped
-    command:
-      - redis-server
-      - --maxmemory
-      - ${CURIO_REDIS_MAX_MEMORY:-256mb}
-      - --maxmemory-policy
-      - allkeys-lru
-      - --save
-      - ""
-      - --appendonly
-      - "no"
+    command: [redis-server, --maxmemory, "${CURIO_REDIS_MAX_MEMORY:-256mb}", --maxmemory-policy, allkeys-lru, --save, "", --appendonly, "no"]
     volumes:
       - type: bind
-        source: ${CURIO_DATA_ROOT:-/var/lib/curio}/ar-io/redis
+        source: ${CURIO_DATA_ROOT}/ar-io/redis
         target: /data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-    networks:
-      - curio
+    networks: [curio]
 
   ar-io-core:
     image: ghcr.io/ar-io/ar-io-core:f3032933c6039305bc5ecec0d486526c6d60d6ea@sha256:1155d2042870e6ba2c1457258765c16b762fe66026e4a42799abfca3b5d0d900
     restart: unless-stopped
     env_file:
-      - ${CURIO_DATA_ROOT:-/var/lib/curio}/ar-io/start-height.env
+      - "${CURIO_DATA_ROOT}/ar-io/start-height.env"
     environment:
       NODE_ENV: production
-      # SBCs and the disposable VM may have IPv6 DNS answers but no usable
-      # IPv6 route. Try IPv4 first so gateway fallbacks do not burn the entire
-      # upstream request window on an unreachable address.
       NODE_OPTIONS: --dns-result-order=ipv4first
-      LOG_LEVEL: ${CURIO_AR_IO_LOG_LEVEL:-info}
-      LOG_FORMAT: simple
       TRUSTED_NODE_URL: http://ar-io-envoy:3000
-      # Prefer trusted AR.IO gateways, but do not let one timeout plus an
-      # arweave.net rate limit disable cold retrieval. Lower fallback tiers are
-      # explicitly untrusted so core retains their provenance classification.
-      TRUSTED_GATEWAYS_URLS: '{"https://ar-io.dev":1,"https://turbo-gateway.com":2,"https://permagate.io":{"priority":3,"trusted":false},"https://arweave.net":{"priority":4,"trusted":false}}'
-      ANS104_UNBUNDLE_FILTER: '{"never":true}'
-      ANS104_INDEX_FILTER: '{"never":true}'
-      RUN_OBSERVER: "false"
-      ON_DEMAND_RETRIEVAL_ORDER: trusted-gateways,ar-io-network,chunks-offset-aware,tx-data
       CHAIN_CACHE_TYPE: redis
       REDIS_CACHE_URL: redis://ar-io-redis:6379
       CONTIGUOUS_DATA_CACHE_CLEANUP_THRESHOLD: ${CURIO_AR_IO_CACHE_CLEANUP_THRESHOLD:-2592000}
     volumes:
       - type: bind
-        source: ${CURIO_DATA_ROOT:-/var/lib/curio}/ar-io
+        source: ${CURIO_DATA_ROOT}/ar-io
         target: /app/data
-    depends_on:
-      ar-io-redis:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "/bin/sh", "/app/healthcheck.sh"]
-      interval: 10s
-      timeout: 5s
-      start_period: 30s
-      retries: 30
-    networks:
-      - curio
-
-  # Envoy r81 has a STRICT_DNS observer cluster and its upstream Compose file
-  # depends on an observer service. Keep the name resolvable, but run no
-  # observer code and mount no wallets or observer state.
-  ar-io-observer:
-    image: ghcr.io/ar-io/ar-io-observer:308b6777d0df4a45f59a1984bcb0874a50f58965@sha256:53fa690e402313561fa9dd3ce6868ffd2f5b9e5688d4eead50da57c90192798e
-    restart: unless-stopped
-    entrypoint: ["/bin/sh", "-c"]
-    command: ["echo 'AR.IO observer disabled for Curio'; exec sleep infinity"]
-    healthcheck:
-      disable: true
-    networks:
-      - curio
+    depends_on: [ar-io-redis]
+    networks: [curio]
 
   ar-io-envoy:
     image: ghcr.io/ar-io/ar-io-envoy:bd738a2435f1293e259dfcbb4ef42f50b26545da@sha256:ffbf849370ed24b2dfecab2ceef733bf1fb67da2d14b4909063d788cc8f72282
     restart: unless-stopped
     environment:
-      LOG_LEVEL: ${CURIO_AR_IO_ENVOY_LOG_LEVEL:-info}
       TVAL_AR_IO_HOST: ar-io-core
       TVAL_AR_IO_PORT: "4000"
-      TVAL_OBSERVER_HOST: ar-io-observer
-      TVAL_OBSERVER_PORT: "5050"
       TVAL_TRUSTED_NODE_HOST: arweave.net
       TVAL_TRUSTED_NODE_PORT: "443"
-      TVAL_FALLBACK_NODE_HOST: peers.arweave.xyz
-      TVAL_FALLBACK_NODE_PORT: "1984"
-      TVAL_GRAPHQL_HOST: ar-io-core
-      TVAL_GRAPHQL_PORT: "4000"
-      TVAL_GRAPHQL_HOST_HEADER: ""
-      TVAL_DATASETS_HOST: ar-io-core
-      TVAL_DATASETS_PORT: "4000"
-      TVAL_ARNS_ROOT_HOST: ""
-      TVAL_ARWEAVE_POST_DRY_RUN: "false"
-      TVAL_ENABLE_ARWEAVE_PEER_EDS: "true"
-      TVAL_ARWEAVE_PEER_DNS_RECORDS: peers.arweave.xyz
-      TVAL_ARWEAVE_PEER_DNS_PORT: "1984"
-      TVAL_ARIO_GATEWAY_UPSTREAM_IDLE_TIMEOUT: 55s
     volumes:
       - type: bind
-        source: ${CURIO_DATA_ROOT:-/var/lib/curio}/ar-io/envoy-eds
+        source: ${CURIO_DATA_ROOT}/ar-io/envoy-eds
         target: /data/envoy-eds
-    ports:
-      - "3000:3000"
-    depends_on:
-      # Core's trusted-node path points back through Envoy, as in upstream r81.
-      # Start Envoy once core exists; requiring core health here would create a
-      # needless startup cycle. Envoy's own health check proves the full path.
-      ar-io-core:
-        condition: service_started
-      ar-io-observer:
-        condition: service_started
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/ar-io/info"]
-      interval: 10s
-      timeout: 5s
-      start_period: 10s
-      retries: 12
-    networks:
-      - curio
+    depends_on: [ar-io-core]
+    networks: [curio]
 
 networks:
   curio:

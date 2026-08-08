@@ -59,8 +59,16 @@ def _require_client() -> httpx.AsyncClient:
     return _client
 
 
+def _require_curator(token: str | None) -> None:
+    configured = get_settings().curator_token
+    if not configured or token != configured:
+        raise ValueError("curator authentication required")
+
+
 @mcp.tool()
-async def resolve(ref: str, pin: bool = False) -> dict[str, Any]:
+async def resolve(
+    ref: str, pin: bool = False, curator_token: str | None = None
+) -> dict[str, Any]:
     """Resolve any media reference into a LAN-playable URL.
 
     Accepts ipfs://…, /ipfs/…, any gateway URL, ar://txid[/path],
@@ -79,6 +87,7 @@ async def resolve(ref: str, pin: bool = False) -> dict[str, Any]:
     result = await resolve_ref(ref, get_settings(), _require_client())
     payload = result.as_dict()
     if pin:
+        _require_curator(curator_token)
         if result.resolved:
             pin_in_background(result, get_settings(), _require_client(), why="resolve pin")
         payload["pin_scheduled"] = result.resolved
@@ -93,6 +102,7 @@ async def wallet_tokens(
     scope: str = "held",
     status: bool = False,
     include_burned: bool = False,
+    curator_token: str | None = None,
 ) -> dict[str, Any]:
     """List a wallet's NFTs live from the public indexers (browse/pick step).
 
@@ -126,6 +136,7 @@ async def wallet_tokens(
     if result is None:
         raise ValueError("not a wallet-shaped reference (want 0x…, name.eth, tz1…, or name.tez)")
     if pin:
+        _require_curator(curator_token)
         job = await start_seed(
             ref, get_settings(), _require_client(),
             limit=limit, scope=scope, include_burned=include_burned,
@@ -136,7 +147,8 @@ async def wallet_tokens(
 
 @mcp.tool()
 async def seed_wallet(
-    ref: str, limit: int | None = None, scope: str = "held", include_burned: bool = False
+    ref: str, limit: int | None = None, scope: str = "held", include_burned: bool = False,
+    curator_token: str | None = None,
 ) -> dict[str, Any]:
     """Seed the box's caches from a wallet (background job).
 
@@ -156,6 +168,7 @@ async def seed_wallet(
     0x…/KT1… contract address, both chains) — the way to sweep a publication
     contract on ETH, where no keyless creator index exists.
     """
+    _require_curator(curator_token)
     job = await start_seed(
         ref, get_settings(), _require_client(),
         limit=limit, scope=scope, include_burned=include_burned,
@@ -204,6 +217,7 @@ async def add_override(
     captured: str | None = None,
     note: str | None = None,
     replace: bool = False,
+    curator_token: str | None = None,
 ) -> dict[str, Any]:
     """Point a dead canonical ref at replacement content — an operator
     decision, always disclosed in resolve results (substituted=true).
@@ -221,6 +235,7 @@ async def add_override(
     same ref errors unless replace=true. The response's replacement_resolved
     tells you whether the replacement actually resolves right now.
     """
+    _require_curator(curator_token)
     entry = validate_entry(
         {
             "ref": ref,
@@ -251,11 +266,12 @@ async def add_override(
 
 
 @mcp.tool()
-async def remove_override(ref: str) -> dict[str, Any]:
+async def remove_override(ref: str, curator_token: str | None = None) -> dict[str, Any]:
     """Remove the override for a ref (any spelling of it). The dead canonical
     ref goes back to resolving as itself — i.e. failing — so only remove an
     entry when the canonical content is available again or the substitution
     was wrong."""
+    _require_curator(curator_token)
     try:
         removed = _require_registry().remove(ref)
     except OverrideError as exc:
@@ -284,7 +300,9 @@ async def list_favorites() -> dict[str, Any]:
 
 
 @mcp.tool()
-async def add_favorite(ref: str, note: str | None = None) -> dict[str, Any]:
+async def add_favorite(
+    ref: str, note: str | None = None, curator_token: str | None = None
+) -> dict[str, Any]:
     """Mark a media reference as a household favorite.
 
     ref accepts any spelling of the content (ipfs://CID, /ipfs/CID, gateway
@@ -297,6 +315,7 @@ async def add_favorite(ref: str, note: str | None = None) -> dict[str, Any]:
     (Arweave) in the background — `pin_scheduled` reports it. Removing a
     favorite never unpins. Use note for why it was picked.
     """
+    _require_curator(curator_token)
     favorites = _require_favorites()
     try:
         # Enrichment, never a gate: a resolve hiccup must not block the pick.
@@ -318,9 +337,10 @@ async def add_favorite(ref: str, note: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def remove_favorite(ref: str) -> dict[str, Any]:
+async def remove_favorite(ref: str, curator_token: str | None = None) -> dict[str, Any]:
     """Remove a favorite by its ref (any spelling of the same content
     matches). Only unmarks the pick — nothing is unpinned or deleted."""
+    _require_curator(curator_token)
     try:
         removed = _require_favorites().remove(ref)
     except FavoriteError as exc:

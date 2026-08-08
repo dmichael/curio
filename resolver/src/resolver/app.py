@@ -22,16 +22,22 @@ Schema docs are FastAPI's stock /docs + /openapi.json.
 
 from __future__ import annotations
 
-import json
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from importlib import metadata
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Query, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, UploadFile
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from .config import get_settings
 from .favorites import (
@@ -56,14 +62,16 @@ from .overrides import (
 from .refs import canonical_ref_key
 from .resolve import resolve_ref
 from .seed import TooManySeedJobs, get_job, list_jobs, start_seed
-from .store import CidMismatch, store_upload
+from .static_store import StaticStore
 from .wallets import list_wallet_tokens
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Redirects are deliberately handled by source adapters; an HTTP client's
+    # implicit redirect would bypass per-target SSRF validation.
     app.state.client = httpx.AsyncClient(
-        follow_redirects=True, timeout=get_settings().http_timeout
+        follow_redirects=False, timeout=get_settings().http_timeout
     )
     set_client(app.state.client)
     # A mounted sub-app's own lifespan never runs; the MCP session manager
@@ -77,6 +85,25 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Curio", lifespan=lifespan)
 
+
+def request_origin(request: Request) -> str:
+    """The sole source of consumer URLs, never a Compose service address."""
+    settings = get_settings()
+    if settings.trusted_proxy_headers:
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
+        host = request.headers.get("x-forwarded-host", request.headers.get("host", "")).split(",")[0].strip()
+        if proto in {"http", "https"} and host:
+            return f"{proto}://{host}"
+    return str(request.base_url).rstrip("/")
+
+
+def require_curator(authorization: str | None = Header(default=None)) -> None:
+    token = get_settings().curator_token
+    if not token:
+        raise HTTPException(503, "curator mutations are disabled: set RESOLVER_CURATOR_TOKEN")
+    if authorization != f"Bearer {token}":
+        raise HTTPException(401, "curator authentication required")
+
 _SCOPE_DESCRIPTION = (
     "'held' = holdings; 'published' = works the wallet first-minted (Tezos only); "
     "'created' = works the wallet authored, i.e. creators/authors metadata, fully-burned "
@@ -86,10 +113,13 @@ _SCOPE_DESCRIPTION = (
 
 @app.get("/resolve")
 async def resolve(
+    request: Request,
     ref: str = Query(..., description="Any media reference"),
     pin: bool = Query(False, description="Also pin/warm the resolved content (background)"),
 ):
-    result = await resolve_ref(ref, get_settings(), app.state.client)
+    if pin:
+        require_curator(request.headers.get("authorization"))
+    result = await resolve_ref(ref, get_settings(), app.state.client, origin=request_origin(request))
     payload = result.as_dict()
     if pin:
         # Opt-in only: plain resolution never pins (browsing must not grow
@@ -101,8 +131,8 @@ async def resolve(
 
 
 @app.get("/c")
-async def cast(ref: str = Query(..., description="Any media reference")):
-    result = await resolve_ref(ref, get_settings(), app.state.client)
+async def cast(request: Request, ref: str = Query(..., description="Any media reference")):
+    result = await resolve_ref(ref, get_settings(), app.state.client, origin=request_origin(request))
     if not result.resolved:
         # Redirecting a renderer at an unresolved ref would point it at
         # garbage or at the metadata document itself.
@@ -122,6 +152,7 @@ def _wallet_error(exc: Exception) -> JSONResponse:
 
 @app.get("/wallet")
 async def wallet(
+    request: Request,
     ref: str = Query(..., description="Wallet address or name: 0x…, name.eth, tz1…, name.tez"),
     limit: int | None = Query(None, ge=1, description="Stop after this many tokens"),
     pin: bool = Query(False, description="Also pin everything listed (starts a seed job)"),
@@ -129,6 +160,8 @@ async def wallet(
     status: bool = Query(False, description="Also resolve each primary_ref and classify it (ok/substituted/unreachable/unresolvable/no-ref) — the audit view"),
     include_burned: bool = Query(False, description="created scope only: keep fully-burned creations (default drops them — destroyed on purpose)"),
 ):
+    if pin:
+        require_curator(request.headers.get("authorization"))
     try:
         result = await list_wallet_tokens(
             ref, get_settings(), app.state.client,
@@ -159,6 +192,7 @@ async def wallet(
 
 @app.post("/seed")
 async def seed(
+    _: None = Depends(require_curator),
     ref: str = Query(..., description="Wallet address or name: 0x…, name.eth, tz1…, name.tez"),
     limit: int | None = Query(None, ge=1, description="Stop after this many tokens (for testing/incremental runs)"),
     scope: str = Query("held", description=_SCOPE_DESCRIPTION),
@@ -238,7 +272,9 @@ async def override_list(
 
 
 @app.post("/override")
-async def override_add(body: OverrideBody):
+async def override_add(
+    request: Request, body: OverrideBody, _: None = Depends(require_curator)
+):
     registry = _registry()
     if registry is None:
         return _registry_disabled()
@@ -253,7 +289,7 @@ async def override_add(body: OverrideBody):
     try:
         # Disclosure, never a gate: the write above already happened, and a
         # network hiccup must not make it look like it didn't.
-        check = await resolve_ref(entry.replacement, get_settings(), app.state.client)
+        check = await resolve_ref(entry.replacement, get_settings(), app.state.client, origin=request_origin(request))
     except Exception:
         check = None
     return JSONResponse(
@@ -270,6 +306,7 @@ async def override_add(body: OverrideBody):
 
 @app.delete("/override")
 async def override_remove(
+    _: None = Depends(require_curator),
     ref: str = Query(..., description="Any spelling of the dead canonical ref"),
 ):
     registry = _registry()
@@ -297,16 +334,18 @@ def _favorites_disabled() -> JSONResponse:
 
 
 @app.get("/favorites")
-async def favorite_list():
+async def favorite_list(request: Request):
     favorites = _favorites_store()
     if favorites is None:
         return _favorites_disabled()
-    records = await list_resolved(favorites, get_settings(), app.state.client)
+    records = await list_resolved(favorites, get_settings(), app.state.client, request_origin(request))
     return JSONResponse({"count": len(records), "favorites": records})
 
 
 @app.post("/favorites")
 async def favorite_add(
+    request: Request,
+    _: None = Depends(require_curator),
     ref: str = Query(..., description="Any media reference (any spelling of it)"),
     note: str | None = Query(None, description="Optional short note"),
 ):
@@ -316,7 +355,7 @@ async def favorite_add(
     try:
         # Enrichment, never a gate: a title is nice to have in the browse
         # list, but a network hiccup must not block recording the pick.
-        check = await resolve_ref(ref, get_settings(), app.state.client)
+        check = await resolve_ref(ref, get_settings(), app.state.client, origin=request_origin(request))
     except Exception:
         check = None
     try:
@@ -342,6 +381,7 @@ async def favorite_add(
 
 @app.delete("/favorites")
 async def favorite_remove(
+    _: None = Depends(require_curator),
     ref: str = Query(..., description="Any spelling of the favorite's ref"),
 ):
     favorites = _favorites_store()
@@ -358,37 +398,99 @@ async def favorite_remove(
 
 @app.post("/store")
 async def store(
+    request: Request,
     file: UploadFile,
+    _: None = Depends(require_curator),
     expect_cid: str | None = Query(
         None,
         description="Canonical recovery: pin only if the bytes reproduce this CID (409 otherwise)",
     ),
 ):
-    """Upload a local file into the box's Kubo (pinned) with provenance
-    recorded — the supply side of an override's replacement ref."""
-    settings = get_settings()
-    if not settings.seed_capture_dir:
+    """Upload into Curio's static store. Uploads never enter IPFS implicitly."""
+    if expect_cid:
         return JSONResponse(
-            {"error": "store disabled: set RESOLVER_SEED_CAPTURE_DIR (the provenance ledger)"},
-            status_code=503,
+            {"error": "expect_cid applies to explicit canonical IPFS recovery, not static uploads"},
+            status_code=400,
         )
+    settings = get_settings()
+    data = await file.read(settings.static_max_bytes + 1)
+    if len(data) > settings.static_max_bytes:
+        return JSONResponse({"error": f"body exceeds {settings.static_max_bytes} bytes"}, status_code=413)
+    entry = StaticStore(settings.static_root).put(
+        data, media_type=file.content_type, filename=file.filename, source_ref=f"upload:{file.filename}",
+        keep_state="kept",
+    )
+    return JSONResponse(
+        {**entry, "filename": file.filename, "media_url": f"{request_origin(request)}/media/{entry['id']}",
+         "source_kind": "upload", "integrity": {"algorithm": "sha256", "digest": entry["digest"]}},
+        status_code=201,
+    )
+
+
+@app.post("/keep")
+async def keep(request: Request, ref: str = Query(...), _: None = Depends(require_curator)):
+    result = await resolve_ref(ref, get_settings(), app.state.client, origin=request_origin(request))
+    if not result.resolved:
+        return JSONResponse(result.as_dict(), status_code=422)
+    if result.source_kind == "arweave":
+        # r81 exposes cache observations but no selected-object retention API.
+        return JSONResponse({**result.as_dict(), "keep_state": "unsupported",
+            "error": "AR.IO r81 has no documented API or configuration to protect selected transaction data from eviction"}, status_code=501)
+    if result.source_kind in {"http", "data", "upload"}:
+        file_id = result.resolved_url.rsplit("/", 1)[-1]
+        if not StaticStore(get_settings().static_root).keep(file_id):
+            return JSONResponse({"error": "static media missing"}, status_code=404)
+        result.keep_state = "kept"
+        return JSONResponse(result.as_dict())
     try:
-        result = await store_upload(file, settings, app.state.client, expect_cid=expect_cid)
-    except CidMismatch as exc:
-        return JSONResponse({"error": str(exc)}, status_code=409)
-    except ValueError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=413)
-    except (httpx.HTTPError, KeyError, json.JSONDecodeError, OSError) as exc:
-        return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=502)
-    return JSONResponse(result, status_code=201)
+        pin_in_background(result, get_settings(), app.state.client, why="keep")
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    result.keep_state = "kept"
+    return JSONResponse(result.as_dict(), status_code=202)
 
 
 @app.get("/library")
 async def library():
-    """What the box actually holds, plane by plane: IPFS pins (durable),
-    warmed Arweave txids live-checked against the evictable cache, and the
-    operator-state counts."""
     return JSONResponse(await library_status(get_settings(), app.state.client))
+
+
+@app.get("/media/{file_id}")
+async def media(file_id: str):
+    item = StaticStore(get_settings().static_root).get(file_id)
+    if item is None:
+        return JSONResponse({"error": "media not found"}, status_code=404)
+    record, path = item
+    return FileResponse(path, media_type=record.get("media_type") or "application/octet-stream",
+                        filename=record.get("filename"))
+
+
+async def _gateway_proxy(request: Request, backend: str, path: str):
+    """One public origin for native gateways; backend ports stay private."""
+    settings = get_settings()
+    base = settings.ipfs_internal if backend == "ipfs" else settings.arweave_internal
+    upstream_path = f"/ipfs/{path}" if backend == "ipfs" else f"/{path}"
+    url = f"{base.rstrip('/')}{upstream_path}"
+    if request.url.query:
+        url += f"?{request.url.query}"
+    upstream = await app.state.client.send(
+        app.state.client.build_request(request.method, url, headers={"range": request.headers.get("range", "")}),
+        stream=True,
+    )
+    headers = {k: v for k, v in upstream.headers.items() if k.lower() in
+               {"content-type", "content-length", "content-range", "accept-ranges", "etag", "cache-control"}}
+    return StreamingResponse(upstream.aiter_raw(), status_code=upstream.status_code, headers=headers,
+                             background=BackgroundTask(upstream.aclose))
+
+
+@app.api_route("/ipfs/{path:path}", methods=["GET", "HEAD"])
+async def ipfs_gateway(request: Request, path: str):
+    return await _gateway_proxy(request, "ipfs", path)
+
+
+@app.api_route("/arweave/{path:path}", methods=["GET", "HEAD"])
+async def arweave_gateway(request: Request, path: str):
+    return await _gateway_proxy(request, "arweave", path)
 
 
 _SKILL_DIR = Path(__file__).parent / "skill"

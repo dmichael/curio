@@ -43,6 +43,7 @@ jobs:
             dist/install.sh \
             dist/curio-appliance.tar.gz \
             dist/curio-appliance.tar.gz.sha256 \
+            dist/VERSION \
             --verify-tag \
             --generate-notes \
             --title "Curio $GITHUB_REF_NAME"

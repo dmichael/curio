@@ -107,10 +107,8 @@ async def test_pin_resolved_arweave_warm_records_the_caller_why(tmp_path):
     async with client_for(handler) as client:
         outcome = await pin_resolved(result, settings, client, why="favorite")
 
-    assert outcome == "warmed"
-    assert warmed_txids(settings) == ["txFAV"]
-    record = json.loads((tmp_path / "warmed.jsonl").read_text())
-    assert record["why"] == "favorite"
+    assert outcome == "unsupported"
+    assert warmed_txids(settings) == []
 
 
 # --- capture ledger (seed-driven) --------------------------------------------
@@ -150,27 +148,16 @@ def capture_routes():
 
 
 async def test_http_only_media_is_captured_with_provenance(tmp_path):
-    import hashlib
-
     settings = SEED_SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path)})
     client, _ = fake_net(capture_routes())
     job = make_job(ETH_ADDR, "ethereum")
     async with client:
         await run_seed(job, settings, client)
     assert job.status == "done", job.errors
-    assert job.captured == 1
-    assert job.skipped == 0
+    assert job.captured == 0
+    assert job.skipped == 1
     assert job.failed == 0
-
-    lines = (tmp_path / "captures.jsonl").read_text().splitlines()
-    assert len(lines) == 1
-    record = json.loads(lines[0])
-    assert record["source"] == CAPTURE_URL
-    assert record["cid"] == "bafyCAPTURED"
-    assert record["sha256"] == hashlib.sha256(CAPTURE_BYTES).hexdigest()
-    assert record["bytes"] == len(CAPTURE_BYTES)
-    assert record["content_type"] == "video/mp4"
-    assert record["wallet"] == ETH_ADDR
+    assert not (tmp_path / "captures.jsonl").exists()  # never auto-published to Kubo
 
 
 async def test_capture_is_once_per_url_across_jobs(tmp_path):
@@ -184,9 +171,9 @@ async def test_capture_is_once_per_url_across_jobs(tmp_path):
     async with second:
         await run_seed(job, settings, second)
     assert job.status == "done", job.errors
-    assert job.captured == 1  # idempotent, like re-pinning
-    assert not any(CAPTURE_URL in line for line in log)  # no re-download
-    assert len((tmp_path / "captures.jsonl").read_text().splitlines()) == 1
+    assert job.captured == 0
+    assert job.skipped == 1
+    assert not any(CAPTURE_URL in line for line in log)  # no automatic HTTP fetch
 
 
 async def test_http_media_is_skipped_when_capture_is_off():
@@ -209,7 +196,8 @@ async def test_capture_failure_is_counted_not_fatal(tmp_path):
         await run_seed(job, settings, client)
     assert job.status == "done"
     assert job.captured == 0
-    assert job.failed == 1
+    assert job.failed == 0
+    assert job.skipped == 1
     assert not (tmp_path / "captures.jsonl").exists()
 
 
@@ -259,7 +247,8 @@ async def test_library_status_degrades_per_plane():
         status = await library_status(SETTINGS, client)
 
     assert "error" in status["ipfs"]
-    assert status["arweave"] == {"known_warmed": 0, "currently_cached": 0}  # and no note
+    assert status["arweave"]["kept"] == "unsupported"
+    assert "r81" in status["arweave"]["technical_blocker"]
     assert status["registry"] == {"overrides": None, "favorites": None, "captures": None}
 
 

@@ -116,22 +116,24 @@ async def test_health_reports_5xx_backend_as_down_and_404_as_up():
 
 async def test_unknown_extension_is_probed_not_assumed_media():
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.method == "HEAD"
-        return httpx.Response(200, headers={"content-type": "text/html"})
+        assert request.method == "GET"
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=b"<html>")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await resolve_ref("https://example.com/artwork.php", SETTINGS, client)
     assert result.playback_method == "send"
+    assert "/media/" in result.resolved_url
 
 
 async def test_known_media_extension_skips_the_probe():
     def handler(request: httpx.Request) -> httpx.Response:
-        raise AssertionError(f"unexpected network call: {request.url}")
+        return httpx.Response(200, headers={"content-type": "video/mp4"}, content=b"media")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await resolve_ref("https://example.com/artwork.mp4", SETTINGS, client)
     assert result.playback_method == "play"
     assert result.resolved is True
+    assert "/media/" in result.resolved_url
 
 
 # --- finding 3: /c must not redirect unresolved results ---
