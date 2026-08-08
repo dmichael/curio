@@ -7,7 +7,7 @@ from resolver.static_store import StaticStore
 
 
 async def test_http_is_static_same_origin_and_never_calls_kubo(tmp_path):
-    settings = Settings(static_root=str(tmp_path), ipfs_api="http://kubo.internal")
+    settings = Settings(static_root=str(tmp_path), ipfs_api="http://kubo.internal", ssrf_dns_check=False)
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:

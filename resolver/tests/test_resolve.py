@@ -11,6 +11,7 @@ SETTINGS = Settings(
     ipfs_api="http://kubo.internal",
     ipfs_public_base="http://box:8080",
     arweave_public_base="http://box:3000",
+    ssrf_dns_check=False,
 )
 
 TXID = "abcdefghijklmnopqrstuvwxyz0123456789_ABCDEF"  # 43 chars

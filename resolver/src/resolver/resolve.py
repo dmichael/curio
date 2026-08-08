@@ -24,11 +24,13 @@ RPC/indexer path chosen for the service; see docs/design.md § Open decisions).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import html
 import ipaddress
 import json
 import re
+import socket
 from dataclasses import asdict, dataclass, replace
 from typing import Any
 from urllib.parse import quote, unquote, urlparse, urlunparse
@@ -117,6 +119,36 @@ def external_url_ok(url: str) -> bool:
         addr.is_private or addr.is_loopback or addr.is_link_local
         or addr.is_multicast or addr.is_reserved or addr.is_unspecified
     )
+
+
+async def _dns_fetch_allowed(url: str, settings: Settings) -> bool:
+    """Resolve every external hostname before connecting and reject private DNS.
+
+    DNS answers are treated conservatively: one prohibited answer rejects the
+    target, and lookup failure does not become a connection attempt.
+    """
+    if not _fetch_allowed(url, settings):
+        return False
+    if any(url == base.rstrip("/") or url.startswith(base.rstrip("/") + "/")
+           for base in (settings.ipfs_internal, settings.arweave_internal)):
+        return True
+    if not settings.ssrf_dns_check:
+        return True
+    parsed = urlparse(url)
+    if parsed.hostname is None:
+        return False
+    try:
+        addresses = await asyncio.to_thread(
+            socket.getaddrinfo, parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror:
+        return False
+    for _, _, _, _, sockaddr in addresses:
+        address = ipaddress.ip_address(sockaddr[0])
+        if address.is_private or address.is_loopback or address.is_link_local or address.is_multicast or address.is_reserved or address.is_unspecified:
+            return False
+    return bool(addresses)
 
 
 def _fetch_allowed(url: str, settings: Settings) -> bool:
@@ -370,8 +402,9 @@ async def _resolve_direct(
 ) -> Resolved:
     seg = path.rsplit("/", 1)[-1]
     ext = extension_of(seg)
-    if not external_url_ok(ref):
-        # Everything past here fetches/probes the URL — refuse internal targets.
+    if not await _dns_fetch_allowed(ref, settings):
+        # Everything past here fetches/probes the URL — resolve DNS first and
+        # refuse internal/private answers before any connection.
         return Resolved(ref, ref, "play", None, False, note="refusing to fetch internal/private URL")
     if ext == "json":
         return await _resolve_token_metadata(ref, ref, "token-metadata", settings, client, depth)
@@ -405,7 +438,7 @@ async def _resolve_direct(
 async def _resolve_token_metadata(
     ref: str, fetch_url: str, provider: str, settings: Settings, client, depth: int
 ) -> Resolved:
-    if not _fetch_allowed(fetch_url, settings):
+    if not await _dns_fetch_allowed(fetch_url, settings):
         return Resolved(ref, ref, "play", provider, False, note="refusing to fetch internal/private URL")
     try:
         metadata: Any = json.loads(await _bounded_text(client, fetch_url, settings.fetch_max_bytes))
@@ -490,7 +523,7 @@ async def _pick_image(metadata: dict[str, Any], settings: Settings, client) -> s
     for key in _IMAGE_FIELDS:
         value = metadata.get(key)
         if isinstance(value, str) and value and value not in candidates:
-            if value.startswith(("http://", "https://")) and not external_url_ok(value):
+            if value.startswith(("http://", "https://")) and not await _dns_fetch_allowed(value, settings):
                 continue  # metadata-supplied URL pointing somewhere internal
             candidates.append(value)
     if not candidates:

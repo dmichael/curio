@@ -1,6 +1,7 @@
 """Tests for the operational-hardening pass (code-review findings)."""
 
 import asyncio
+import socket
 
 import httpx
 import pytest
@@ -61,6 +62,19 @@ def test_gateway_exemption_requires_path_boundary(url, ok):
         arweave_internal="http://127.0.0.1:3000/",  # trailing slash must not break it
     )
     assert _fetch_allowed(url, local) is ok
+
+
+async def test_dns_rebinding_target_is_refused_before_connection(monkeypatch):
+    def private_dns(*_args, **_kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", private_dns)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: (_ for _ in ()).throw(AssertionError("must not connect"))
+    )) as client:
+        result = await resolve_ref("https://attacker.example/media.png", SETTINGS, client)
+    assert result.resolved is False
+    assert "internal/private" in (result.note or "")
 
 
 async def test_direct_resolution_refuses_private_targets():

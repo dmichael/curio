@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     # retention metadata; object files are addressed by their SHA-256 digest.
     static_root: str = "/tmp/curio-media"
     static_max_bytes: int = Field(default=1_073_741_824, gt=0)
+    ssrf_dns_check: bool = True
 
     # Empty means curator mutations are disabled rather than public.
     curator_token: str = ""
