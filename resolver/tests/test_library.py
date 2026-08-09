@@ -10,7 +10,7 @@ import pytest
 from resolver import app as app_module
 from resolver.config import Settings, get_settings
 from resolver.favorites import get_favorites
-from resolver.library import library_status, pin_resolved, record_warm, warmed_txids
+from resolver.library import library_status, record_warm, store_resolved, warmed_txids
 from resolver.overrides import get_registry
 from resolver.seed import SeedJob, _warm_txid, run_seed
 
@@ -92,7 +92,7 @@ async def test_warm_txid_records_success_not_failure(tmp_path):
     assert record["why"] == "seed"
 
 
-async def test_pin_resolved_arweave_warm_records_the_caller_why(tmp_path):
+async def test_store_resolved_arweave_warm_records_the_caller_why(tmp_path):
     settings = SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path)})
     result = SimpleNamespace(
         resolved=True,
@@ -105,9 +105,9 @@ async def test_pin_resolved_arweave_warm_records_the_caller_why(tmp_path):
         return httpx.Response(200, headers={"x-cache": "HIT"}, content=b"art bytes")
 
     async with client_for(handler) as client:
-        outcome = await pin_resolved(result, settings, client, why="favorite")
+        outcome = await store_resolved(result, settings, client, why="favorite")
 
-    assert outcome == "kept"
+    assert outcome == "stored"
     assert warmed_txids(settings) == ["txFAV"]
 
 

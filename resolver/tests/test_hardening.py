@@ -183,19 +183,13 @@ async def test_known_media_extension_skips_the_probe():
     assert "/media/" in result.resolved_url
 
 
-# --- finding 3: /c must not redirect unresolved results ---
+# --- obsolete mutation routes stay absent ---------------------------------
 
 
-def test_cast_route_refuses_unresolved_refs(http_client):
-    response = http_client.get("/c", params={"ref": "not a reference"}, follow_redirects=False)
-    assert response.status_code == 422
-    assert response.json()["resolved"] is False
-
-    ok = http_client.get(
-        "/c", params={"ref": "ipfs://bafyCID/art.png"}, follow_redirects=False
-    )
-    assert ok.status_code == 422  # known suffix cannot bypass local availability
-    assert ok.json()["resolved"] is False
+def test_obsolete_storage_routes_are_not_exposed(http_client):
+    assert http_client.get("/c", params={"ref": "x"}).status_code == 404
+    assert http_client.post("/keep", params={"ref": "x"}).status_code == 404
+    assert http_client.post("/store").status_code == 404
 
 
 # --- finding 1: seed admission control ---

@@ -3,6 +3,7 @@ import httpx
 
 from resolver.config import Settings
 from resolver.seed import SeedJob, run_seed
+from resolver.static_store import StaticStore
 
 ETH_ADDR = "0xAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb"
 MEDIA_TXID = "M" * 43
@@ -52,13 +53,14 @@ async def test_seed_keeps_http_and_data_metadata_on_final_native_planes(tmp_path
     assert any("/api/v0/pin/add" in request for request in seen)
 
 
-async def test_seed_does_not_claim_native_html_runtime_work_is_kept(tmp_path):
+async def test_seed_stores_native_html_and_records_live_dependency(tmp_path):
     txid = "H" * 43
     settings = Settings(
         blockscout_base="http://bs.internal/api/v2",
         ipfs_internal="http://ipfs.internal",
         ipfs_api="http://kubo.internal",
         arweave_internal="http://ar.internal",
+        static_root=str(tmp_path / "media"),
         ssrf_dns_check=False,
     )
     seen: list[str] = []
@@ -74,14 +76,20 @@ async def test_seed_does_not_claim_native_html_runtime_work_is_kept(tmp_path):
             return httpx.Response(200, headers={"content-type": "text/html"})
         if request.method == "HEAD" and request.url.host == "ar.internal":
             return httpx.Response(200, headers={"content-type": "text/html"})
-        raise AssertionError(f"runtime HTML should not be retained: {request.method} {request.url}")
+        if request.method == "GET" and request.url.host == "ar.internal":
+            return httpx.Response(200, headers={"x-cache": "HIT"}, content=b"html")
+        if request.url.path == "/api/v0/pin/add":
+            return httpx.Response(200, json={"Pins": ["bafyRUNTIME"]})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     job = SeedJob(id="html", ref=ETH_ADDR, chain="ethereum", address=ETH_ADDR, started_at="t")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         await run_seed(job, settings, client)
 
-    assert job.status == "done"
-    assert (job.pinned, job.warmed, job.captured) == (0, 0, 0)
-    assert job.failed == 2
-    assert all("uncaptured dependencies" in error for error in job.errors)
-    assert all("pin/add" not in request for request in seen)
+    assert job.status == "done", job.errors
+    assert (job.pinned, job.warmed, job.captured) == (1, 1, 0)
+    assert job.failed == 0
+    store = StaticStore(str(tmp_path / "media"))
+    assert store.resolution("ipfs://bafyRUNTIME/index.html")["status"] == "live-dependent"
+    assert store.resolution(f"ar://{txid}/index.html")["status"] == "live-dependent"
+    assert any("pin/add" in request for request in seen)

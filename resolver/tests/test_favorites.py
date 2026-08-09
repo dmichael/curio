@@ -19,7 +19,7 @@ from resolver.favorites import (
     FavoritesUnparseable,
     get_favorites,
 )
-from resolver.library import pin_resolved
+from resolver.library import store_resolved
 from resolver.resolve import Resolved
 
 # --- store ---------------------------------------------------------------
@@ -103,13 +103,13 @@ def test_missing_file_is_empty(tmp_path):
     assert favorites.list_favorites() == []
 
 
-# --- pinning: a favorite is a keep-this signal ----------------------------
+# --- source-native storage helper -----------------------------------------
 
 
 PIN_SETTINGS = Settings(ipfs_api="http://kubo.internal", arweave_internal="http://ar.internal")
 
 
-async def test_pin_resolved_pins_ipfs_target(tmp_path):
+async def test_store_resolved_pins_ipfs_target(tmp_path):
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -122,13 +122,13 @@ async def test_pin_resolved_pins_ipfs_target(tmp_path):
         "play", "ipfs", True,
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        outcome = await pin_resolved(result, PIN_SETTINGS, client)
+        outcome = await store_resolved(result, PIN_SETTINGS, client)
     assert outcome == "pinned"
     # Pin the canonical root; the resolved path remains serving/provenance.
     assert calls == [("/api/v0/pin/add", {"arg": "/ipfs/bafyFAV"})]
 
 
-async def test_pin_resolved_verifies_arweave_cache_and_skips_unresolved():
+async def test_store_resolved_verifies_arweave_cache_and_skips_unresolved():
     settings = PIN_SETTINGS
     warmed = []
 
@@ -138,30 +138,11 @@ async def test_pin_resolved_verifies_arweave_cache_and_skips_unresolved():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         arweave = Resolved("ar://TX123", "http://box:3000/TX123", "play", "arweave", True)
-        assert await pin_resolved(arweave, settings, client) == "kept"
+        assert await store_resolved(arweave, settings, client) == "stored"
         assert warmed == ["http://ar.internal/TX123", "http://ar.internal/TX123"]
 
         dead = Resolved("ipfs://bafyDEAD", "ipfs://bafyDEAD", "play", "ipfs", False)
-        assert await pin_resolved(dead, settings, client) is None  # nothing fetched
-
-
-# --- pin option on /resolve ------------------------------------------------
-
-
-def test_resolve_pin_option_schedules_and_default_does_not(http_client):
-    # default: pure resolution, no pin key at all
-    plain = http_client.get("/resolve", params={"ref": "ipfs://bafyCID/art.png"}).json()
-    assert "pin_scheduled" not in plain
-
-    pinned = http_client.get(
-        "/resolve", params={"ref": "ipfs://bafyCID/art.png", "pin": 1}
-    ).json()
-    assert pinned["pin_scheduled"] is False  # unavailable native backend is not an optimistic pin
-
-    unresolvable = http_client.get(
-        "/resolve", params={"ref": "not a reference", "pin": 1}
-    ).json()
-    assert unresolvable["pin_scheduled"] is False  # nothing to keep
+        assert await store_resolved(dead, settings, client) is None  # nothing fetched
 
 
 # --- routes ---------------------------------------------------------------
@@ -195,7 +176,6 @@ def test_favorite_crud_round_trip(client):
     assert body["final_ref"] == "ipfs://bafyCID/art.png"
     assert body["source_ref"] == "ipfs://bafyCID/art.png"
     assert body["title"] is None
-    assert body["pin_scheduled"] is False
 
     # The list retains the discovery record but exposes the unavailable state.
     listed = client.get("/favorites").json()

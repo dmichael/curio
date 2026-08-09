@@ -1,9 +1,8 @@
-"""The durability tier and its ledgers: what the box has decided to keep.
+"""Source-native storage helpers and cross-plane library status.
 
-The library is source-native: Kubo pins IPFS, Curio's static store keeps
-ordinary HTTP/data, and Arweave keep eagerly fetches and verifies the one
-persistent AR.IO Core cache. This module owns the source-appropriate helpers
-and `GET /library`, the cross-plane answer to "what does the box hold?".
+Kubo pins IPFS, Curio stores ordinary HTTP/data, and AR.IO Core eagerly fetches
+and verifies Arweave. This module also owns `GET /library`, the cross-plane
+answer to "what does the box hold?".
 """
 
 from __future__ import annotations
@@ -11,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +17,7 @@ from typing import Any, NamedTuple
 
 import httpx
 
-from .arweave_cache import keep_arweave
+from .arweave_cache import store_arweave
 from .config import Settings
 from .favorites import get_favorites
 from .overrides import get_registry
@@ -29,15 +27,12 @@ from .safe_fetch import safe_stream
 
 _STATUS_TIMEOUT = 10.0  # per probe: status must answer even when a plane hangs
 
-_log = logging.getLogger("resolver.library")
-
-# Strong references to fire-and-forget tasks: asyncio keeps only weak ones,
-# so an unreferenced task can be garbage-collected mid-flight. Background
-# pins (here) and seed jobs (seed.py) share this registry via keep_task.
+# Strong references to seed tasks: asyncio keeps only weak ones, so an
+# unreferenced background job can be garbage-collected mid-flight.
 _TASKS: set[asyncio.Task[None]] = set()
 
 
-def keep_task(task: asyncio.Task[None]) -> None:
+def track_task(task: asyncio.Task[None]) -> None:
     """Hold a strong reference to a background task until it finishes."""
     _TASKS.add(task)
     task.add_done_callback(_TASKS.discard)
@@ -96,22 +91,22 @@ async def ingest_url(
     return Ingested(cid, size, digest.hexdigest() if digest else None, content_type)
 
 
-# --- single-target pinning (favorites, resolve?pin=1) ----------------------
-# Resolution alone deliberately never pins — browsing must not grow the
-# library. These helpers make ONE resolved target durable when the caller
-# declares intent (a favorite, an explicit pin=1). Wallet-wide pinning is a
-# seed job, not a loop over these.
+# --- single-target source storage -----------------------------------------
+# POST /resolve stores one final native artifact. Wallet-wide storage remains
+# a seed job rather than a client-side loop over this helper.
 
 
-async def pin_resolved(
+async def store_resolved(
     result: Resolved, settings: Settings, client: httpx.AsyncClient, why: str = "pin"
 ) -> str | None:
-    """Apply explicit keep intent on the source-native storage plane."""
+    """Store one resolved artifact on its source-native storage plane.
+
+    Runtime HTML is still pinned or fetched, while its public resolution status
+    remains ``live-dependent`` because the shell's network dependencies are not
+    thereby captured.
+    """
     if not result.resolved:
         return None
-    if getattr(result, "keep_state", None) == "live-dependent":
-        # Retaining the HTML shell is not preservation of a runtime work.
-        return "live-dependent"
     # The public resolved URL may be a Curio proxy and original_ref may be a
     # metadata document. Retention always targets the final native artifact.
     # The fallback only supports older in-process callers that construct a
@@ -136,33 +131,11 @@ async def pin_resolved(
         if arweave is None:
             return "failed"
         txid, path = arweave
-        outcome = await keep_arweave(txid, path, settings, client)
-        if outcome == "kept":
+        outcome = await store_arweave(txid, path, settings, client)
+        if outcome == "stored":
             record_warm(txid, settings, why)
         return outcome
     return None
-
-
-def pin_in_background(
-    result: Resolved, settings: Settings, client: httpx.AsyncClient, why: str = "pin"
-) -> None:
-    """Fire-and-forget pin of one resolved target: the request that asked
-    for it must return immediately even when the content is cold and large."""
-    keep_task(asyncio.create_task(_pin_logged(result, settings, client, why)))
-
-
-async def _pin_logged(
-    result: Resolved, settings: Settings, client: httpx.AsyncClient, why: str
-) -> None:
-    try:
-        outcome = await pin_resolved(result, settings, client, why=why)
-    except Exception as exc:  # best effort: a failed pin must not crash the loop
-        _log.warning(
-            "%s pin failed for %s: %s: %s", why, result.original_ref, type(exc).__name__, exc
-        )
-        return
-    if outcome:
-        _log.info("%s %s: %s", why, result.original_ref, outcome)
 
 
 def captures_file(settings: Settings) -> Path:
@@ -240,8 +213,8 @@ async def library_status(settings: Settings, client: httpx.AsyncClient) -> dict[
     """What the box holds, plane by plane.
 
     IPFS pins are durable. Arweave records are same-Core cache diagnostics:
-    resolving, playing, and explicit keep all populate the one persistent
-    Core cache. Each plane degrades independently rather than making status
+    resolution, storage, and playback all populate the one persistent Core
+    cache. Each plane degrades independently rather than making status
     fail because one backend is down.
     """
     return {

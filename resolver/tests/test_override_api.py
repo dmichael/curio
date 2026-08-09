@@ -1,4 +1,4 @@
-"""Route-level tests for override CRUD and /store.
+"""Route-level tests for override CRUD and multipart /resolve.
 
 All tests share the session-scoped TestClient from conftest (the MCP session
 manager in the lifespan is start-once-per-process); settings vary per test
@@ -7,12 +7,12 @@ via env + lru_cache clearing.
 
 import tomllib
 
-import httpx
 import pytest
 
-from resolver import app as app_module
+from resolver import operations
 from resolver.config import get_settings
 from resolver.overrides import get_registry
+from resolver.resolve import Resolved
 
 ENTRY = {
     "ref": "ipfs://bafyDEAD/art.png",
@@ -37,7 +37,7 @@ def client(http_client, tmp_path, monkeypatch):
     get_registry.cache_clear()
 
 
-def test_override_crud_round_trip(client):
+def test_override_crud_round_trip(client, monkeypatch):
     created = client.post("/override", json=ENTRY)
     assert created.status_code == 201
     body = created.json()
@@ -55,13 +55,37 @@ def test_override_crud_round_trip(client):
     assert raw.status_code == 200
     assert tomllib.loads(raw.text)["override"][0]["replacement"] == ENTRY["replacement"]
 
-    # the registry is live immediately: the dead ref resolves via the override
-    resolved = client.get(
+    # the registry is live immediately when the dead ref is stored.
+    async def substituted(ref, *_args, **_kwargs):
+        return Resolved(
+            ref,
+            "http://testserver/ipfs/bafyALT/master.png",
+            "play",
+            "ipfs",
+            True,
+            source_kind="ipfs",
+            final_ref="ipfs://bafyALT/master.png",
+            substituted=True,
+            substituted_ref=ref,
+            substitution_status="alternate-master",
+        )
+
+    async def pinned(*_args, **_kwargs):
+        return "pinned"
+
+    monkeypatch.setattr(operations, "resolve_ref", substituted)
+    monkeypatch.setattr(operations, "store_resolved", pinned)
+    resolved = client.post(
         "/resolve", params={"ref": "https://ipfs.io/ipfs/bafyDEAD/art.png"}
     ).json()
     assert resolved["substituted"] is True
     assert resolved["substitution_status"] == "alternate-master"
-    assert resolved["resolved_url"] == "http://testserver/ipfs/bafyALT/master.png"
+    playback = client.get(
+        "/resolve",
+        params={"ref": "ipfs://bafyDEAD/art.png"},
+        follow_redirects=False,
+    )
+    assert playback.headers["location"] == "/ipfs/bafyALT/master.png"
 
     removed = client.request("DELETE", "/override", params={"ref": "/ipfs/bafyDEAD/art.png"})
     assert removed.status_code == 200
@@ -109,30 +133,26 @@ def test_override_endpoints_disabled_without_path(http_client, monkeypatch):
         get_settings.cache_clear()
 
 
-def test_store_route_uploads_and_records(client, tmp_path):
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/v0/add"
-        return httpx.Response(200, json={"Hash": "bafySTORED", "Name": "m.png"})
-
-    real = app_module.app.state.client
-    app_module.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    try:
-        response = client.post("/store", files={"file": ("m.png", b"png-bytes", "image/png")})
-    finally:
-        app_module.app.state.client = real
+def test_resolve_route_uploads_and_records(client):
+    response = client.post(
+        "/resolve", files={"file": ("m.png", b"png-bytes", "image/png")}
+    )
     assert response.status_code == 201
     body = response.json()
     assert body["source_kind"] == "upload"
-    assert body["keep_state"] == "kept"
-    assert body["media_url"].startswith("http://testserver/media/")
+    assert body["status"] == "ready"
+    assert body["ref"].startswith("upload:sha256:")
+    assert body["media_url"].startswith("http://testserver/resolve?")
     assert body["integrity"]["algorithm"] == "sha256"
 
 
-def test_store_route_disabled_without_capture_dir(http_client, monkeypatch):
+def test_upload_does_not_require_capture_dir(http_client, monkeypatch):
     monkeypatch.delenv("RESOLVER_SEED_CAPTURE_DIR", raising=False)
     get_settings.cache_clear()
     try:
-        response = http_client.post("/store", files={"file": ("m.png", b"x", "image/png")})
+        response = http_client.post(
+            "/resolve", files={"file": ("m.png", b"x", "image/png")}
+        )
         assert response.status_code == 201
         assert response.json()["source_kind"] == "upload"
     finally:

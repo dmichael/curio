@@ -1,10 +1,10 @@
 <h1 align="center">Curio</h1>
 
-<p align="center"><strong>Keep the media behind your NFTs usable.</strong></p>
+<p align="center"><strong>Put NFT media into storage you control.</strong></p>
 
-Curio follows NFT media references and returns playable URLs on your own
-server. It uses Kubo for IPFS, AR.IO for Arweave, and a local static store for
-ordinary files.
+Curio accepts NFT media references and local files, stores their final artifacts,
+and gives media players one URL space on your own server. It uses Kubo for IPFS,
+AR.IO Core for Arweave, and a local static store for ordinary files.
 
 ## Install
 
@@ -30,52 +30,48 @@ curio logs resolver --follow
 Configuration defaults to `~/.config/curio/curio.env`; state defaults to
 `~/.local/share/curio/state`.
 
-## Resolve media
+## Store a reference
+
+`POST /resolve` expresses storage intent:
 
 ```bash
-curl --get 'http://localhost:8090/resolve' \
+curl -X POST --get 'http://localhost:8090/resolve' \
   --data-urlencode 'ref=ipfs://bafy.../artwork'
 ```
 
-A successful response includes `media_url` on the Curio origin. Curio supports:
+JSON input is also accepted:
 
-| Input | Result |
+```bash
+curl -X POST 'http://localhost:8090/resolve' \
+  -H 'Content-Type: application/json' \
+  -d '{"ref":"ar://transaction-id"}'
+```
+
+A successful response has status `ready` or `live-dependent` and includes a
+`media_url`. Players fetch that URL with GET; Curio redirects it to the stored
+source-native media path. A reference that has not been submitted successfully
+returns 404 from GET `/resolve`.
+
+Curio understands:
+
+| Input | Storage |
 |---|---|
-| IPFS URI, path, or gateway URL | Served through Kubo at `/ipfs/...` |
-| Arweave transaction or manifest path | Served through AR.IO at `/arweave/...` |
-| HTTP media | Copied into Curio's static cache and served at `/media/...` |
-| HTTP or inline JSON metadata | Followed to its media reference |
-| Other `data:` media | Decoded into the static cache |
+| IPFS URI, path, or gateway URL | Pinned in Kubo and served at `/ipfs/...` |
+| Arweave transaction or manifest path | Fetched through AR.IO Core and served at `/arweave/...` |
+| HTTP media | Stored locally by SHA-256 and served at `/media/...` |
+| HTTP or inline JSON metadata | Followed to its selected media reference |
+| Other `data:` media | Decoded into the static store |
 | Small UnixFS wrappers and Verse artwork pages | Followed to the selected media |
 
 HTML works can depend on uncaptured scripts, APIs, or other resources. Curio
-marks these results `live-dependent`.
+stores the primary artifact but reports these results as `live-dependent`.
 
-## Keep media
+## Store a file
 
-Mutating requests need the curator token from `curio.env`:
-
-```bash
-curl -X POST -H 'Authorization: Bearer YOUR_TOKEN' --get \
-  'http://localhost:8090/keep' \
-  --data-urlencode 'ref=ar://transaction-id'
-```
-
-Keep means:
-
-- IPFS: pin the CID root in Kubo.
-- Arweave: fully fetch the work and verify it in the same persistent AR.IO
-  Core used for playback.
-- HTTP or inline media: mark the local static object as kept.
-
-AR.IO Core does not automatically delete fetched content. Arweave keep is an
-eager download check, not a second storage tier or a new Arweave replica.
-
-Upload a local file with:
+The same endpoint accepts an upload:
 
 ```bash
-curl -X POST -H 'Authorization: Bearer YOUR_TOKEN' \
-  -F 'file=@master.mp4' 'http://localhost:8090/store'
+curl -X POST -F 'file=@master.mp4' 'http://localhost:8090/resolve'
 ```
 
 Uploads remain in Curio's static store. Curio does not add them to IPFS.
@@ -90,15 +86,15 @@ curl --get 'http://localhost:8090/wallet' \
   --data-urlencode 'ref=name.eth'
 ```
 
-Start a background keep job for a wallet or contract with authenticated
-`POST /seed`, then poll `/seed/<job-id>`. Ethereum creator lookup and direct
-contract/token RPC resolution are not implemented.
+`POST /seed` starts a background storage job for a wallet or contract; poll
+`/seed/<job-id>`. Ethereum creator lookup and direct contract/token RPC
+resolution are not implemented.
 
 ## API and services
 
 OpenAPI is available at `/docs` and `/openapi.json`. MCP is mounted at `/mcp`.
-The main routes are `/resolve`, `/wallet`, `/keep`, `/seed`, `/store`,
-`/favorites`, `/override`, `/library`, and `/healthz`.
+The main routes are `/resolve`, `/wallet`, `/seed`, `/favorites`, `/override`,
+`/library`, and `/healthz`.
 
 The appliance runs three services:
 
@@ -110,8 +106,10 @@ Port 8090 is the only public HTTP port. Kubo also publishes port 4001 over TCP
 and UDP for IPFS peers. Kubo's HTTP interfaces and AR.IO Core stay on the
 private Compose network.
 
-Returned URLs normally use the request origin. Reverse-proxy deployments can
-set `CURIO_PUBLIC_BASE_URL` or allowlist the immediate proxy with
+Curio is designed for a trusted household or studio network and has no user
+authentication. Do not expose it directly to the public internet. Returned URLs
+normally use the request origin. Reverse-proxy deployments can set
+`CURIO_PUBLIC_BASE_URL` or allowlist the immediate proxy with
 `CURIO_TRUSTED_PROXY_CIDRS`.
 
 Back up `curio.env` and the state directory. See [the design](docs/design.md),

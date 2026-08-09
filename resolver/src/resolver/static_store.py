@@ -7,8 +7,17 @@ import mimetypes
 import sqlite3
 import threading
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 from uuid import uuid4
+
+
+class ResolutionStatus(StrEnum):
+    """The complete public state of a submitted Curio reference."""
+
+    READY = "ready"
+    LIVE_DEPENDENT = "live-dependent"
+    FAILED = "failed"
 
 
 class CacheQuotaError(ValueError):
@@ -18,11 +27,11 @@ class CacheQuotaError(ValueError):
 class StaticStore:
     """Content-addressed objects and source records.
 
-    Kept records are durable. Other records share an evictable quota; digests
-    with kept records are excluded from both the quota and eviction.
+    Stored records are durable. Other records share an evictable quota; digests
+    with stored records are excluded from both the quota and eviction.
     """
 
-    _SCHEMA_VERSION = 1
+    _SCHEMA_VERSION = 3
     _initialized_paths: set[Path] = set()
     _initialization_locks: dict[Path, threading.Lock] = {}
     _initialization_locks_guard = threading.Lock()
@@ -42,12 +51,17 @@ class StaticStore:
         db.execute(
             """CREATE TABLE IF NOT EXISTS media (
                 id TEXT PRIMARY KEY, digest TEXT NOT NULL, filename TEXT,
-                media_type TEXT, bytes INTEGER NOT NULL, keep_state TEXT NOT NULL,
+                media_type TEXT, bytes INTEGER NOT NULL, storage_status TEXT NOT NULL,
                 source_ref TEXT NOT NULL, retrieved_at TEXT NOT NULL,
                 accessed_at TEXT NOT NULL
             )"""
         )
         columns = {row["name"] for row in db.execute("PRAGMA table_info(media)")}
+        if "keep_state" in columns and "storage_status" not in columns:
+            db.execute("ALTER TABLE media RENAME COLUMN keep_state TO storage_status")
+            columns.remove("keep_state")
+            columns.add("storage_status")
+        db.execute("UPDATE media SET storage_status = 'stored' WHERE storage_status = 'kept'")
         # Existing catalogues predate access tracking and allowed NULL source
         # refs. Give legacy rows stable per-record identities before adding the
         # uniqueness invariant.
@@ -61,7 +75,7 @@ class StaticStore:
             SELECT id FROM (
                 SELECT id, row_number() OVER (
                     PARTITION BY source_ref, digest
-                    ORDER BY CASE keep_state WHEN 'kept' THEN 1 ELSE 0 END DESC,
+                    ORDER BY CASE storage_status WHEN 'stored' THEN 1 ELSE 0 END DESC,
                              retrieved_at DESC, id DESC
                 ) AS position
                 FROM media
@@ -69,7 +83,21 @@ class StaticStore:
         )""")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS media_source_digest ON media(source_ref, digest)")
         db.execute("CREATE INDEX IF NOT EXISTS media_digest ON media(digest)")
-        db.execute("CREATE INDEX IF NOT EXISTS media_cache_lru ON media(keep_state, accessed_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS media_cache_lru ON media(storage_status, accessed_at)")
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS resolutions (
+                canonical_ref TEXT PRIMARY KEY,
+                ref TEXT NOT NULL,
+                final_ref TEXT NOT NULL,
+                media_path TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('ready', 'live-dependent', 'failed')),
+                media_type TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"""
+        )
+        db.execute("CREATE INDEX IF NOT EXISTS resolutions_status ON resolutions(status)")
 
     def _ensure_initialized(self) -> None:
         db_path = self.db_path.resolve()
@@ -125,13 +153,13 @@ class StaticStore:
         return source_ref or f"anonymous:sha256:{digest}"
 
     def put(self, data: bytes, *, media_type: str | None, filename: str | None,
-            source_ref: str | None, keep_state: str = "cached") -> dict[str, object]:
+            source_ref: str | None, storage_status: str = "cached") -> dict[str, object]:
         temporary = self.root / f".upload-{uuid4().hex}"
         self.root.mkdir(parents=True, exist_ok=True)
         temporary.write_bytes(data)
         try:
             return self.put_file(temporary, media_type=media_type, filename=filename,
-                                 source_ref=source_ref, keep_state=keep_state)
+                                 source_ref=source_ref, storage_status=storage_status)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -139,7 +167,7 @@ class StaticStore:
         row = db.execute("""SELECT COALESCE(SUM(bytes), 0) AS total FROM (
             SELECT digest, MAX(bytes) AS bytes
             FROM media GROUP BY digest
-            HAVING SUM(CASE WHEN keep_state = 'kept' THEN 1 ELSE 0 END) = 0
+            HAVING SUM(CASE WHEN storage_status = 'stored' THEN 1 ELSE 0 END) = 0
         )""").fetchone()
         return int(row["total"])
 
@@ -150,20 +178,20 @@ class StaticStore:
             )
         removed: list[str] = []
         while self._cache_bytes(db) + needed > self.cache_max_bytes:
-            # Object-level LRU; digests with kept records are never evicted.
+            # Object-level LRU; digests with stored records are never evicted.
             victim = db.execute("""SELECT digest FROM media GROUP BY digest
-                HAVING SUM(CASE WHEN keep_state = 'kept' THEN 1 ELSE 0 END) = 0
+                HAVING SUM(CASE WHEN storage_status = 'stored' THEN 1 ELSE 0 END) = 0
                 ORDER BY MAX(accessed_at) ASC, digest ASC LIMIT 1""").fetchone()
             if victim is None:
                 raise CacheQuotaError("static cache quota has no evictable objects")
             digest = str(victim["digest"])
-            db.execute("DELETE FROM media WHERE digest = ? AND keep_state != 'kept'", (digest,))
+            db.execute("DELETE FROM media WHERE digest = ? AND storage_status != 'stored'", (digest,))
             if db.execute("SELECT 1 FROM media WHERE digest = ?", (digest,)).fetchone() is None:
                 removed.append(digest)
         return removed
 
     def put_file(self, temporary: Path, *, media_type: str | None, filename: str | None,
-                 source_ref: str | None, keep_state: str = "cached") -> dict[str, object]:
+                 source_ref: str | None, storage_status: str = "cached") -> dict[str, object]:
         hasher = hashlib.sha256()
         size = 0
         with temporary.open("rb") as source:
@@ -180,15 +208,15 @@ class StaticStore:
             # Serialize quota calculation, eviction, and insertion across workers.
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute(
-                "SELECT id, bytes, media_type, keep_state FROM media WHERE source_ref = ? AND digest = ?",
+                "SELECT id, bytes, media_type, storage_status FROM media WHERE source_ref = ? AND digest = ?",
                 (source_identity, digest),
             ).fetchone()
             if existing is not None:
                 db.commit()
                 return {"id": existing["id"], "digest": digest, "bytes": existing["bytes"],
-                        "media_type": existing["media_type"], "keep_state": existing["keep_state"]}
+                        "media_type": existing["media_type"], "storage_status": existing["storage_status"]}
             is_new_object = db.execute("SELECT 1 FROM media WHERE digest = ?", (digest,)).fetchone() is None
-            if keep_state != "kept" and is_new_object:
+            if storage_status != "stored" and is_new_object:
                 removed = self._evict_for(db, size)
             if not path.exists():
                 temporary.replace(path)
@@ -196,19 +224,19 @@ class StaticStore:
             file_id = uuid4().hex
             now = self._now()
             inserted = db.execute(
-                """INSERT INTO media (id, digest, filename, media_type, bytes, keep_state, source_ref, retrieved_at, accessed_at)
+                """INSERT INTO media (id, digest, filename, media_type, bytes, storage_status, source_ref, retrieved_at, accessed_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(source_ref, digest) DO NOTHING""",
-                (file_id, digest, filename, media_type, size, keep_state, source_identity, now, now),
+                (file_id, digest, filename, media_type, size, storage_status, source_identity, now, now),
             )
             if inserted.rowcount == 0:
                 winner = db.execute(
-                    "SELECT id, bytes, media_type, keep_state FROM media WHERE source_ref = ? AND digest = ?",
+                    "SELECT id, bytes, media_type, storage_status FROM media WHERE source_ref = ? AND digest = ?",
                     (source_identity, digest),
                 ).fetchone()
                 db.commit()
                 return {"id": winner["id"], "digest": digest, "bytes": winner["bytes"],
-                        "media_type": winner["media_type"], "keep_state": winner["keep_state"]}
+                        "media_type": winner["media_type"], "storage_status": winner["storage_status"]}
             db.commit()
         except Exception:
             db.rollback()
@@ -223,7 +251,7 @@ class StaticStore:
         for old_digest in removed:
             (self.objects / old_digest).unlink(missing_ok=True)
         return {"id": file_id, "digest": digest, "bytes": size,
-                "media_type": media_type, "keep_state": keep_state}
+                "media_type": media_type, "storage_status": storage_status}
 
     def get(self, file_id: str) -> tuple[dict[str, object], Path] | None:
         db = self._connection()
@@ -241,12 +269,73 @@ class StaticStore:
             db.close()
         return record, path
 
-    def keep(self, file_id: str) -> bool:
+    def store(self, file_id: str) -> bool:
         db = self._connection()
         try:
-            result = db.execute("UPDATE media SET keep_state = 'kept' WHERE id = ?", (file_id,))
+            result = db.execute("UPDATE media SET storage_status = 'stored' WHERE id = ?", (file_id,))
             db.commit()
             return result.rowcount == 1
+        finally:
+            db.close()
+
+    def record_resolution(
+        self,
+        *,
+        canonical_ref: str,
+        ref: str,
+        final_ref: str,
+        media_path: str,
+        status: ResolutionStatus,
+        media_type: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, object]:
+        """Insert or update the one playback route for a submitted reference."""
+        if not media_path.startswith(("/ipfs/", "/arweave/", "/media/")):
+            raise ValueError("resolution media_path must use a Curio media route")
+        now = self._now()
+        db = self._connection()
+        try:
+            db.execute(
+                """INSERT INTO resolutions
+                   (canonical_ref, ref, final_ref, media_path, status, media_type,
+                    reason, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(canonical_ref) DO UPDATE SET
+                       ref = excluded.ref,
+                       final_ref = excluded.final_ref,
+                       media_path = excluded.media_path,
+                       status = excluded.status,
+                       media_type = excluded.media_type,
+                       reason = excluded.reason,
+                       updated_at = excluded.updated_at""",
+                (
+                    canonical_ref,
+                    ref,
+                    final_ref,
+                    media_path,
+                    status.value,
+                    media_type,
+                    reason,
+                    now,
+                    now,
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM resolutions WHERE canonical_ref = ?", (canonical_ref,)
+            ).fetchone()
+            db.commit()
+            return dict(row)
+        finally:
+            db.close()
+
+    def resolution(self, canonical_ref: str) -> dict[str, object] | None:
+        """Return a stored reference's playback route without resolving it again."""
+        db = self._connection()
+        try:
+            row = db.execute(
+                "SELECT * FROM resolutions WHERE canonical_ref = ?", (canonical_ref,)
+            ).fetchone()
+            return dict(row) if row is not None else None
         finally:
             db.close()
 

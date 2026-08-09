@@ -7,7 +7,7 @@ from importlib import metadata
 from pathlib import Path
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -17,6 +17,7 @@ from fastapi.responses import (
 )
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
+from starlette.datastructures import UploadFile
 
 from . import operations
 from .config import get_settings
@@ -29,7 +30,7 @@ from .favorites import (
     list_resolved,
 )
 from .health import gateway_health
-from .library import library_status, pin_resolved
+from .library import library_status
 from .mcp_server import mcp, set_client
 from .origin import effective_origin, normalize_origin
 from .overrides import (
@@ -39,7 +40,7 @@ from .overrides import (
     RegistryUnparseable,
     get_registry,
 )
-from .resolve import resolve_ref
+from .refs import canonical_ref_key
 from .seed import TooManySeedJobs, get_job, list_jobs, start_seed
 from .static_store import StaticStore
 from .wallets import list_wallet_tokens
@@ -94,13 +95,6 @@ def request_origin(request: Request) -> str:
     return origin
 
 
-def require_curator(authorization: str | None = Header(default=None)) -> None:
-    token = get_settings().curator_token
-    if not token:
-        raise HTTPException(503, "curator mutations are disabled: set RESOLVER_CURATOR_TOKEN")
-    if authorization != f"Bearer {token}":
-        raise HTTPException(401, "curator authentication required")
-
 _SCOPE_DESCRIPTION = (
     "'held' = holdings; 'published' = works the wallet first-minted (Tezos only); "
     "'created' = works the wallet authored, i.e. creators/authors metadata, fully-burned "
@@ -109,29 +103,109 @@ _SCOPE_DESCRIPTION = (
 
 
 @app.get("/resolve")
-async def resolve(
-    request: Request,
-    ref: str = Query(..., description="Any media reference"),
-    pin: bool = Query(False, description="Also pin/warm the resolved content (background)"),
-):
-    if pin:
-        require_curator(request.headers.get("authorization"))
+async def resolve_get(ref: str = Query(..., description="A reference previously stored by Curio")):
+    """Redirect a known reference to its source-native Curio media route."""
     settings = get_settings()
-    result = await resolve_ref(ref, settings, app.state.client, origin=request_origin(request))
-    payload = (
-        await operations.resolved_with_optional_pin(result, settings, app.state.client)
-        if pin
-        else result.as_dict()
+    record = StaticStore(settings.static_root, settings.static_cache_max_bytes).resolution(
+        canonical_ref_key(ref)
     )
-    return JSONResponse(payload)
+    if record is None:
+        return JSONResponse({"error": "reference not found"}, status_code=404)
+    return RedirectResponse(str(record["media_path"]), status_code=302)
 
 
-@app.get("/c")
-async def cast(request: Request, ref: str = Query(..., description="Any media reference")):
-    result = await resolve_ref(ref, get_settings(), app.state.client, origin=request_origin(request))
-    if not result.resolved:
-        return JSONResponse(result.as_dict(), status_code=422)
-    return RedirectResponse(result.resolved_url, status_code=302)
+@app.post(
+    "/resolve",
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {"ref": {"type": "string"}},
+                        "required": ["ref"],
+                    }
+                },
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {"file": {"type": "string", "format": "binary"}},
+                        "required": ["file"],
+                    }
+                },
+            }
+        }
+    },
+)
+async def resolve_post(
+    request: Request,
+    ref: str | None = Query(None, description="A media reference to store"),
+):
+    """Resolve and store exactly one reference or uploaded file."""
+    file: UploadFile | None = None
+    content_type = request.headers.get("content-type", "").lower()
+    if content_type.startswith("application/json"):
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        body_ref = body.get("ref") if isinstance(body, dict) else None
+        if isinstance(body_ref, str):
+            if ref is not None:
+                return JSONResponse({"error": "supply ref only once"}, status_code=400)
+            ref = body_ref
+    elif content_type.startswith("multipart/form-data"):
+        candidate = (await request.form()).get("file")
+        if isinstance(candidate, UploadFile):
+            file = candidate
+
+    if (ref is None) == (file is None):
+        if file is not None:
+            await file.close()
+        return JSONResponse({"error": "supply exactly one of ref or file"}, status_code=400)
+
+    settings = get_settings()
+    origin = request_origin(request)
+    if ref is not None:
+        payload, stored = await operations.store_reference(
+            ref, settings, app.state.client, origin
+        )
+        return JSONResponse(payload, status_code=200 if stored else 422)
+
+    store = StaticStore(settings.static_root, settings.static_cache_max_bytes)
+    store.root.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=store.root, prefix=".upload-", delete=False) as output:
+            temporary = Path(output.name)
+            size = 0
+            while chunk := await file.read(65536):
+                size += len(chunk)
+                if size > settings.static_max_bytes:
+                    return JSONResponse(
+                        {"error": f"body exceeds {settings.static_max_bytes} bytes"},
+                        status_code=413,
+                    )
+                output.write(chunk)
+        entry = store.put_file(
+            temporary,
+            media_type=file.content_type,
+            filename=file.filename,
+            source_ref=None,
+            storage_status="stored",
+        )
+        temporary = None
+        payload = operations.record_upload(
+            entry,
+            filename=file.filename,
+            settings=settings,
+            origin=origin,
+        )
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        await file.close()
+    return JSONResponse(payload, status_code=201)
 
 
 def _wallet_error(exc: Exception) -> JSONResponse:
@@ -147,13 +221,10 @@ async def wallet(
     request: Request,
     ref: str = Query(..., description="Wallet address or name: 0x…, name.eth, tz1…, name.tez"),
     limit: int | None = Query(None, ge=1, description="Stop after this many tokens"),
-    pin: bool = Query(False, description="Also pin everything listed (starts a seed job)"),
     scope: str = Query("held", description=_SCOPE_DESCRIPTION),
     status: bool = Query(False, description="Also resolve each primary_ref and classify it (ok/substituted/unreachable/unresolvable/no-ref) — the audit view"),
-    include_burned: bool = Query(False, description="created scope only: keep fully-burned creations (default drops them — destroyed on purpose)"),
+    include_burned: bool = Query(False, description="created scope only: include fully-burned creations (default drops them — destroyed on purpose)"),
 ):
-    if pin:
-        require_curator(request.headers.get("authorization"))
     try:
         result = await list_wallet_tokens(
             ref, get_settings(), app.state.client,
@@ -166,26 +237,15 @@ async def wallet(
             {"error": "not a wallet-shaped reference (want 0x…, name.eth, tz1…, or name.tez)"},
             status_code=400,
         )
-    if pin:
-        try:
-            job = await start_seed(
-                ref, get_settings(), app.state.client,
-                limit=limit, scope=scope, include_burned=include_burned,
-            )
-            result["pin_job"] = job.as_dict() if job else None
-        except (TooManySeedJobs, httpx.HTTPError, ValueError) as exc:
-            result["pin_job"] = None
-            result["pin_error"] = f"{type(exc).__name__}: {exc}"
     return JSONResponse(result)
 
 
 @app.post("/seed")
 async def seed(
-    _: None = Depends(require_curator),
     ref: str = Query(..., description="Wallet address or name: 0x…, name.eth, tz1…, name.tez"),
     limit: int | None = Query(None, ge=1, description="Stop after this many tokens (for testing/incremental runs)"),
     scope: str = Query("held", description=_SCOPE_DESCRIPTION),
-    include_burned: bool = Query(False, description="created scope only: keep fully-burned creations (default drops them — destroyed on purpose)"),
+    include_burned: bool = Query(False, description="created scope only: include fully-burned creations (default drops them — destroyed on purpose)"),
 ):
     try:
         job = await start_seed(
@@ -259,9 +319,7 @@ async def override_list(
 
 
 @app.post("/override")
-async def override_add(
-    request: Request, body: OverrideBody, _: None = Depends(require_curator)
-):
+async def override_add(request: Request, body: OverrideBody):
     registry = _registry()
     if registry is None:
         return _registry_disabled()
@@ -283,7 +341,6 @@ async def override_add(
 
 @app.delete("/override")
 async def override_remove(
-    _: None = Depends(require_curator),
     ref: str = Query(..., description="Any spelling of the dead canonical ref"),
 ):
     registry = _registry()
@@ -322,7 +379,6 @@ async def favorite_list(request: Request):
 @app.post("/favorites")
 async def favorite_add(
     request: Request,
-    _: None = Depends(require_curator),
     ref: str = Query(..., description="Any media reference (any spelling of it)"),
     note: str | None = Query(None, description="Optional short note"),
 ):
@@ -337,7 +393,6 @@ async def favorite_add(
             settings=get_settings(),
             client=app.state.client,
             origin=lambda: request_origin(request),
-            background_why="favorite",
         )
     except (DuplicateFavorite, FavoritesUnparseable) as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
@@ -350,9 +405,6 @@ async def favorite_add(
             "playback_method": result.playback_method if result else None,
             "final_ref": result.final_ref if result else record.get("final_ref"),
             "source_ref": result.final_ref if result else record.get("final_ref"),
-            "pin_scheduled": created.pin_scheduled,
-            "keep_state": result.keep_state if result else None,
-            "promoted": created.promoted,
         },
         status_code=201,
     )
@@ -360,7 +412,6 @@ async def favorite_add(
 
 @app.delete("/favorites")
 async def favorite_remove(
-    _: None = Depends(require_curator),
     ref: str = Query(..., description="Any spelling of the favorite's ref"),
 ):
     favorites = _favorites_store()
@@ -373,78 +424,6 @@ async def favorite_remove(
     except FavoritesUnparseable as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
     return JSONResponse({"removed": removed})
-
-
-@app.post("/store")
-async def store(
-    request: Request,
-    file: UploadFile,
-    _: None = Depends(require_curator),
-    expect_cid: str | None = Query(
-        None,
-        description="Canonical recovery: pin only if the bytes reproduce this CID (409 otherwise)",
-    ),
-):
-    """Upload into Curio's static store. Uploads never enter IPFS implicitly."""
-    if expect_cid:
-        return JSONResponse(
-            {"error": "expect_cid applies to explicit canonical IPFS recovery, not static uploads"},
-            status_code=400,
-        )
-    settings = get_settings()
-    store = StaticStore(settings.static_root, settings.static_cache_max_bytes)
-    store.root.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        # UploadFile may be backed by a spooled file, but read() still returns
-        # an unbounded byte string. Copy in chunks into our state filesystem so
-        # the size limit is enforced without buffering the complete upload.
-        with tempfile.NamedTemporaryFile(dir=store.root, prefix=".upload-", delete=False) as output:
-            temporary = Path(output.name)
-            size = 0
-            while chunk := await file.read(65536):
-                size += len(chunk)
-                if size > settings.static_max_bytes:
-                    return JSONResponse({"error": f"body exceeds {settings.static_max_bytes} bytes"}, status_code=413)
-                output.write(chunk)
-        entry = store.put_file(
-            temporary, media_type=file.content_type, filename=file.filename,
-            source_ref=f"upload:{file.filename}", keep_state="kept",
-        )
-        temporary = None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-        await file.close()
-    return JSONResponse(
-        {**entry, "filename": file.filename, "media_url": f"{request_origin(request)}/media/{entry['id']}",
-         "source_kind": "upload", "integrity": {"algorithm": "sha256", "digest": entry["digest"]}},
-        status_code=201,
-    )
-
-
-@app.post("/keep")
-async def keep(request: Request, ref: str = Query(...), _: None = Depends(require_curator)):
-    result = await resolve_ref(ref, get_settings(), app.state.client, origin=request_origin(request))
-    if not result.resolved:
-        return JSONResponse(result.as_dict(), status_code=422)
-    if result.keep_state == "live-dependent":
-        return JSONResponse({**result.as_dict(), "keep_state": "live-dependent",
-            "error": "HTML capture has uncaptured runtime dependencies"}, status_code=409)
-    if result.source_kind in {"http", "data", "upload"}:
-        if not operations.promote_static(result, get_settings()):
-            return JSONResponse({"error": "static media missing"}, status_code=404)
-        result.keep_state = "kept"
-        return JSONResponse(result.as_dict())
-    try:
-        outcome = await pin_resolved(result, get_settings(), app.state.client, why="keep")
-    except Exception as exc:
-        return JSONResponse({**result.as_dict(), "keep_state": "failed", "error": str(exc)}, status_code=502)
-    if outcome not in {"pinned", "kept"}:
-        return JSONResponse({**result.as_dict(), "keep_state": "failed",
-            "error": "content was not successfully fetched and verified locally"}, status_code=502)
-    result.keep_state = "kept"
-    return JSONResponse(result.as_dict())
 
 
 @app.get("/library")

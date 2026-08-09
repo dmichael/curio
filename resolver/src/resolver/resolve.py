@@ -30,7 +30,7 @@ import html
 import json
 import re
 import tempfile
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -50,9 +50,15 @@ from .fixups import (
 )
 from .overrides import get_registry
 from .refs import arweave_parts, ipfs_parts
-from .static_store import CacheQuotaError, StaticStore
+from .static_store import CacheQuotaError, ResolutionStatus, StaticStore
 
-__all__ = ["Resolved", "resolve_ref", "pick_media_field", "external_url_ok"]
+__all__ = [
+    "Resolved",
+    "resolve_ref",
+    "storage_intent",
+    "pick_media_field",
+    "external_url_ok",
+]
 
 _VERSE_HOSTS = {"verse.works", "www.verse.works"}
 _META_IMAGE_RE = re.compile(
@@ -72,6 +78,17 @@ _MAX_DIR_CHILDREN = 8
 # resolver may run tests on multiple loops, hence the loop identity in the key.
 _STATIC_FETCH_LIMITERS: dict[tuple[int, int], asyncio.Semaphore] = {}
 _STATIC_FETCH_DEPTH: ContextVar[int] = ContextVar("static_fetch_depth", default=0)
+_STORAGE_INTENT: ContextVar[bool] = ContextVar("storage_intent", default=False)
+
+
+@contextmanager
+def storage_intent():
+    """Make final static artifacts non-evictable throughout recursive resolution."""
+    token = _STORAGE_INTENT.set(True)
+    try:
+        yield
+    finally:
+        _STORAGE_INTENT.reset(token)
 
 
 @asynccontextmanager
@@ -116,8 +133,12 @@ class Resolved:
     # deliberately differs from original_ref, which remains the caller's
     # discovery input (often a metadata document).
     final_ref: str | None = None
-    keep_state: str = "cached"
+    status: ResolutionStatus = ResolutionStatus.READY
     integrity: dict[str, str] | None = None
+
+    def __post_init__(self) -> None:
+        if not self.resolved:
+            self.status = ResolutionStatus.FAILED
 
     def as_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -250,6 +271,30 @@ async def resolve_ref(
     if _depth > _MAX_DEPTH:
         return Resolved(ref, ref, "play", None, False, note="recursion limit reached")
 
+    if ref.startswith(("upload:sha256:", "data:sha256:")):
+        record = StaticStore(
+            settings.static_root, settings.static_cache_max_bytes
+        ).resolution(ref)
+        if record is None:
+            return Resolved(ref, ref, "play", None, False, note="stored reference not found")
+        base = origin.rstrip("/") if origin else settings.ipfs_public_base.rstrip("/")
+        media_type = record.get("media_type")
+        status = ResolutionStatus(str(record["status"]))
+        source_kind = "upload" if ref.startswith("upload:") else "data"
+        digest = ref.rsplit(":", 1)[-1]
+        return Resolved(
+            ref,
+            f"{base}{record['media_path']}",
+            "send" if status == ResolutionStatus.LIVE_DEPENDENT else "play",
+            source_kind,
+            True,
+            content_type=str(media_type) if media_type else None,
+            source_kind=source_kind,
+            final_ref=str(record["final_ref"]),
+            status=status,
+            integrity={"algorithm": "sha256", "digest": digest},
+        )
+
     if settings.overrides_path:
         override = get_registry(settings.overrides_path).lookup(ref)
         if override is not None:
@@ -334,7 +379,7 @@ async def _resolve_ipfs(
     if main == "text/html":
         return Resolved(
             ref, public, "send", "ipfs", True, content_type=content_type,
-            source_kind="ipfs", final_ref=native_ref, keep_state="live-dependent",
+            source_kind="ipfs", final_ref=native_ref, status=ResolutionStatus.LIVE_DEPENDENT,
             integrity={"algorithm": "ipfs-cid", "digest": cid},
         )
 
@@ -345,7 +390,7 @@ async def _resolve_ipfs(
     return Resolved(
         ref, public, method, "ipfs", True, content_type=content_type,
         source_kind="ipfs", final_ref=native_ref,
-        keep_state="live-dependent" if method == "send" else "cached",
+        status=ResolutionStatus.LIVE_DEPENDENT if method == "send" else ResolutionStatus.READY,
         # A CID names an IPLD graph, not necessarily one flat byte stream.
         integrity={"algorithm": "ipfs-cid", "digest": cid},
     )
@@ -416,7 +461,7 @@ async def _resolve_arweave(
     return Resolved(
         ref, public, method, "arweave", True, content_type=content_type,
         source_kind="arweave", final_ref=native_ref,
-        keep_state="live-dependent" if main == "text/html" else "cached",
+        status=ResolutionStatus.LIVE_DEPENDENT if main == "text/html" else ResolutionStatus.READY,
         integrity=integrity,
     )
 
@@ -473,8 +518,13 @@ async def _resolve_direct_fetch(
                     if size > cap:
                         raise ValueError(f"response larger than {cap} bytes")
                     output.write(chunk)
-        entry = store.put_file(Path(temporary), media_type=content_type,
-                               filename=seg or None, source_ref=ref)
+        entry = store.put_file(
+            Path(temporary),
+            media_type=content_type,
+            filename=seg or None,
+            source_ref=ref,
+            storage_status="stored" if _STORAGE_INTENT.get() else "cached",
+        )
         temporary = None  # put_file atomically moved it
     except CacheQuotaError as exc:
         return Resolved(
@@ -493,7 +543,7 @@ async def _resolve_direct_fetch(
     url = f"{public_origin}/media/{entry['id']}"
     method = "send" if _main_content_type(content_type) == "text/html" else infer_playback_method(path)
     return Resolved(ref, url, method, "http", True, content_type=content_type, source_kind="http", final_ref=ref,
-        keep_state="live-dependent" if _main_content_type(content_type) == "text/html" else "cached",
+        status=ResolutionStatus.LIVE_DEPENDENT if _main_content_type(content_type) == "text/html" else ResolutionStatus.READY,
         integrity={"algorithm": "sha256", "digest": str(entry["digest"])})
 
 
@@ -600,14 +650,18 @@ async def _resolve_data_uri(
         return Resolved(ref, ref, "play", "data", False, note="data: URI exceeds configured size limit", final_ref=ref)
     try:
         entry = StaticStore(settings.static_root, settings.static_cache_max_bytes).put(
-            data, media_type=mediatype, filename=None, source_ref=ref,
+            data,
+            media_type=mediatype,
+            filename=None,
+            source_ref=ref,
+            storage_status="stored" if _STORAGE_INTENT.get() else "cached",
         )
     except CacheQuotaError as exc:
         return Resolved(ref, ref, "play", "data", False, note=f"media cache admission failed: {exc}", final_ref=ref)
     base = origin.rstrip("/") if origin else settings.ipfs_public_base.rstrip("/")
     method = "send" if mediatype == "text/html" else "play"
     return Resolved(ref, f"{base}/media/{entry['id']}", method, "data", True, content_type=mediatype,
-        source_kind="data", final_ref=ref, keep_state="live-dependent" if mediatype == "text/html" else "cached",
+        source_kind="data", final_ref=ref, status=ResolutionStatus.LIVE_DEPENDENT if mediatype == "text/html" else ResolutionStatus.READY,
         integrity={"algorithm": "sha256", "digest": str(entry["digest"])})
 
 

@@ -6,7 +6,7 @@ extracts every content-addressed media reference from token metadata, then:
 
   - IPFS refs    -> `pin add` on the box's Kubo API (fetches and keeps the DAG)
   - Arweave refs -> fetched and verified through Curio's one persistent AR.IO Core
-  - plain http   -> copied into and synchronously kept by Curio's static backend
+  - plain http   -> copied into Curio's static store
 
 Wallet seeding never moves ordinary HTTP bytes into IPFS.
 
@@ -28,11 +28,12 @@ from datetime import datetime, timezone
 
 import httpx
 
-from .arweave_cache import keep_arweave
+from .arweave_cache import store_arweave
 from .config import Settings
-from .library import ingest_url, keep_task, record_warm
+from .library import ingest_url, record_warm, track_task
+from .operations import record_result
 from .refs import arweave_parts, ipfs_parts
-from .resolve import external_url_ok, resolve_ref
+from .resolve import Resolved, external_url_ok, resolve_ref, storage_intent
 from .static_store import StaticStore
 from .wallets import (
     _check_scope,
@@ -54,7 +55,7 @@ class SeedJob:
     ref: str
     chain: str  # "ethereum" | "tezos"
     scope: str = "held"  # "held" | "published" (first-minted) | "created" (authored) | "contract"
-    include_burned: bool = False  # created scope: keep fully-burned creations too
+    include_burned: bool = False  # created scope: include fully-burned creations too
     status: str = "running"  # "running" | "done" | "failed"
     address: str | None = None
     tokens: int = 0
@@ -62,7 +63,7 @@ class SeedJob:
     pinned: int = 0
     recovered: int = 0  # pinned via HTTP-copy recovery after IPFS fetch failed
     warmed: int = 0  # same-Core fetch/verification operations
-    captured: int = 0  # static HTTP captures (kept for wire compatibility)
+    captured: int = 0  # static HTTP captures (retained for wire compatibility)
     skipped: int = 0
     failed: int = 0
     errors: list[str] = field(default_factory=list)
@@ -156,13 +157,13 @@ async def start_seed(
         started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
     _JOBS[job.id] = job
-    keep_task(asyncio.create_task(run_seed(job, settings, client, limit=limit)))
+    track_task(asyncio.create_task(run_seed(job, settings, client, limit=limit)))
     return job
 
 
-def _evict_finished(keep: int) -> None:
+def _evict_finished(limit: int) -> None:
     finished = [job_id for job_id, job in _JOBS.items() if job.status != "running"]
-    for job_id in finished[: max(0, len(finished) - keep)]:
+    for job_id in finished[: max(0, len(finished) - limit)]:
         del _JOBS[job_id]
 
 
@@ -219,7 +220,7 @@ async def _run_seed_inner(
     native_refs: set[str] = set()
     native_refs_lock = asyncio.Lock()
     await asyncio.gather(
-        *(_keep_ref(ref, job, settings, client, sem, native_refs, native_refs_lock) for ref in refs),
+        *(_store_ref(ref, job, settings, client, sem, native_refs, native_refs_lock) for ref in refs),
     )
 
 
@@ -235,8 +236,8 @@ async def _pin_cid(
     settings: Settings,
     client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
-) -> None:
-    """`pin add` on the box's Kubo — this fetches the DAG and keeps it.
+) -> bool:
+    """`pin add` on the box's Kubo, returning whether storage succeeded.
 
     When the IPFS fetch fails (providers gone), fall back to recovering the
     bytes from an HTTP copy of the same content.
@@ -250,7 +251,7 @@ async def _pin_cid(
             )
             response.raise_for_status()
             job.pinned += 1
-            return
+            return True
         except httpx.HTTPError as exc:
             pin_error = f"{type(exc).__name__}: {exc}"
 
@@ -258,11 +259,12 @@ async def _pin_cid(
         if recovery_sources and await _recover_cid(cid, recovery_sources, job, settings, client):
             job.recovered += 1
             _log.info("seed %s: recovered %s from an HTTP copy", job.id, cid)
-            return
+            return True
 
         job.failed += 1
         _note_error(job, f"pin {cid}: {pin_error}")
         _log.warning("seed %s: pin %s failed (%s); recovery failed", job.id, cid, pin_error)
+        return False
 
 
 def _recovery_sources(cid: str, seen: list[str], settings: Settings) -> list[str]:
@@ -341,41 +343,67 @@ async def _warm_txid(
             _note_error(job, f"warm {txid}: {type(exc).__name__}: {exc}")
 
 
-async def _keep_txid(
+async def _store_txid(
     txid: str, path: str, job: SeedJob, settings: Settings, client: httpx.AsyncClient, sem: asyncio.Semaphore
-) -> None:
-    """Explicit seed intent fetches and verifies the same persistent Core."""
+) -> bool:
+    """Fetch and verify one Arweave identity in the persistent Core."""
     async with sem:
-        outcome = await keep_arweave(txid, path, settings, client)
-        if outcome == "kept":
+        outcome = await store_arweave(txid, path, settings, client)
+        if outcome == "stored":
             job.warmed += 1
             record_warm(txid, settings, why="seed")
-            return
+            return True
         job.failed += 1
-        _note_error(job, f"keep {txid}{path}: same-Core cache verification failed")
+        _note_error(job, f"store {txid}{path}: same-Core cache verification failed")
+        return False
 
 
-async def _keep_ref(
+async def _record_stored_ref(
+    ref: str,
+    result: Resolved,
+    job: SeedJob,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+) -> bool:
+    """Record a seed result so the submitted reference is playable through GET."""
+    if not result.resolved:
+        async with sem:
+            with storage_intent():
+                result = await resolve_ref(ref, settings, client)
+    if not result.resolved:
+        # The source-native operation still succeeded. Some tests and unusual
+        # gateways do not make a newly stored artifact immediately probeable;
+        # omit only the playback record rather than misreporting storage failure.
+        return False
+    try:
+        origin = settings.public_base_url or settings.ipfs_public_base
+        record_result(ref, result, settings, origin)
+    except (OSError, ValueError) as exc:
+        job.failed += 1
+        _note_error(job, f"store {ref}: resolution record failed: {exc}")
+        return False
+    return True
+
+
+async def _store_ref(
     ref: str, job: SeedJob, settings: Settings, client: httpx.AsyncClient, sem: asyncio.Semaphore,
     native_refs: set[str], native_refs_lock: asyncio.Lock,
 ) -> None:
-    """Keep a discovered reference on the final artifact's native plane."""
+    """Store a discovered reference on the final artifact's native plane."""
     try:
         async with sem:
-            result = await resolve_ref(ref, settings, client)
+            with storage_intent():
+                result = await resolve_ref(ref, settings, client)
     except (httpx.HTTPError, ValueError) as exc:
         job.failed += 1
-        _note_error(job, f"retain {ref}: {type(exc).__name__}: {exc}")
+        _note_error(job, f"store {ref}: {type(exc).__name__}: {exc}")
         return
     final_ref = result.final_ref
     ipfs = ipfs_parts(final_ref) if final_ref else None
     arweave = arweave_parts(final_ref) if final_ref else None
-    # Runtime HTML needs dependency capture/replay before it can honestly be
-    # called kept. Native identity alone is not enough to preserve the work.
-    if result.keep_state == "live-dependent":
-        job.failed += 1
-        _note_error(job, f"retain {ref}: HTML runtime has uncaptured dependencies")
-        return
+    # Runtime HTML is stored like any other primary artifact, while callers
+    # continue to see its honest live-dependent status.
     # A CID pin covers every file below that CID; Arweave paths and static
     # artifacts remain distinct identities.
     native_key = f"ipfs:{ipfs[0]}" if ipfs else final_ref
@@ -384,24 +412,27 @@ async def _keep_ref(
             job.skipped += 1
             return
         native_refs.add(native_key)
-    # A seed's explicit keep intent may make a cold IPFS/Arweave artifact
-    # locally servable. This is limited to an already-recognized native final
+    # A seed's storage intent may make a cold IPFS/Arweave artifact locally
+    # servable. This is limited to an already-recognized native final
     # ref; arbitrary HTTP/data bodies never enter Kubo.
     if result.source_kind == "ipfs" and ipfs is not None:
         cid, path = ipfs
         sources = [ref] if not path.strip("/") and ref.startswith(("http://", "https://")) else []
-        await _pin_cid(cid, sources, job, settings, client, sem)
+        if await _pin_cid(cid, sources, job, settings, client, sem):
+            await _record_stored_ref(ref, result, job, settings, client, sem)
         return
     if result.source_kind == "arweave" and arweave is not None:
-        await _keep_txid(*arweave, job, settings, client, sem)
+        if await _store_txid(*arweave, job, settings, client, sem):
+            await _record_stored_ref(ref, result, job, settings, client, sem)
         return
     if not result.resolved:
         job.failed += 1
-        _note_error(job, f"retain {ref}: final artifact is unavailable")
+        _note_error(job, f"store {ref}: final artifact is unavailable")
         return
     if result.source_kind in {"http", "data", "upload"} and "/media/" in result.resolved_url:
-        if StaticStore(settings.static_root, settings.static_cache_max_bytes).keep(result.resolved_url.rsplit("/", 1)[-1]):
+        if StaticStore(settings.static_root, settings.static_cache_max_bytes).store(result.resolved_url.rsplit("/", 1)[-1]):
             job.captured += 1
+            await _record_stored_ref(ref, result, job, settings, client, sem)
             return
     job.failed += 1
-    _note_error(job, f"retain {ref}: final source has no promotable native artifact")
+    _note_error(job, f"store {ref}: final source has no promotable native artifact")

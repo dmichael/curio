@@ -18,8 +18,8 @@ class Settings(BaseSettings):
 
     # Gateways the resolver PROBES and fetches metadata from (on-box, localhost).
     ipfs_internal: str = "http://127.0.0.1:8080"
-    # The one persistent AR.IO Core data API. Resolve, playback, and explicit
-    # keep verification all use this same cache.
+    # The one persistent AR.IO Core data API. Resolution, storage, and playback
+    # all use this same Core.
     arweave_internal: str = "http://127.0.0.1:4000"
 
     # Public front-door URL takes precedence over a request/proxy origin.
@@ -36,16 +36,13 @@ class Settings(BaseSettings):
     # retention metadata; object files are addressed by their SHA-256 digest.
     static_root: str = "/tmp/curio-media"
     static_max_bytes: int = Field(default=128_000_000, gt=0)
-    # Total disk budget for evictable public HTTP/data cache objects. Kept
-    # static media is durable library content and intentionally not charged.
+    # Total disk budget for evictable public HTTP/data cache objects. Stored
+    # static media is library content and intentionally not charged.
     static_cache_max_bytes: int = Field(default=1_000_000_000, gt=0)
     static_fetch_concurrency: int = Field(default=4, ge=1)
     data_max_bytes: int = Field(default=4_000_000, gt=0)
     redirect_max_hops: int = Field(default=5, ge=0)
     ssrf_dns_check: bool = True
-
-    # Empty means curator mutations are disabled rather than public.
-    curator_token: str = ""
 
     # Operator-curated exception registry (overrides.py, docs/design.md):
     # a TOML file mapping dead canonical refs to replacements. Empty disables

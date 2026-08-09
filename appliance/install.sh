@@ -29,7 +29,7 @@ ensure_start_height() {
     fi
     echo "Resolving the current Arweave chain height (first install only)..."
     docker pull "$AR_IO_CORE_IMAGE"
-    height=$(docker run --rm --entrypoint node "$AR_IO_CORE_IMAGE" -e \
+    height=$(docker run --rm --entrypoint /nodejs/bin/node "$AR_IO_CORE_IMAGE" -e \
         'const https=require("https");const r=https.get("https://arweave.net/info",{timeout:30000},x=>{let b="";x.on("data",c=>b+=c);x.on("end",()=>{try{const h=JSON.parse(b).height;if(Number.isSafeInteger(h)&&h>=0)console.log(h);else process.exitCode=1}catch{process.exitCode=1}})});r.on("timeout",()=>r.destroy(new Error("timeout")));r.on("error",()=>process.exitCode=1);') || fail "could not query Arweave height through pinned AR.IO Core image"
     valid_uint "$height" || fail "arweave.net returned an invalid chain height: ${height:-empty}"
     temporary="$state_file.tmp.$$"
@@ -86,13 +86,11 @@ main() {
         [ -z "${CURIO_DATA_ROOT:-}" ] || [ "$requested_data_root" = "$data_root" ] || fail "CURIO_DATA_ROOT differs from existing configuration; make an explicit migration instead"
     else
         app_root=$requested_app_root; data_root=$requested_data_root
-        token=${CURIO_CURATOR_TOKEN:-$(dd if=/dev/urandom bs=24 count=1 2>/dev/null | base64 | tr -d '\n')}
         cat >"$config_file" <<EOF
 CURIO_APP_ROOT=$app_root
 CURIO_DATA_ROOT=$data_root
 CURIO_HOST_UID=$(id -u)
 CURIO_HOST_GID=$(id -g)
-CURIO_CURATOR_TOKEN=$token
 CURIO_IPFS_STORAGE_MAX=${CURIO_IPFS_STORAGE_MAX:-20GB}
 CURIO_STATIC_CACHE_MAX_BYTES=${CURIO_STATIC_CACHE_MAX_BYTES:-1000000000}
 CURIO_ARWEAVE_COLD_TIMEOUT=${CURIO_ARWEAVE_COLD_TIMEOUT:-300}
@@ -103,7 +101,6 @@ EOF
         chmod 600 "$config_file"
     fi
     valid_root "$app_root" && valid_root "$data_root" || fail "configured roots are unsafe"
-    grep -q '^CURIO_CURATOR_TOKEN=.' "$config_file" || fail "CURIO_CURATOR_TOKEN is required"
     grep -q '^CURIO_HOST_UID=[0-9][0-9]*$' "$config_file" || fail "CURIO_HOST_UID is required"
     grep -q '^CURIO_HOST_GID=[0-9][0-9]*$' "$config_file" || fail "CURIO_HOST_GID is required"
     # Historical Redis/Envoy/retained directories are intentionally untouched.

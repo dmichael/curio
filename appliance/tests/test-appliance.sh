@@ -7,6 +7,7 @@ trap 'if [[ -f $TMP/pyproject.orig ]]; then cp "$TMP/pyproject.orig" "$ROOT/reso
 fail() { echo "test-appliance: $*" >&2; exit 1; }
 for command in python3 tar sha256sum; do command -v "$command" >/dev/null || fail "$command is required"; done
 grep -q 'RESOLVER_TRUSTED_PROXY_CIDRS: ${CURIO_TRUSTED_PROXY_CIDRS:-}' "$ROOT/appliance/compose.yaml" || fail 'Compose does not map trusted proxy CIDRs'
+grep -q -- '--entrypoint /nodejs/bin/node' "$ROOT/appliance/install.sh" || fail 'Installer does not use the pinned Core image node path'
 
 # Bootstrap checksum and requested-version verification must happen before the
 # embedded installer runs. A fake installer records that it was reached.
@@ -39,7 +40,6 @@ CURIO_APP_ROOT=$APP
 CURIO_DATA_ROOT=$DATA
 CURIO_HOST_UID=$(id -u)
 CURIO_HOST_GID=$(id -g)
-CURIO_CURATOR_TOKEN=test
 EOF
   docker compose --project-name curio-qualification --env-file "$TMP/curio.env" --file "$ROOT/appliance/compose.yaml" config --format json >"$TMP/compose.json"
   python3 - "$TMP/compose.json" "$DATA" <<'PY'
@@ -67,6 +67,7 @@ assert not s['kubo'].get('ports',[])[0]['target']==8080
 assert s['resolver']['environment']['RESOLVER_ARWEAVE_INTERNAL']=='http://ar-io-core:4000'
 assert s['resolver']['environment']['RESOLVER_ARWEAVE_COLD_TIMEOUT']=='300'
 assert s['resolver']['environment']['RESOLVER_TRUSTED_PROXY_CIDRS']==''
+assert 'RESOLVER_CURATOR_TOKEN' not in s['resolver']['environment']
 assert 'RESOLVER_IPFS_PUBLIC_BASE' not in s['resolver']['environment']
 PY
 else

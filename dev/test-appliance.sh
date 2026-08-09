@@ -26,15 +26,18 @@ health(){ "$HOME/.local/bin/curio" health >"$EVIDENCE_DIR/health.latest" 2>&1; }
 wait_healthy(){ for _ in $(seq 1 120); do health && return; sleep 5; done; cat "$EVIDENCE_DIR/health.latest" >&2; fail 'Curio did not become healthy'; }
 fetch_arweave_fixture(){
   local txid=$1 output=$2 headers=$3 code
-  code=$(curl -sS -L --max-time 600 -D "$headers" -o "$output" -w '%{http_code}' "http://127.0.0.1:8090/arweave/$txid" || true)
-  [[ $code == 200 ]] || fail "AR.IO fixture failed (HTTP ${code:-none})"
+  for _ in $(seq 1 12); do
+    code=$(curl -sS -L --max-time 600 -D "$headers" -o "$output" -w '%{http_code}' "http://127.0.0.1:8090/arweave/$txid" || true)
+    [[ $code == 200 ]] && return
+    sleep 5
+  done
+  fail "AR.IO fixture failed (HTTP ${code:-none})"
 }
 verify(){
-  local id token
-  token=$(awk -F= '$1=="CURIO_CURATOR_TOKEN"{print $2}' "$ENV_FILE")
-  id=$(<"$EVIDENCE_DIR/media-id")
+  local ref
+  ref=$(<"$EVIDENCE_DIR/media-ref")
   curl -fsS http://127.0.0.1:8090/healthz >/dev/null
-  [[ $(curl -fsS "http://127.0.0.1:8090/media/$id") == "$(<"$EVIDENCE_DIR/payload")" ]] || fail 'static media lost'
+  [[ $(curl -fsSL --get --data-urlencode "ref=$ref" http://127.0.0.1:8090/resolve) == "$(<"$EVIDENCE_DIR/payload")" ]] || fail 'static media lost'
   curl -fsS http://127.0.0.1:8090/favorites | grep -F 'bafytest' >/dev/null || fail 'favorite lost'
   [[ $(sha256sum "$ENV_FILE" | awk '{print $1}') == $(<"$EVIDENCE_DIR/env.sha") ]] || fail 'configuration changed'
   [[ $(sha256sum "$DATA_ROOT/ar-io/start-height.env" | awk '{print $1}') == $(<"$EVIDENCE_DIR/height.sha") ]] || fail 'start height changed'
@@ -54,7 +57,7 @@ for c in json.loads(pathlib.Path(sys.argv[1]).read_text() or '[]'):
 PY
 }
 if [[ $MODE == --after-reboot ]]; then
-  [[ -f $EVIDENCE_DIR/media-id ]] || fail 'first-phase evidence is absent'
+  [[ -f $EVIDENCE_DIR/media-ref ]] || fail 'first-phase evidence is absent'
   wait_healthy; verify
   cp "$EVIDENCE_DIR/health.latest" "$EVIDENCE_DIR/health.after-reboot"
   echo "post-reboot checks passed; evidence: $EVIDENCE_DIR"; exit
@@ -62,7 +65,6 @@ fi
 "$ROOT/appliance/install.sh"
 wait_healthy
 readlink "$APP_ROOT/current" >"$EVIDENCE_DIR/release.before-rerun"
-token=$(awk -F= '$1=="CURIO_CURATOR_TOKEN"{print $2}' "$ENV_FILE")
 [[ $ARWEAVE_TXID =~ ^[A-Za-z0-9_-]{43}$ && $ARWEAVE_SHA256 =~ ^[a-fA-F0-9]{64}$ ]] || fail 'set both valid CURIO_TEST_ARWEAVE_TXID and CURIO_TEST_ARWEAVE_SHA256'
 fetch_arweave_fixture "$ARWEAVE_TXID" "$EVIDENCE_DIR/arweave.initial" "$EVIDENCE_DIR/arweave.initial.headers"
 [[ $(sha256sum "$EVIDENCE_DIR/arweave.initial" | awk '{print $1}') == "${ARWEAVE_SHA256,,}" ]] || fail 'AR.IO fixture checksum mismatch'
@@ -70,20 +72,17 @@ fetch_arweave_fixture "$ARWEAVE_TXID" "$EVIDENCE_DIR/arweave.initial" "$EVIDENCE
 fetch_arweave_fixture "$ARWEAVE_TXID" "$EVIDENCE_DIR/arweave.cached" "$EVIDENCE_DIR/arweave.cached.headers"
 [[ $(sha256sum "$EVIDENCE_DIR/arweave.cached" | awk '{print $1}') == "${ARWEAVE_SHA256,,}" ]] || fail 'cached AR.IO fixture checksum mismatch'
 grep -Eiq '^x-cache:[[:space:]]*HIT' "$EVIDENCE_DIR/arweave.cached.headers" || fail 'second AR.IO fetch was not a native cache hit'
-# Keep is eager same-Core fetch and verification, not movement between tiers
-# or a claim of replication into the Arweave network.
-keep=$(curl -fsS -X POST -H "Authorization: Bearer $token" --get --data-urlencode "ref=ar://$ARWEAVE_TXID" http://127.0.0.1:8090/keep)
-printf %s "$keep" | python3 -c 'import json,sys; assert json.load(sys.stdin)["keep_state"] == "kept"'
+# POST resolution stores through the same Core; it is not a claim of
+# replication into the Arweave network.
+resolution=$(curl -fsS -X POST --get --data-urlencode "ref=ar://$ARWEAVE_TXID" http://127.0.0.1:8090/resolve)
+printf %s "$resolution" | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "ready"'
 printf '%s\n' "$ARWEAVE_TXID" >"$EVIDENCE_DIR/arweave.txid"
 printf '%s\n' "${ARWEAVE_SHA256,,}" >"$EVIDENCE_DIR/arweave.sha"
 printf 'curio-persistence-%s\n' "$(date +%s)" >"$EVIDENCE_DIR/payload"
-store=$(curl -fsS -H "Authorization: Bearer $token" -F "file=@$EVIDENCE_DIR/payload" http://127.0.0.1:8090/store)
-printf %s "$store" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' >"$EVIDENCE_DIR/media-id"
-id=$(<"$EVIDENCE_DIR/media-id")
-curl -fsS -X POST -H "Authorization: Bearer $token" --get --data-urlencode "ref=http://127.0.0.1:8090/media/$id" http://127.0.0.1:8090/favorites >/dev/null || true
-# Direct localhost HTTP is intentionally rejected by SSRF protection; record
-# an IPFS favorite instead, while media persistence is checked independently.
-curl -fsS -X POST -H "Authorization: Bearer $token" --get --data-urlencode 'ref=ipfs://bafytest/art.png' http://127.0.0.1:8090/favorites >/dev/null
+stored=$(curl -fsS -F "file=@$EVIDENCE_DIR/payload" http://127.0.0.1:8090/resolve)
+printf %s "$stored" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ref"])' >"$EVIDENCE_DIR/media-ref"
+# Record an IPFS favorite independently from the uploaded-media persistence check.
+curl -fsS -X POST --get --data-urlencode 'ref=ipfs://bafytest/art.png' http://127.0.0.1:8090/favorites >/dev/null 2>&1 || true
 sha256sum "$ENV_FILE" | awk '{print $1}' >"$EVIDENCE_DIR/env.sha"
 sha256sum "$DATA_ROOT/ar-io/start-height.env" | awk '{print $1}' >"$EVIDENCE_DIR/height.sha"
 "$ROOT/appliance/install.sh"; wait_healthy

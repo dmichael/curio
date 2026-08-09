@@ -15,7 +15,6 @@ from .health import gateway_health
 from .library import library_status as _library_status
 from .origin import effective_origin
 from .overrides import OverrideError, OverrideRegistry, get_registry
-from .resolve import resolve_ref
 from .seed import get_job, list_jobs, start_seed
 from .wallets import list_wallet_tokens
 
@@ -60,54 +59,36 @@ def _mcp_origin(ctx: Context | None = None) -> str:
     return settings.public_base_url.rstrip("/") or settings.ipfs_public_base.rstrip("/")
 
 
-def _require_curator(token: str | None) -> None:
-    configured = get_settings().curator_token
-    if not configured or token != configured:
-        raise ValueError("curator authentication required")
-
-
 @mcp.tool()
-async def resolve(
-    ref: str, pin: bool = False, curator_token: str | None = None, ctx: Context = None
-) -> dict[str, Any]:
-    """Resolve a reference into a playable URL on the Curio origin.
+async def resolve(ref: str, ctx: Context = None) -> dict[str, Any]:
+    """Resolve and store an IPFS, Arweave, HTTP, data, or metadata reference.
 
-    Accepts IPFS and Arweave spellings, metadata/data URIs, Verse pages, and
-    direct HTTP media. `media_url`/`resolved_url` is ready for a renderer;
-    `play` is static media and `send` is HTML. `resolved=false` means Curio
-    cannot serve a local artifact. `substituted=true` discloses an override.
-    pin=true requires curator_token: IPFS reports a background pending pin,
-    static media is promoted synchronously, and Arweave fully fetches then
-    verifies the same persistent Core cache. Runtime HTML remains live-dependent.
+    A successful response contains the reference to pass to HTTP
+    `GET /resolve?ref=...`, plus its final source identity and status. Runtime
+    HTML is stored as `live-dependent` because its network dependencies remain
+    outside Curio.
     """
-    settings = get_settings()
-    client = _require_client()
-    result = await resolve_ref(ref, settings, client, origin=_mcp_origin(ctx))
-    if pin:
-        _require_curator(curator_token)
-        return await operations.resolved_with_optional_pin(result, settings, client)
-    return result.as_dict()
+    payload, _ = await operations.store_reference(
+        ref, get_settings(), _require_client(), _mcp_origin(ctx)
+    )
+    return payload
 
 
 @mcp.tool()
 async def wallet_tokens(
     ref: str,
     limit: int | None = None,
-    pin: bool = False,
     scope: str = "held",
     status: bool = False,
     include_burned: bool = False,
-    curator_token: str | None = None,
 ) -> dict[str, Any]:
     """List a wallet's NFTs live from the public indexers (browse/pick step).
 
     Call this to choose something to display: ref is 0x…, name.eth, tz1…, or
     name.tez. Each token carries name, contract, token_id, mime, refs, and
     primary_ref — pass primary_ref to the resolve tool to get a playable URL.
-    pin=true additionally makes everything listed durable by starting a seed
-    job for the wallet (same as seed_wallet, honoring limit and scope) — the
-    response gains pin_job; poll it with seed_status. scope="published"
-    (Tezos only) lists the works the wallet FIRST-MINTED — its published
+    Use seed_wallet to store every listed work. scope="published" (Tezos
+    only) lists the works the wallet FIRST-MINTED — its published
     catalog — instead of its holdings. scope="created" (Tezos only) lists
     what the wallet AUTHORED — tokens crediting it in creators/authors
     metadata — the robust authorship index (first-minter over-captures
@@ -130,31 +111,22 @@ async def wallet_tokens(
     )
     if result is None:
         raise ValueError("not a wallet-shaped reference (want 0x…, name.eth, tz1…, or name.tez)")
-    if pin:
-        _require_curator(curator_token)
-        job = await start_seed(
-            ref, get_settings(), _require_client(),
-            limit=limit, scope=scope, include_burned=include_burned,
-        )
-        result["pin_job"] = job.as_dict() if job else None
     return result
 
 
 @mcp.tool()
 async def seed_wallet(
     ref: str, limit: int | None = None, scope: str = "held", include_burned: bool = False,
-    curator_token: str | None = None,
 ) -> dict[str, Any]:
-    """Start a source-appropriate wallet keep job (background).
+    """Start a source-appropriate wallet storage job (background).
 
-    It pins final IPFS artifacts, fetches and verifies final Arweave artifacts
-    through the one persistent Core, and promotes final HTTP/data artifacts in
-    Curio static storage. Ordinary bytes never enter IPFS implicitly. Poll
+    It pins final IPFS artifacts, fetches final Arweave artifacts through the
+    persistent Core, and stores final HTTP/data artifacts in Curio. Ordinary
+    bytes never enter IPFS implicitly. Poll
     with seed_status. Re-running is safe; use limit for a partial run.
     scope="published" and "created" are Tezos-only; "contract" accepts a
     literal 0x…/KT1… contract on either supported chain.
     """
-    _require_curator(curator_token)
     job = await start_seed(
         ref, get_settings(), _require_client(),
         limit=limit, scope=scope, include_burned=include_burned,
@@ -203,7 +175,6 @@ async def add_override(
     captured: str | None = None,
     note: str | None = None,
     replace: bool = False,
-    curator_token: str | None = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Point a dead canonical ref at replacement content — an operator
@@ -211,8 +182,8 @@ async def add_override(
 
     ref matches ANY spelling of the same content (ipfs://CID, /ipfs/CID,
     gateway URLs; ar://txid, arweave.net URLs). replacement must already
-    resolve through Curio — REST `POST /store` creates kept static media and
-    returns its `media_url`; binary upload is not an MCP tool. status is the
+    resolve through Curio — a multipart `POST /resolve` stores an uploaded
+    replacement; binary upload is not an MCP tool. status is the
     provenance tier: 'canonical-recovered' (bytes
     reproduce the recorded CID), 'captured-original' (fetched from the
     canonical URL while it answered), 'operator-attested' (no hash ever
@@ -222,7 +193,6 @@ async def add_override(
     same ref errors unless replace=true. The response's replacement_resolved
     tells you whether the replacement actually resolves right now.
     """
-    _require_curator(curator_token)
     try:
         return await operations.create_override(
             _require_registry(),
@@ -245,12 +215,11 @@ async def add_override(
 
 
 @mcp.tool()
-async def remove_override(ref: str, curator_token: str | None = None) -> dict[str, Any]:
+async def remove_override(ref: str) -> dict[str, Any]:
     """Remove the override for a ref (any spelling of it). The dead canonical
     ref goes back to resolving as itself — i.e. failing — so only remove an
     entry when the canonical content is available again or the substitution
     was wrong."""
-    _require_curator(curator_token)
     try:
         removed = _require_registry().remove(ref)
     except OverrideError as exc:
@@ -280,7 +249,7 @@ async def list_favorites(ctx: Context = None) -> dict[str, Any]:
 
 @mcp.tool()
 async def add_favorite(
-    ref: str, note: str | None = None, curator_token: str | None = None, ctx: Context = None
+    ref: str, note: str | None = None, ctx: Context = None
 ) -> dict[str, Any]:
     """Mark a media reference as a household favorite.
 
@@ -289,14 +258,9 @@ async def add_favorite(
     same content count as the same favorite, so adding it twice errors. The
     resolver is consulted once to record a title for the browse list
     (enrichment only, never a gate — the response's `resolved` field says
-    whether the ref resolves right now). Favoriting also makes the content
-    durable where the source supports it: static records are promoted
-    synchronously, IPFS pinning is scheduled (`pin_scheduled=true`), and
-    Arweave synchronously fetches and verifies the same persistent Core cache. Runtime HTML remains
-    live-dependent. Removing a favorite never unpins. Use note for why it
-    was picked.
+    whether the ref resolves right now). Favorites organize the library; use
+    POST /resolve or seed_wallet to store media. Use note for why it was picked.
     """
-    _require_curator(curator_token)
     try:
         created = await operations.create_favorite(
             _require_favorites(),
@@ -314,17 +278,13 @@ async def add_favorite(
         "resolved": result.resolved if result else None,
         "final_ref": result.final_ref if result else record.get("final_ref"),
         "source_ref": result.final_ref if result else record.get("final_ref"),
-        "pin_scheduled": created.pin_scheduled,
-        "promoted": created.promoted,
-        "keep_state": result.keep_state if result else None,
     }
 
 
 @mcp.tool()
-async def remove_favorite(ref: str, curator_token: str | None = None) -> dict[str, Any]:
+async def remove_favorite(ref: str) -> dict[str, Any]:
     """Remove a favorite by its ref (any spelling of the same content
     matches). Only unmarks the pick — nothing is unpinned or deleted."""
-    _require_curator(curator_token)
     try:
         removed = _require_favorites().remove(ref)
     except FavoriteError as exc:
@@ -343,8 +303,8 @@ async def library_status() -> dict[str, Any]:
     """What the box holds, plane by plane.
 
     `ipfs.pinned` counts recursive Kubo pins. Arweave `known_warmed` and
-    `currently_cached` describe the one persistent Core cache. Resolve/play
-    also populate it; explicit keep eagerly fetches and verifies a local hit.
+    `currently_cached` describe the one persistent Core cache. Resolution and
+    playback populate that same Core.
     This is not an Arweave-network replication claim. Registry counts cover
     operator state. A failed plane gets its own error
     rather than failing the complete response.

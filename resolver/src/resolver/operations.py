@@ -1,52 +1,170 @@
-"""Shared mutation workflows used by the REST and MCP adapters."""
+"""Shared workflows used by the REST and MCP adapters."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 
 from .config import Settings
 from .favorites import Favorites
-from .library import pin_in_background, pin_resolved
+from .library import store_resolved
 from .overrides import OverrideRegistry, validate_entry
 from .refs import canonical_ref_key
-from .resolve import Resolved, resolve_ref
-from .static_store import StaticStore
+from .resolve import Resolved, resolve_ref, storage_intent
+from .static_store import ResolutionStatus, StaticStore
 
 
-def promote_static(result: Resolved, settings: Settings) -> bool:
-    """Promote a source-native static object without routing it through IPFS."""
+def store_static(result: Resolved, settings: Settings) -> bool:
+    """Mark a source-native static object as stored without routing it through IPFS."""
     if result.source_kind not in {"http", "data", "upload"} or "/media/" not in result.resolved_url:
         return False
-    return StaticStore(settings.static_root, settings.static_cache_max_bytes).keep(
+    return StaticStore(settings.static_root, settings.static_cache_max_bytes).store(
         result.resolved_url.rsplit("/", 1)[-1]
     )
 
 
-async def resolved_with_optional_pin(
-    result: Resolved, settings: Settings, client: httpx.AsyncClient
+def _media_path(url: str) -> str:
+    parsed = urlsplit(url)
+    path = parsed.path
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    if not path.startswith(("/ipfs/", "/arweave/", "/media/")):
+        raise ValueError("resolved media is not on a Curio media route")
+    return path
+
+
+def _digest_ref(prefix: str, result: Resolved) -> str | None:
+    integrity = result.integrity or {}
+    if integrity.get("algorithm") != "sha256" or not integrity.get("digest"):
+        return None
+    return f"{prefix}:sha256:{integrity['digest']}"
+
+
+def _public_ref(ref: str, result: Resolved) -> str:
+    if ref.startswith("data:"):
+        return _digest_ref("data", result) or ref.strip()
+    return ref.strip()
+
+
+def resolution_payload(
+    record: dict[str, object], origin: str, result: Resolved | None = None
 ) -> dict[str, Any]:
-    """Return a resolved payload with explicit, source-appropriate keep intent."""
-    payload = result.as_dict()
-    if result.source_kind in {"http", "data", "upload"}:
-        promoted = result.keep_state != "live-dependent" and promote_static(result, settings)
-        payload["pin_scheduled"] = False
-        payload["promoted"] = promoted
-        if promoted:
-            payload["keep_state"] = "kept"
-        elif result.keep_state != "live-dependent":
-            payload["keep_state"] = "failed"
-    elif result.resolved and result.keep_state != "live-dependent" and result.source_kind == "ipfs":
-        pin_in_background(result, settings, client, why="resolve pin")
-        payload["pin_scheduled"] = True
-        payload["keep_state"] = "pending"
-    elif result.resolved and result.keep_state != "live-dependent" and result.source_kind == "arweave":
-        payload["pin_scheduled"] = False
-        payload["keep_state"] = (await pin_resolved(result, settings, client, why="resolve keep")) or "failed"
-    else:
-        payload["pin_scheduled"] = False
+    """Format a stored resolution for API and MCP callers."""
+    ref = str(record["ref"])
+    payload: dict[str, Any] = {
+        "ref": ref,
+        "final_ref": record["final_ref"],
+        "media_url": f"{origin.rstrip('/')}/resolve?{urlencode({'ref': ref})}",
+        "status": record["status"],
+    }
+    if record.get("media_type") is not None:
+        payload["media_type"] = record["media_type"]
+    if result is not None:
+        for name in (
+            "source_kind",
+            "playback_method",
+            "title",
+            "integrity",
+            "substituted",
+            "substituted_ref",
+            "substitution_status",
+        ):
+            value = getattr(result, name)
+            if value not in (None, False):
+                payload[name] = value
+    return payload
+
+
+def failed_resolution_payload(ref: str, reason: str | None) -> dict[str, Any]:
+    return {
+        "ref": ref.strip(),
+        "status": ResolutionStatus.FAILED.value,
+        "reason": reason or "Curio could not resolve and store this reference.",
+    }
+
+
+def record_result(
+    ref: str, result: Resolved, settings: Settings, origin: str
+) -> dict[str, Any]:
+    """Record the playback route after a final artifact has been stored."""
+    public_ref = _public_ref(ref, result)
+    final_ref = result.final_ref or public_ref
+    if final_ref.startswith("data:"):
+        final_ref = _digest_ref("data", result) or final_ref
+    status = (
+        ResolutionStatus.LIVE_DEPENDENT
+        if result.status == ResolutionStatus.LIVE_DEPENDENT
+        else ResolutionStatus.READY
+    )
+    store = StaticStore(settings.static_root, settings.static_cache_max_bytes)
+    record = store.record_resolution(
+        canonical_ref=canonical_ref_key(public_ref),
+        ref=public_ref,
+        final_ref=final_ref,
+        media_path=_media_path(result.resolved_url),
+        status=status,
+        media_type=result.content_type,
+        reason=result.note,
+    )
+    return resolution_payload(record, origin, result)
+
+
+async def store_reference(
+    ref: str,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    origin: str,
+) -> tuple[dict[str, Any], bool]:
+    """Resolve one reference, store its final artifact, and record its playback route."""
+    with storage_intent():
+        result = await resolve_ref(ref, settings, client, origin=origin)
+    if not result.resolved:
+        return failed_resolution_payload(ref, result.note), False
+
+    try:
+        if result.source_kind in {"http", "data", "upload"}:
+            stored = store_static(result, settings)
+        else:
+            outcome = await store_resolved(result, settings, client, why="resolve")
+            stored = outcome in {"pinned", "stored"}
+    except Exception as exc:
+        return failed_resolution_payload(ref, f"{type(exc).__name__}: {exc}"), False
+
+    if not stored:
+        return failed_resolution_payload(ref, "The final artifact could not be stored."), False
+
+    return record_result(ref, result, settings, origin), True
+
+
+def record_upload(
+    entry: dict[str, object],
+    *,
+    filename: str | None,
+    settings: Settings,
+    origin: str,
+) -> dict[str, Any]:
+    """Give an uploaded static object the same reference contract as remote media."""
+    ref = f"upload:sha256:{entry['digest']}"
+    store = StaticStore(settings.static_root, settings.static_cache_max_bytes)
+    record = store.record_resolution(
+        canonical_ref=ref,
+        ref=ref,
+        final_ref=ref,
+        media_path=f"/media/{entry['id']}",
+        status=ResolutionStatus.READY,
+        media_type=str(entry["media_type"]) if entry.get("media_type") else None,
+    )
+    payload = resolution_payload(record, origin)
+    payload.update(
+        {
+            "filename": filename,
+            "source_kind": "upload",
+            "integrity": {"algorithm": "sha256", "digest": entry["digest"]},
+        }
+    )
     return payload
 
 
@@ -82,12 +200,10 @@ async def create_override(
 
 @dataclass
 class FavoriteCreation:
-    """Shared favorite mutation facts; adapters add their own response fields."""
+    """Shared favorite facts; adapters add their own response fields."""
 
     record: dict[str, Any]
     result: Resolved | None
-    pin_scheduled: bool
-    promoted: bool
 
 
 async def create_favorite(
@@ -98,11 +214,10 @@ async def create_favorite(
     settings: Settings,
     client: httpx.AsyncClient,
     origin: Callable[[], str],
-    background_why: str = "pin",
 ) -> FavoriteCreation:
-    """Record a favorite, enrich it opportunistically, and retain its media."""
+    """Record a favorite and enrich it opportunistically."""
     try:
-        # A resolution failure must not prevent favoriting.
+        # Resolution enriches the browse record but is never a gate.
         result = await resolve_ref(ref, settings, client, origin=origin())
     except Exception:
         result = None
@@ -112,19 +227,4 @@ async def create_favorite(
         note=note,
         final_ref=result.final_ref if result else None,
     )
-    pin_scheduled = bool(
-        result
-        and result.resolved
-        and result.keep_state != "live-dependent"
-        and result.source_kind not in {"http", "data", "upload", "arweave"}
-    )
-    promoted = False
-    if result and result.resolved and result.source_kind in {"http", "data", "upload"}:
-        promoted = result.keep_state != "live-dependent" and promote_static(result, settings)
-        result.keep_state = "kept" if promoted else result.keep_state
-    elif pin_scheduled:
-        pin_in_background(result, settings, client, why=background_why)
-        result.keep_state = "pending"
-    elif result and result.resolved and result.keep_state != "live-dependent" and result.source_kind == "arweave":
-        result.keep_state = (await pin_resolved(result, settings, client, why="favorite")) or "failed"
-    return FavoriteCreation(record, result, pin_scheduled, promoted)
+    return FavoriteCreation(record, result)

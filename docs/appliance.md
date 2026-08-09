@@ -9,7 +9,7 @@ Docker, or alter firewall and network settings.
 Defaults follow XDG paths:
 
 ```text
-~/.config/curio/curio.env             configuration and curator token
+~/.config/curio/curio.env             configuration
 ~/.local/share/curio/app/releases/    installed application copies
 ~/.local/share/curio/app/current      active release symlink
 ~/.local/share/curio/state/           persistent state
@@ -79,14 +79,14 @@ CURIO_PUBLIC_BASE_URL=
 CURIO_TRUSTED_PROXY_CIDRS=
 ```
 
-The installer also records the current user and group IDs and creates a random
-curator token. Do not share `curio.env`.
+The installer also records the current user and group IDs. Curio has no user
+authentication and should remain on a trusted network.
 
 ## Backup
 
 Stop Curio before a cold backup, then copy `curio.env` and the state directory.
-The important state is Kubo's repository, AR.IO Core's data, static media, and
-curator records.
+The important state is Kubo's repository, AR.IO Core's data, static media,
+resolution records, favorites, and overrides.
 
 Old directories left by earlier development builds are not deleted during an
 upgrade. Remove them manually only after confirming that the current Compose

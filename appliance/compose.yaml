@@ -13,7 +13,7 @@ services:
       RESOLVER_PORT: "8090"
       RESOLVER_IPFS_INTERNAL: http://kubo:8080
       RESOLVER_IPFS_API: http://kubo:5001
-      # All Arweave reads, including explicit keep verification, use this Core.
+      # All Arweave resolution, storage, and playback uses this Core.
       RESOLVER_ARWEAVE_INTERNAL: http://ar-io-core:4000
       RESOLVER_ARWEAVE_COLD_TIMEOUT: ${CURIO_ARWEAVE_COLD_TIMEOUT:-300}
       RESOLVER_PUBLIC_BASE_URL: ${CURIO_PUBLIC_BASE_URL:-}
@@ -22,7 +22,6 @@ services:
       RESOLVER_STATIC_CACHE_MAX_BYTES: ${CURIO_STATIC_CACHE_MAX_BYTES:-1000000000}
       RESOLVER_OVERRIDES_PATH: /state/overrides.toml
       RESOLVER_FAVORITES_PATH: /state/favorites.json
-      RESOLVER_CURATOR_TOKEN: ${CURIO_CURATOR_TOKEN:?set CURIO_CURATOR_TOKEN in curio.env}
     volumes:
       - type: bind
         source: ${CURIO_DATA_ROOT:?set CURIO_DATA_ROOT}

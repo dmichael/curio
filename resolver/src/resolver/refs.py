@@ -45,18 +45,21 @@ def arweave_parts(ref: str) -> tuple[str, str] | None:
     """Return (txid, path) for any Arweave-shaped reference, else None.
 
     The path matters: Arweave path manifests resolve `txid/sub/path` to a
-    distinct resource, so dropping it serves the wrong content.
+    distinct resource, so dropping or normalizing it serves the wrong content.
     """
     parsed = urlparse(ref)
     if parsed.scheme == "ar":
         if parsed.netloc:
             return parsed.netloc, parsed.path
-        txid, _, rest = parsed.path.lstrip("/").partition("/")
-        return (txid, f"/{rest}" if rest else "") if txid else None
-    if parsed.hostname in {"arweave.net", "www.arweave.net"}:
-        txid, _, rest = parsed.path.strip("/").partition("/")
-        if _TXID_RE.match(txid):
-            return txid, f"/{rest}" if rest else ""
+        txid, separator, rest = parsed.path.removeprefix("/").partition("/")
+        return (txid, f"/{rest}" if separator else "") if txid else None
+    if parsed.scheme in {"http", "https"} and parsed.hostname in {
+        "arweave.net",
+        "www.arweave.net",
+    }:
+        txid, separator, rest = parsed.path.removeprefix("/").partition("/")
+        if _TXID_RE.fullmatch(txid):
+            return txid, f"/{rest}" if separator else ""
     return None
 
 
@@ -81,5 +84,5 @@ def canonical_ref_key(ref: str) -> str:
     arweave = arweave_parts(ref)
     if arweave is not None:
         txid, path = arweave
-        return f"ar://{txid}{path.rstrip('/')}"
+        return f"ar://{txid}{path}"
     return ref

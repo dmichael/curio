@@ -1,6 +1,6 @@
 import httpx
 
-from resolver.arweave_cache import keep_arweave
+from resolver.arweave_cache import store_arweave
 from resolver.config import Settings
 
 
@@ -18,7 +18,7 @@ async def test_keep_fully_fetches_and_verifies_the_same_core_cache():
         return httpx.Response(200, headers=headers, content=b"cached bytes")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        assert await keep_arweave("A" * 43, "/manifest/item.png", settings, client) == "kept"
+        assert await store_arweave("A" * 43, "/manifest/item.png", settings, client) == "stored"
 
     assert [(request.method, str(request.url)) for request in calls] == [
         ("GET", f"http://core.internal/{'A' * 43}/manifest/item.png"),
@@ -33,4 +33,4 @@ async def test_keep_fails_without_a_same_core_native_hit():
     async with httpx.AsyncClient(transport=httpx.MockTransport(
         lambda _: httpx.Response(200, headers={"x-cache": "MISS"}, content=b"bytes")
     )) as client:
-        assert await keep_arweave("B" * 43, "", settings, client) == "failed"
+        assert await store_arweave("B" * 43, "", settings, client) == "failed"

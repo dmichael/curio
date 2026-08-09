@@ -14,6 +14,8 @@ def no_net() -> httpx.AsyncClient:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "HEAD" and request.url.host == "127.0.0.1":
             return httpx.Response(200, headers={"content-type": "image/png"})
+        if request.url.path == "/api/v0/pin/add":
+            return httpx.Response(200, json={"Pins": ["bafyCID"]})
         raise AssertionError(f"unexpected network call: {request.url}")
 
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -53,8 +55,12 @@ async def test_mcp_exposes_the_curated_tools():
     }
 
 
-def test_mcp_transport_uses_nonlocal_request_origin(http_client):
+def test_mcp_transport_uses_nonlocal_request_origin(http_client, monkeypatch):
     """Exercise the real streamable-HTTP transport, not call_tool()."""
+    async def stored(ref, _settings, _client, origin):
+        return {"ref": ref, "media_url": f"{origin}/resolve?ref={ref}", "status": "ready"}, True
+
+    monkeypatch.setattr(mcp_server.operations, "store_reference", stored)
     headers = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
     initialize = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
         "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"},
@@ -73,11 +79,15 @@ def test_mcp_transport_uses_nonlocal_request_origin(http_client):
     finally:
         http_client.base_url = previous_base
     assert response.status_code == 200
-    assert "http://curio.example/ipfs/bafyCID/a.png" in response.text
+    assert "http://curio.example/resolve?ref=ipfs://bafyCID/a.png" in response.text
 
 
 def test_mcp_transport_uses_trusted_forwarded_origin_and_guard(http_client, monkeypatch):
     """The mounted MCP transport and Host/Origin guard share proxy origin logic."""
+    async def stored(ref, _settings, _client, origin):
+        return {"ref": ref, "media_url": f"{origin}/resolve?ref={ref}", "status": "ready"}, True
+
+    monkeypatch.setattr(mcp_server.operations, "store_reference", stored)
     monkeypatch.setenv("RESOLVER_TRUSTED_PROXY_CIDRS", "127.0.0.0/8")
     get_settings.cache_clear()
     headers = {
@@ -105,15 +115,16 @@ def test_mcp_transport_uses_trusted_forwarded_origin_and_guard(http_client, monk
         http_client._transport.client = old_client
         get_settings.cache_clear()
     assert response.status_code == 200
-    assert "https://curio.example/ipfs/bafyCID/a.png" in response.text
+    assert "https://curio.example/resolve?ref=ipfs://bafyCID/a.png" in response.text
 
 
 async def test_mcp_resolve_tool_round_trips():
     async with no_net() as client:
         mcp_server.set_client(client)
         payload = await call("resolve", {"ref": "ipfs://bafyCID/art.png"})
-    assert payload["resolved"] is True
-    assert payload["resolved_url"].endswith("/ipfs/bafyCID/art.png")
+    assert payload["status"] == "ready"
+    assert payload["final_ref"] == "ipfs://bafyCID/art.png"
+    assert "/resolve?ref=" in payload["media_url"]
 
 
 async def test_mcp_override_tools_round_trip(override_env):
@@ -126,7 +137,6 @@ async def test_mcp_override_tools_round_trip(override_env):
                 "replacement": "ipfs://bafyALT/master.png",
                 "status": "alternate-master",
                 "note": "test master",
-                "curator_token": "test-curator-token",
             },
         )
         assert added["replaced"] is False
@@ -136,7 +146,7 @@ async def test_mcp_override_tools_round_trip(override_env):
         assert listed["count"] == 1
         assert listed["entries"][0]["note"] == "test master"
 
-        removed = await call("remove_override", {"ref": "/ipfs/bafyDEAD/art.png", "curator_token": "test-curator-token"})
+        removed = await call("remove_override", {"ref": "/ipfs/bafyDEAD/art.png"})
         assert removed["removed"]["ref"] == "ipfs://bafyDEAD/art.png"
         assert (await call("list_overrides", {}))["count"] == 0
 
@@ -155,7 +165,7 @@ async def test_mcp_favorite_tools_round_trip(favorites_env):
     async with no_net() as client:
         mcp_server.set_client(client)
         added = await call(
-            "add_favorite", {"ref": "ipfs://bafyFAV/art.png", "note": "living room", "curator_token": "test-curator-token"}
+            "add_favorite", {"ref": "ipfs://bafyFAV/art.png", "note": "living room"}
         )
         assert added["key"] == "ipfs://bafyFAV/art.png"
         assert added["resolved"] is True
@@ -167,7 +177,7 @@ async def test_mcp_favorite_tools_round_trip(favorites_env):
         assert listed["favorites"][0]["resolved"] is True
         assert listed["favorites"][0]["resolved_url"].endswith("/ipfs/bafyFAV/art.png")
 
-        removed = await call("remove_favorite", {"ref": "/ipfs/bafyFAV/art.png", "curator_token": "test-curator-token"})
+        removed = await call("remove_favorite", {"ref": "/ipfs/bafyFAV/art.png"})
         assert removed["removed"]["ref"] == "ipfs://bafyFAV/art.png"
         assert (await call("list_favorites", {}))["count"] == 0
 
