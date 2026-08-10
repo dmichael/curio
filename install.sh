@@ -7,15 +7,27 @@ VERSION=${CURIO_VERSION:-}
 ASSET=curio-appliance.tar.gz
 CHECKSUM_ASSET=$ASSET.sha256
 fail() { echo "curio installer: $*" >&2; exit 1; }
+valid_release_version() {
+    case "$1" in v*) release_numbers=${1#v} ;; *) return 1 ;; esac
+    case "$release_numbers" in ''|.*|*.|*..*|*[!0-9.]*) return 1 ;; esac
+    old_ifs=$IFS; IFS=.; set -- $release_numbers; IFS=$old_ifs
+    [ "$#" -eq 3 ] && [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ]
+}
 [ "$(uname -s)" = Linux ] || fail "Curio can only be installed on Linux"
 for command in curl tar sha256sum mktemp; do command -v "$command" >/dev/null 2>&1 || fail "$command is required"; done
-case "$VERSION" in ''|v[0-9]*.[0-9]*.[0-9]*) ;; *) fail "CURIO_VERSION must look like vX.Y.Z";; esac
-if [ -n "$VERSION" ]; then base="https://github.com/$REPOSITORY/releases/download/$VERSION"; else base="https://github.com/$REPOSITORY/releases/latest/download"; fi
-base=${CURIO_RELEASE_BASE_URL:-$base}
+release_root=${CURIO_RELEASE_BASE_URL:-"https://github.com/$REPOSITORY/releases"}
+release_root=${release_root%/}
+if [ -z "$VERSION" ]; then
+    VERSION=$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 "$release_root/latest/download/VERSION" 2>/dev/null) \
+        || fail "could not fetch latest VERSION"
+    valid_release_version "$VERSION" || fail "latest release does not publish a valid VERSION"
+fi
+valid_release_version "$VERSION" || fail "CURIO_VERSION must look like vX.Y.Z"
+base="$release_root/download/$VERSION"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/curio-install.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT HUP INT TERM
-curl -fL --retry 3 -o "$tmp/$ASSET" "$base/$ASSET"
-curl -fL --retry 3 -o "$tmp/$CHECKSUM_ASSET" "$base/$CHECKSUM_ASSET"
+curl -fL --connect-timeout 10 --max-time 600 --retry 3 -o "$tmp/$ASSET" "$base/$ASSET"
+curl -fL --connect-timeout 10 --max-time 60 --retry 3 -o "$tmp/$CHECKSUM_ASSET" "$base/$CHECKSUM_ASSET"
 expected=$(awk -v a="$ASSET" '$2 == a || $2 == "*" a {print $1; exit}' "$tmp/$CHECKSUM_ASSET")
 case "$expected" in ??????*) ;; *) fail "invalid release checksum";; esac
 [ "$(sha256sum "$tmp/$ASSET" | awk '{print $1}')" = "$expected" ] || fail "release archive checksum mismatch"

@@ -14,6 +14,12 @@ PROJECT_NAME=${CURIO_PROJECT_NAME:-curio}
 COMPOSE_FILE=${CURIO_COMPOSE_FILE:-"$APP_ROOT/current/compose.yaml"}
 
 fail() { echo "curio: $*" >&2; exit 1; }
+valid_release_version() {
+    case "$1" in v*) release_numbers=${1#v} ;; *) return 1 ;; esac
+    case "$release_numbers" in ''|.*|*.|*..*|*[!0-9.]*) return 1 ;; esac
+    old_ifs=$IFS; IFS=.; set -- $release_numbers; IFS=$old_ifs
+    [ "$#" -eq 3 ] && [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ]
+}
 require_installation() {
     [ -f "$COMPOSE_FILE" ] || fail "installation not found: $COMPOSE_FILE"
     [ -f "$ENV_FILE" ] || fail "configuration not found: $ENV_FILE"
@@ -21,16 +27,25 @@ require_installation() {
 }
 compose() { "$DOCKER_BIN" compose --project-name "$PROJECT_NAME" --env-file "$ENV_FILE" --file "$COMPOSE_FILE" "$@"; }
 version() { [ -f "$APP_ROOT/current/VERSION" ] || fail "installed version is unavailable"; cat "$APP_ROOT/current/VERSION"; }
-release_base() { printf '%s' "${CURIO_RELEASE_BASE_URL:-https://github.com/${CURIO_GITHUB_REPOSITORY:-dmichael/curio}/releases}"; }
+release_base() {
+    base=${CURIO_RELEASE_BASE_URL:-https://github.com/${CURIO_GITHUB_REPOSITORY:-dmichael/curio}/releases}
+    printf '%s' "${base%/}"
+}
+latest_release() {
+    command -v curl >/dev/null 2>&1 || fail "curl is required for updates"
+    latest=$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 "$(release_base)/latest/download/VERSION" 2>/dev/null) \
+        || fail "could not fetch latest VERSION"
+    valid_release_version "$latest" || fail "latest release does not publish a valid VERSION"
+    printf '%s' "$latest"
+}
 check_update() {
-    command -v curl >/dev/null 2>&1 || fail "curl is required for update checks"
-    latest=$(curl -fsSL "$(release_base)/latest/download/VERSION" 2>/dev/null || true)
-    [ -n "$latest" ] || { echo "update check unavailable: release does not publish VERSION" >&2; return 1; }
+    latest=$(latest_release)
     current=$(version); printf 'installed %s; latest %s\n' "$current" "$latest"; [ "v$current" != "$latest" ]
 }
 update() {
     requested=${1:-}
-    [ -z "$requested" ] || case "$requested" in v[0-9]*.[0-9]*.[0-9]*) ;; *) fail "version must look like vX.Y.Z";; esac
+    if [ -z "$requested" ]; then requested=$(latest_release); fi
+    valid_release_version "$requested" || fail "version must look like vX.Y.Z"
     require_installation
     CURIO_APP_ROOT="$APP_ROOT" CURIO_VERSION="$requested" "$APP_ROOT/current/install.sh"
 }

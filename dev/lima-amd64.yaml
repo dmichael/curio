@@ -1,0 +1,17 @@
+# Disposable AMD64 Linux appliance qualification VM for Apple Silicon Macs.
+# QEMU emulation is slower than the native ARM64 VZ guest in dev/lima.yaml.
+minimumLimaVersion: 2.0.0
+
+base:
+  - template:docker-rootful
+
+arch: x86_64
+vmType: qemu
+cpus: 4
+memory: 6GiB
+disk: 60GiB
+
+portForwards:
+  - guestPort: 8090
+    hostPort: 23090
+    static: true

@@ -11,7 +11,8 @@ grep -q -- '--entrypoint /nodejs/bin/node' "$ROOT/appliance/install.sh" || fail 
 
 # Bootstrap checksum and requested-version verification must happen before the
 # embedded installer runs. A fake installer records that it was reached.
-mkdir -p "$TMP/release" "$TMP/tree/curio/appliance" "$TMP/tree/curio/resolver" "$TMP/bin"
+release_dir="$TMP/releases/download/v0.2.0"
+mkdir -p "$release_dir" "$TMP/tree/curio/appliance" "$TMP/tree/curio/resolver" "$TMP/bin"
 printf '[project]\nversion = "0.2.0"\n' >"$TMP/tree/curio/resolver/pyproject.toml"
 cat >"$TMP/tree/curio/appliance/install.sh" <<EOF
 #!/bin/sh
@@ -23,12 +24,17 @@ cat >"$TMP/bin/uname" <<'EOF'
 echo Linux
 EOF
 chmod +x "$TMP/bin/uname"
-tar -czf "$TMP/release/curio-appliance.tar.gz" -C "$TMP/tree" curio
-(cd "$TMP/release" && sha256sum curio-appliance.tar.gz >curio-appliance.tar.gz.sha256)
-PATH="$TMP/bin:$PATH" CURIO_RELEASE_BASE_URL="file://$TMP/release" CURIO_VERSION=v0.2.0 "$ROOT/install.sh" >/dev/null
+tar -czf "$release_dir/curio-appliance.tar.gz" -C "$TMP/tree" curio
+(cd "$release_dir" && sha256sum curio-appliance.tar.gz >curio-appliance.tar.gz.sha256)
+PATH="$TMP/bin:$PATH" CURIO_RELEASE_BASE_URL="file://$TMP/releases" CURIO_VERSION=v0.2.0 "$ROOT/install.sh" >/dev/null
 [[ $(<"$TMP/reached") == reached ]] || fail "verified bootstrap did not invoke release installer"
-printf '%064d  curio-appliance.tar.gz\n' 0 >"$TMP/release/curio-appliance.tar.gz.sha256"
-if PATH="$TMP/bin:$PATH" CURIO_RELEASE_BASE_URL="file://$TMP/release" "$ROOT/install.sh" >/dev/null 2>&1; then fail "bootstrap accepted bad checksum"; fi
+mkdir -p "$TMP/releases/latest/download"
+printf 'v0.2.0\n' >"$TMP/releases/latest/download/VERSION"
+rm "$TMP/reached"
+PATH="$TMP/bin:$PATH" CURIO_RELEASE_BASE_URL="file://$TMP/releases" "$ROOT/install.sh" >/dev/null
+[[ $(<"$TMP/reached") == reached ]] || fail "latest bootstrap did not resolve VERSION to an immutable release"
+printf '%064d  curio-appliance.tar.gz\n' 0 >"$release_dir/curio-appliance.tar.gz.sha256"
+if PATH="$TMP/bin:$PATH" CURIO_RELEASE_BASE_URL="file://$TMP/releases" CURIO_VERSION=v0.2.0 "$ROOT/install.sh" >/dev/null 2>&1; then fail "bootstrap accepted bad checksum"; fi
 
 # Render the three-service graph when Compose is available. AR.IO has one
 # persistent Core; resolver and Kubo are its only peers in this graph.
@@ -152,15 +158,21 @@ grep -q 'up -d --wait --wait-timeout .* --remove-orphans' "$TMP/docker.log" || f
 # The installed wrapper must call the root verified bootstrap (not the
 # appliance installer directly), preserving an exact tag and empty/latest mode.
 grep -q 'Verified Curio release bootstrap' "$TMP/custom-app/current/install.sh" || fail 'installed update target is not the verified bootstrap'
+printf 'v0.2.2\n' >"$TMP/releases/latest/download/VERSION"
+CURIO_RELEASE_BASE_URL="file://$TMP/releases" CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update --check >"$TMP/update-check"
+grep -q 'installed 0.2.1; latest v0.2.2' "$TMP/update-check" || fail 'update check did not use the release root latest path'
+printf 'not-a-version\n' >"$TMP/releases/latest/download/VERSION"
+if CURIO_RELEASE_BASE_URL="file://$TMP/releases" CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update >/dev/null 2>&1; then fail 'wrapper accepted an invalid latest VERSION'; fi
+printf 'v0.2.2\n' >"$TMP/releases/latest/download/VERSION"
 cat >"$TMP/custom-app/current/install.sh" <<EOF
 #!/bin/sh
 printf 'version=%s app=%s\\n' "\${CURIO_VERSION-unset}" "\${CURIO_APP_ROOT-unset}" >>"$TMP/wrapper-update.log"
 EOF
 chmod +x "$TMP/custom-app/current/install.sh"
 CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update --version v0.2.1
-CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update
+CURIO_RELEASE_BASE_URL="file://$TMP/releases" CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update
 [[ $(sed -n '1p' "$TMP/wrapper-update.log") == "version=v0.2.1 app=$TMP/custom-app" ]] || fail 'wrapper did not propagate exact update version to bootstrap'
-[[ $(sed -n '2p' "$TMP/wrapper-update.log") == "version= app=$TMP/custom-app" ]] || fail 'wrapper did not invoke latest bootstrap mode'
+[[ $(sed -n '2p' "$TMP/wrapper-update.log") == "version=v0.2.2 app=$TMP/custom-app" ]] || fail 'wrapper did not bind latest VERSION to an immutable release'
 CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_DOCKER_LOG="$TMP/docker.log" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" status
 
 grep -q -- '--file .*custom-app/current/compose.yaml' "$TMP/docker.log" || fail 'wrapper did not discover configured custom app root'

@@ -64,7 +64,11 @@ curio update --version vX.Y.Z
 ```
 
 No release assets have been published yet, so remote installation and update
-commands cannot complete until the first release exists.
+commands cannot complete until the first release exists. For mirrors and local
+qualification, `CURIO_RELEASE_BASE_URL` sets the release root (the equivalent of
+`https://github.com/dmichael/curio/releases`). Latest-mode installation reads
+`latest/download/VERSION`, validates it, then fetches assets from the immutable
+`download/<version>` path.
 
 ## Configuration
 

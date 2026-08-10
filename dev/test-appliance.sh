@@ -13,6 +13,12 @@ DATA_HOME=${XDG_DATA_HOME:-"$HOME/.local/share"}
 ENV_FILE=${CURIO_ENV_FILE:-"$CONFIG_HOME/curio/curio.env"}
 APP_ROOT=${CURIO_APP_ROOT:-"$DATA_HOME/curio/app"}
 DATA_ROOT=${CURIO_DATA_ROOT:-"$DATA_HOME/curio/state"}
+RELEASE_BASE_URL=${CURIO_TEST_RELEASE_BASE_URL:-}
+INSTALL_VERSION=${CURIO_TEST_INSTALL_VERSION:-}
+UPDATE_VERSION=${CURIO_TEST_UPDATE_VERSION:-}
+LATEST_VERSION=${CURIO_TEST_LATEST_VERSION:-}
+REJECT_VERSION=${CURIO_TEST_REJECT_VERSION:-}
+FAILED_UPDATE_VERSION=${CURIO_TEST_FAILED_UPDATE_VERSION:-}
 fail(){ echo "test-appliance: $*" >&2; exit 1; }
 usage(){ echo "usage: $0 --disposable-vm|--after-reboot" >&2; }
 [[ $MODE == --disposable-vm || $MODE == --after-reboot ]] || { usage; exit 2; }
@@ -20,10 +26,41 @@ usage(){ echo "usage: $0 --disposable-vm|--after-reboot" >&2; }
 command -v systemd-detect-virt >/dev/null && systemd-detect-virt --quiet || fail 'refusing non-virtualized host'
 for c in docker curl python3 sha256sum; do command -v "$c" >/dev/null || fail "$c is required"; done
 docker compose version >/dev/null || fail 'docker compose plugin is required'
+if [[ -n $RELEASE_BASE_URL ]]; then
+  [[ $INSTALL_VERSION == v*.*.* && $UPDATE_VERSION == v*.*.* && $LATEST_VERSION == v*.*.* ]] || fail 'release qualification requires install, exact-update, and latest versions'
+  [[ $INSTALL_VERSION != "$UPDATE_VERSION" && $INSTALL_VERSION != "$LATEST_VERSION" && $UPDATE_VERSION != "$LATEST_VERSION" ]] || fail 'install, exact-update, and latest versions must differ'
+  for version in "$REJECT_VERSION" "$FAILED_UPDATE_VERSION"; do
+    [[ -z $version || $version == v*.*.* ]] || fail "invalid test release version: $version"
+  done
+  published_latest=$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 "$RELEASE_BASE_URL/latest/download/VERSION") || fail 'latest VERSION fixture is unavailable'
+  [[ $published_latest == "$LATEST_VERSION" ]] || fail "latest fixture publishes $published_latest, expected $LATEST_VERSION"
+  for version in "$INSTALL_VERSION" "$UPDATE_VERSION" "$LATEST_VERSION" "$REJECT_VERSION" "$FAILED_UPDATE_VERSION"; do
+    [[ -z $version ]] && continue
+    for asset in install.sh curio-appliance.tar.gz curio-appliance.tar.gz.sha256; do
+      curl -fsS --connect-timeout 10 --max-time 60 --retry 3 -o /dev/null "$RELEASE_BASE_URL/download/$version/$asset" || fail "fixture unavailable: $version/$asset"
+    done
+  done
+elif [[ -n $INSTALL_VERSION || -n $UPDATE_VERSION || -n $LATEST_VERSION || -n $REJECT_VERSION || -n $FAILED_UPDATE_VERSION ]]; then
+  fail 'release test versions require CURIO_TEST_RELEASE_BASE_URL'
+fi
 mkdir -p "$EVIDENCE_DIR"
 compose(){ docker compose --project-name curio --env-file "$ENV_FILE" --file "$APP_ROOT/current/compose.yaml" "$@"; }
 health(){ "$HOME/.local/bin/curio" health >"$EVIDENCE_DIR/health.latest" 2>&1; }
-wait_healthy(){ for _ in $(seq 1 120); do health && return; sleep 5; done; cat "$EVIDENCE_DIR/health.latest" >&2; fail 'Curio did not become healthy'; }
+wait_healthy(){
+  local stable=0
+  for _ in $(seq 1 120); do
+    if health; then ((stable += 1)); ((stable >= 3)) && return; else stable=0; fi
+    sleep 5
+  done
+  cat "$EVIDENCE_DIR/health.latest" >&2
+  fail 'Curio did not remain healthy'
+}
+install_release(){
+  local version=$1 bootstrap="$EVIDENCE_DIR/install-$1.sh"
+  curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 "$RELEASE_BASE_URL/download/$version/install.sh" -o "$bootstrap"
+  CURIO_RELEASE_BASE_URL="$RELEASE_BASE_URL" CURIO_VERSION="$version" sh "$bootstrap"
+}
+release_curio(){ CURIO_RELEASE_BASE_URL="$RELEASE_BASE_URL" "$HOME/.local/bin/curio" "$@"; }
 fetch_arweave_fixture(){
   local txid=$1 output=$2 headers=$3 code
   for _ in $(seq 1 12); do
@@ -32,6 +69,15 @@ fetch_arweave_fixture(){
     sleep 5
   done
   fail "AR.IO fixture failed (HTTP ${code:-none})"
+}
+fetch_arweave_cache_hit(){
+  local txid=$1 output=$2 headers=$3
+  for _ in $(seq 1 12); do
+    fetch_arweave_fixture "$txid" "$output" "$headers"
+    grep -Eiq '^x-cache:[[:space:]]*HIT' "$headers" && return
+    sleep 5
+  done
+  fail 'AR.IO fixture did not become a cache hit'
 }
 verify(){
   local ref
@@ -43,9 +89,8 @@ verify(){
   [[ $(sha256sum "$DATA_ROOT/ar-io/start-height.env" | awk '{print $1}') == $(<"$EVIDENCE_DIR/height.sha") ]] || fail 'start height changed'
   [[ -z $(find "$DATA_ROOT" -xdev \( ! -user "$(id -u)" -o ! -group "$(id -g)" \) -print -quit) ]] || fail 'container created root-owned state'
   if [[ -f $EVIDENCE_DIR/arweave.txid ]]; then
-    fetch_arweave_fixture "$(<"$EVIDENCE_DIR/arweave.txid")" "$EVIDENCE_DIR/arweave.verify" "$EVIDENCE_DIR/arweave.headers"
+    fetch_arweave_cache_hit "$(<"$EVIDENCE_DIR/arweave.txid")" "$EVIDENCE_DIR/arweave.verify" "$EVIDENCE_DIR/arweave.headers"
     [[ $(sha256sum "$EVIDENCE_DIR/arweave.verify" | awk '{print $1}') == $(<"$EVIDENCE_DIR/arweave.sha") ]] || fail 'AR.IO fixture bytes changed'
-    grep -Eiq '^x-cache:[[:space:]]*HIT' "$EVIDENCE_DIR/arweave.headers" || fail 'AR.IO fixture was not cached'
   fi
   compose ps --all --quiet | xargs -r docker inspect >"$EVIDENCE_DIR/containers.json"
   python3 - "$EVIDENCE_DIR/containers.json" <<'PY'
@@ -62,16 +107,26 @@ if [[ $MODE == --after-reboot ]]; then
   cp "$EVIDENCE_DIR/health.latest" "$EVIDENCE_DIR/health.after-reboot"
   echo "post-reboot checks passed; evidence: $EVIDENCE_DIR"; exit
 fi
-"$ROOT/appliance/install.sh"
+if [[ -n $RELEASE_BASE_URL ]]; then
+  if [[ -n $REJECT_VERSION ]]; then
+    if install_release "$REJECT_VERSION" >"$EVIDENCE_DIR/rejected-install.log" 2>&1; then
+      fail 'release with an invalid checksum was accepted'
+    fi
+    grep -F 'release archive checksum mismatch' "$EVIDENCE_DIR/rejected-install.log" >/dev/null || fail 'reject fixture did not reach checksum verification'
+    [[ ! -e $APP_ROOT/current ]] || fail 'rejected release changed the active release'
+  fi
+  install_release "$INSTALL_VERSION"
+else
+  "$ROOT/appliance/install.sh"
+fi
 wait_healthy
 readlink "$APP_ROOT/current" >"$EVIDENCE_DIR/release.before-rerun"
 [[ $ARWEAVE_TXID =~ ^[A-Za-z0-9_-]{43}$ && $ARWEAVE_SHA256 =~ ^[a-fA-F0-9]{64}$ ]] || fail 'set both valid CURIO_TEST_ARWEAVE_TXID and CURIO_TEST_ARWEAVE_SHA256'
 fetch_arweave_fixture "$ARWEAVE_TXID" "$EVIDENCE_DIR/arweave.initial" "$EVIDENCE_DIR/arweave.initial.headers"
 [[ $(sha256sum "$EVIDENCE_DIR/arweave.initial" | awk '{print $1}') == "${ARWEAVE_SHA256,,}" ]] || fail 'AR.IO fixture checksum mismatch'
 # A second read proves the same persistent Core now serves a native cache hit.
-fetch_arweave_fixture "$ARWEAVE_TXID" "$EVIDENCE_DIR/arweave.cached" "$EVIDENCE_DIR/arweave.cached.headers"
+fetch_arweave_cache_hit "$ARWEAVE_TXID" "$EVIDENCE_DIR/arweave.cached" "$EVIDENCE_DIR/arweave.cached.headers"
 [[ $(sha256sum "$EVIDENCE_DIR/arweave.cached" | awk '{print $1}') == "${ARWEAVE_SHA256,,}" ]] || fail 'cached AR.IO fixture checksum mismatch'
-grep -Eiq '^x-cache:[[:space:]]*HIT' "$EVIDENCE_DIR/arweave.cached.headers" || fail 'second AR.IO fetch was not a native cache hit'
 # POST resolution stores through the same Core; it is not a claim of
 # replication into the Arweave network.
 resolution=$(curl -fsS -X POST --get --data-urlencode "ref=ar://$ARWEAVE_TXID" http://127.0.0.1:8090/resolve)
@@ -85,9 +140,36 @@ printf %s "$stored" | python3 -c 'import json,sys; print(json.load(sys.stdin)["r
 curl -fsS -X POST --get --data-urlencode 'ref=ipfs://bafytest/art.png' http://127.0.0.1:8090/favorites >/dev/null 2>&1 || true
 sha256sum "$ENV_FILE" | awk '{print $1}' >"$EVIDENCE_DIR/env.sha"
 sha256sum "$DATA_ROOT/ar-io/start-height.env" | awk '{print $1}' >"$EVIDENCE_DIR/height.sha"
-"$ROOT/appliance/install.sh"; wait_healthy
-[[ $(readlink "$APP_ROOT/current") != $(<"$EVIDENCE_DIR/release.before-rerun") ]] || fail 'rerun did not replace release pointer'
-verify
+if [[ -n $RELEASE_BASE_URL ]]; then
+  release_curio update --check >"$EVIDENCE_DIR/update-check"
+  grep -F "installed ${INSTALL_VERSION#v}; latest $LATEST_VERSION" "$EVIDENCE_DIR/update-check" >/dev/null || fail 'update check returned unexpected versions'
+  release_curio update --version "$UPDATE_VERSION"
+  wait_healthy
+  [[ $(release_curio version) == "${UPDATE_VERSION#v}" ]] || fail 'exact-version update installed the wrong version'
+  [[ $(readlink "$APP_ROOT/current") != $(<"$EVIDENCE_DIR/release.before-rerun") ]] || fail 'exact-version update did not replace release pointer'
+  verify
+  readlink "$APP_ROOT/current" >"$EVIDENCE_DIR/release.before-latest-update"
+  release_curio update
+  wait_healthy
+  [[ $(release_curio version) == "${LATEST_VERSION#v}" ]] || fail 'latest update installed the wrong version'
+  [[ $(readlink "$APP_ROOT/current") != $(<"$EVIDENCE_DIR/release.before-latest-update") ]] || fail 'latest update did not replace release pointer'
+  verify
+  if [[ -n $FAILED_UPDATE_VERSION ]]; then
+    readlink "$APP_ROOT/current" >"$EVIDENCE_DIR/release.before-failed-update"
+    if release_curio update --version "$FAILED_UPDATE_VERSION" >"$EVIDENCE_DIR/failed-update.log" 2>&1; then
+      fail 'broken release update unexpectedly succeeded'
+    fi
+    grep -F 'Compose start or health check failed' "$EVIDENCE_DIR/failed-update.log" >/dev/null || fail 'failed-update fixture did not reach Compose startup'
+    grep -F 'restoring previous release' "$EVIDENCE_DIR/failed-update.log" >/dev/null || fail 'failed update did not exercise rollback'
+    [[ $(readlink "$APP_ROOT/current") == $(<"$EVIDENCE_DIR/release.before-failed-update") ]] || fail 'failed update did not restore the active release'
+    [[ $(release_curio version) == "${LATEST_VERSION#v}" ]] || fail 'failed update changed the installed version'
+    wait_healthy; verify
+  fi
+else
+  "$ROOT/appliance/install.sh"; wait_healthy
+  [[ $(readlink "$APP_ROOT/current") != $(<"$EVIDENCE_DIR/release.before-rerun") ]] || fail 'rerun did not replace release pointer'
+  verify
+fi
 compose up -d --force-recreate --no-build; wait_healthy; verify
 compose stop ar-io-core
 if health; then fail 'health succeeded with AR.IO Core stopped'; fi

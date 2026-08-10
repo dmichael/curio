@@ -57,7 +57,7 @@ jobs:
       - name: Check shell syntax
         run: |
           bash -n appliance/install.sh appliance/curio appliance/kubo-init.sh
-          bash -n appliance/tests/test-appliance.sh dev/test-appliance.sh
+          bash -n appliance/tests/test-appliance.sh dev/test-appliance.sh dev/stage-test-releases.sh scripts/check-image-platforms.sh
           sh -n appliance/install.sh appliance/curio appliance/kubo-init.sh
 
       - name: Compile-check scripts
