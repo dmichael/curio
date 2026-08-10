@@ -84,5 +84,8 @@ def canonical_ref_key(ref: str) -> str:
     arweave = arweave_parts(ref)
     if arweave is not None:
         txid, path = arweave
-        return f"ar://{txid}{path}"
+        # A bare trailing slash names the transaction itself, so `ar://txid/`
+        # keys as `ar://txid`. Deeper paths keep theirs: a manifest resolves
+        # `txid/sub/` and `txid/sub` to potentially different resources.
+        return f"ar://{txid}{'' if path == '/' else path}"
     return ref

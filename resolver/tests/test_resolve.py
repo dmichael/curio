@@ -111,6 +111,25 @@ def test_canonical_ref_key_collapses_subdomain_gateway_urls():
     assert canonical_ref_key(f"https://{CIDV1}.ipfs.dweb.link/x") == f"ipfs://{CIDV1}/x"
 
 
+def test_bare_arweave_trailing_slash_keys_as_the_transaction():
+    txid = "T" * 43
+    for spelling in (
+        f"ar://{txid}",
+        f"ar://{txid}/",
+        f"https://arweave.net/{txid}",
+        f"https://arweave.net/{txid}/",
+    ):
+        assert canonical_ref_key(spelling) == f"ar://{txid}"
+
+
+def test_arweave_manifest_subpath_keeps_its_trailing_slash():
+    # `txid/sub/` and `txid/sub` can be different manifest resources, so only
+    # the bare transaction slash collapses.
+    txid = "T" * 43
+    assert canonical_ref_key(f"ar://{txid}/sub/") == f"ar://{txid}/sub/"
+    assert canonical_ref_key(f"ar://{txid}/sub") == f"ar://{txid}/sub"
+
+
 async def test_html_work_is_sent_not_played():
     async with fake_net({"https://example.com/runtime/index.html": {
         "status_code": 200, "headers": {"content-type": "text/html"}, "content": b"<html>"

@@ -196,6 +196,25 @@ async def test_storage_intent_bypasses_evictable_cache_quota(tmp_path):
     assert store.get(media_id)[0]["storage_status"] == "stored"
 
 
+def test_get_does_not_redirect_a_recorded_failure(http_client, tmp_path, monkeypatch):
+    monkeypatch.setenv("RESOLVER_STATIC_ROOT", str(tmp_path / "media"))
+    get_settings.cache_clear()
+    StaticStore(str(tmp_path / "media")).record_resolution(
+        canonical_ref="ipfs://bafyDEAD/art.png",
+        ref="ipfs://bafyDEAD/art.png",
+        final_ref="ipfs://bafyDEAD/art.png",
+        media_path="/ipfs/bafyDEAD/art.png",
+        status=ResolutionStatus.FAILED,
+        reason="providers gone",
+    )
+    response = http_client.get(
+        "/resolve", params={"ref": "ipfs://bafyDEAD/art.png"}, follow_redirects=False
+    )
+    assert response.status_code == 404
+    assert response.json()["reason"] == "providers gone"
+    get_settings.cache_clear()
+
+
 def test_resolution_schema_migrates_existing_static_database(tmp_path):
     root = tmp_path / "media"
     root.mkdir()

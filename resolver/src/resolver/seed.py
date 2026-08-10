@@ -379,9 +379,11 @@ async def _record_stored_ref(
     try:
         origin = settings.public_base_url or settings.ipfs_public_base
         record_result(ref, result, settings, origin)
-    except (OSError, ValueError) as exc:
+    except Exception as exc:
+        # Bookkeeping must never fail the job: this runs inside a gather, so an
+        # escaping error would discard every other reference's outcome too.
         job.failed += 1
-        _note_error(job, f"store {ref}: resolution record failed: {exc}")
+        _note_error(job, f"store {ref}: resolution record failed: {type(exc).__name__}: {exc}")
         return False
     return True
 
