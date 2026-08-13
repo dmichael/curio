@@ -2,6 +2,11 @@
 
 <p align="center"><strong>A preservation and delivery appliance for digital art.</strong></p>
 
+<p align="center"><img src="docs/flatiron.jpg" width="640" alt="Flatiron — a painting by David Michael"></p>
+<p align="center"><em>Flatiron</em> by David Michael — resolved by Curio from its
+<a href="https://verse.works/items/ethereum/0xf7d3e687883b98eafb8808fa9b53ee065fb2e43f/1">Verse URL</a>
+via an on-chain <code>tokenURI</code> call to the 7979×5322 Arweave original.</p>
+
 Curio solves the gap between having a reference to a digital artwork and being
 able to display that artwork reliably in the future.
 
