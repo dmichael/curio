@@ -25,7 +25,8 @@ require_installation() {
     [ -f "$ENV_FILE" ] || fail "configuration not found: $ENV_FILE"
     command -v "$DOCKER_BIN" >/dev/null 2>&1 || fail "Docker is not available"
 }
-compose() { "$DOCKER_BIN" compose --project-name "$PROJECT_NAME" --env-file "$ENV_FILE" --file "$COMPOSE_FILE" "$@"; }
+# Compose stats the caller's working directory; run from / so any cwd works.
+compose() { (cd / && "$DOCKER_BIN" compose --project-name "$PROJECT_NAME" --env-file "$ENV_FILE" --file "$COMPOSE_FILE" "$@"); }
 version() { [ -f "$APP_ROOT/current/VERSION" ] || fail "installed version is unavailable"; cat "$APP_ROOT/current/VERSION"; }
 release_base() {
     base=${CURIO_RELEASE_BASE_URL:-https://github.com/${CURIO_GITHUB_REPOSITORY:-dmichael/curio}/releases}

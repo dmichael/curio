@@ -68,10 +68,14 @@ rollback() {
 main() {
     [ "$(uname -s)" = Linux ] || fail "Curio can only be installed on Linux"
     command -v docker >/dev/null 2>&1 || fail "a user-accessible Docker runtime is required"
-    docker compose version >/dev/null 2>&1 || fail "Docker Compose plugin is required"
-    docker info >/dev/null 2>&1 || fail "cannot access Docker as this user"
     script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
     source_root=$(CDPATH= cd "$script_dir/.." && pwd)
+    # Compose stats the caller's working directory during validation. Run from
+    # / so an inaccessible cwd (for example root's home under sudo -u) cannot
+    # fail the install or its rollback. Every path below is absolute.
+    cd /
+    docker compose version >/dev/null 2>&1 || fail "Docker Compose plugin is required"
+    docker info >/dev/null 2>&1 || fail "cannot access Docker as this user"
     data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}; config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}; bin_home=${XDG_BIN_HOME:-"$HOME/.local/bin"}
     config_dir="$config_home/curio"; config_file="$config_dir/curio.env"
     requested_app_root=${CURIO_APP_ROOT:-"$data_home/curio/app"}; requested_data_root=${CURIO_DATA_ROOT:-"$data_home/curio/state"}

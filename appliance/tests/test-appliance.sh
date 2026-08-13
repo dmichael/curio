@@ -98,7 +98,7 @@ PATH="$TMP/kubo-bin:$PATH" KUBO_TEST_STATE="$TMP/kubo-state" CURIO_IPFS_STORAGE_
 # caller root is recursively replaced.
 cat >"$TMP/bin/docker" <<'EOF'
 #!/bin/sh
-printf '%s\n' "$*" >>"$CURIO_DOCKER_LOG"
+printf '%s|%s\n' "$PWD" "$*" >>"$CURIO_DOCKER_LOG"
 case "$*" in
   *'compose version'*|*' info'*|*' config --quiet'*|*' build resolver'*) exit 0;;
   *' pull ghcr.io/ar-io/ar-io-core:'*) exit 0;;
@@ -184,5 +184,8 @@ CURIO_RELEASE_BASE_URL="file://$TMP/releases" CURIO_DOCKER_BIN="$TMP/bin/docker"
 CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_DOCKER_LOG="$TMP/docker.log" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" status
 
 grep -q -- '--file .*custom-app/current/compose.yaml' "$TMP/docker.log" || fail 'wrapper did not discover configured custom app root'
+# Compose stats the caller's cwd; installer and wrapper must run Docker from /
+# so an inaccessible caller directory cannot fail an install or rollback.
+! grep -qv '^/|' "$TMP/docker.log" || fail 'a Docker invocation inherited the caller working directory'
 sh -n "$ROOT/install.sh" "$ROOT/appliance/install.sh" "$ROOT/appliance/curio" "$ROOT/appliance/kubo-init.sh"
 echo 'appliance tests passed'
