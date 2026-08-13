@@ -1,6 +1,6 @@
 [project]
 name = "content-resolver"
-version = "0.2.5"
+version = "0.2.6"
 description = "Self-hosted media resolver for IPFS, Arweave, and digital artwork"
 authors = [{name = "David Michael"}]
 license = {text = "MIT"}
