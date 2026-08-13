@@ -12,11 +12,13 @@ pins/cache are used; consumers get the PUBLIC base):
   - tokenURI JSON       -> animation_url/artifactUri, else largest image by
     Content-Length -> recurse
   - data:application/json -> decoded inline metadata -> recurse
-  - verse.works/artworks/... -> chain-first: scrape contract address + token
-    id, call ERC-721 tokenURI (or ERC-1155 uri) over the configured RPC, and
-    resolve that like any other tokenURI; only when chain resolution is
-    impossible (no coordinates, RPC disabled/failed, metadata unreachable)
-    fall back to scraping the page directly (tokenUri / iframeUrl / og:image)
+  - verse.works/artworks/... and verse.works/items/ethereum/<contract>/<id>
+    -> chain-first: get the contract address + token id (scraped from the
+    artwork page, or already in the /items/ URL itself), call ERC-721
+    tokenURI (or ERC-1155 uri) over the configured RPC, and resolve that like
+    any other tokenURI; only when chain resolution is impossible (no
+    coordinates, RPC disabled/failed, metadata unreachable) fall back to
+    scraping a page directly (tokenUri / iframeUrl / og:image)
 
 Every step first consults the operator's override registry (overrides.py):
 a ref whose canonical content is gone resolves to its recorded replacement,
@@ -24,7 +26,8 @@ marked `substituted` with a provenance status — never silently.
 
 Not built: ENS / wallet / tx resolution generally (needs an RPC/indexer path
 chosen for the service; see docs/design.md § Open decisions). Contract+tokenId
-resolution is built, but only for Verse artwork pages (see `_resolve_verse`).
+resolution is built, but only for Verse references (see `_resolve_verse` and
+`_resolve_verse_items`).
 """
 
 from __future__ import annotations
@@ -79,6 +82,11 @@ _EMBEDDED_STRING_RE = r'\\"{key}\\":\\"([^\\"]+)\\"'
 # either as a JSON string or a bare number.
 _CONTRACT_ADDRESS_RE = re.compile(r'\\"contractAddress\\":\\"(0x[0-9a-fA-F]{40})\\"')
 _TOKEN_ID_RE = re.compile(r'\\"(?:tokenId|tokenID|token_id)\\":(?:\\")?(\d+)(?:\\")?')
+# /items/<chain>/<contract>/<tokenId> names its chain coordinates directly in
+# the URL — no page scrape needed to find them. Only "ethereum" is supported
+# today; the address and token id are validated on top of the path shape.
+_ITEMS_PATH_RE = re.compile(r"^/items/([^/]+)/([^/]+)/([^/]+)$")
+_HEX_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 # animation-tier fields win outright; image-tier fields compete on size.
 # artifactUri/displayUri are the TZIP-21 (Tezos) equivalents.
@@ -352,8 +360,16 @@ async def resolve_ref(
         return await _resolve_data_uri(ref, settings, client, _depth, origin)
 
     parsed = urlparse(ref)
-    if parsed.hostname in _VERSE_HOSTS and parsed.path.startswith("/artworks/"):
-        return await _resolve_verse(ref, settings, client, _depth, origin)
+    if parsed.hostname in _VERSE_HOSTS:
+        if parsed.path.startswith("/artworks/"):
+            return await _resolve_verse(ref, settings, client, _depth, origin)
+        items_coordinates = _verse_items_coordinates(parsed.path)
+        if items_coordinates is not None:
+            contract, token_id = items_coordinates
+            return await _resolve_verse_items(ref, contract, token_id, settings, client, _depth, origin)
+        # Malformed /items/ paths (bad chain segment, address, or token id)
+        # are not a recognized Verse shape — fall through to generic HTTP
+        # handling below rather than treating them as Verse references.
 
     if parsed.scheme in {"http", "https"}:
         return await _resolve_direct(ref, parsed.path, settings, client, _depth, origin)
@@ -747,6 +763,22 @@ def _extract_verse_chain_coordinates(text: str) -> tuple[str, int] | None:
     return contract_match.group(1), int(token_match.group(1))
 
 
+def _verse_items_coordinates(path: str) -> tuple[str, int] | None:
+    """(contract address, token id) from a `/items/ethereum/<addr>/<id>` path,
+    else None. Only the "ethereum" chain segment is recognized today; a
+    different chain, a malformed address, or a non-numeric token id is not
+    treated as a Verse chain reference at all — the caller falls through to
+    generic URL handling instead.
+    """
+    match = _ITEMS_PATH_RE.match(path)
+    if not match:
+        return None
+    chain, address, token_id = match.groups()
+    if chain != "ethereum" or not _HEX_ADDRESS_RE.match(address) or not token_id.isdigit():
+        return None
+    return address, int(token_id)
+
+
 def _encode_uint256_call(selector_hex: str, token_id: int) -> str:
     return f"0x{selector_hex}{token_id:064x}"
 
@@ -855,17 +887,64 @@ def _disclose_dead_chain_ref(result: Resolved, dead_chain: Resolved | None) -> R
     """Carry forward a chain-found-but-unreachable canonical ref.
 
     Chain resolution may discover a real tokenURI on-chain and still fail to
-    reach its metadata or media (dead pointer, cold storage gone). When that
-    happens the scrape fallback below still runs, for playability — but the
-    catalogue must never look like the scrape rendition is the canonical
-    source. `dead_chain` is that failed chain `Resolved`; its `final_ref`
-    names what SHOULD exist and its `note` says why it doesn't.
+    reach its metadata or media (dead pointer, cold storage gone). `result`
+    is whatever the scrape fallback produced — playable or not — but the
+    catalogue must never look like a scrape rendition (or an empty failure)
+    is the canonical source. `dead_chain` is that failed chain `Resolved`;
+    its `final_ref` names what SHOULD exist and its `note` says why it
+    doesn't.
     """
     if dead_chain is None:
         return result
-    disclosure = f"on-chain canonical ref {dead_chain.final_ref} unreachable ({dead_chain.note}); showing verse scrape fallback"
+    outcome = "showing verse scrape fallback" if result.resolved else "no scrape fallback available either"
+    disclosure = f"on-chain canonical ref {dead_chain.final_ref} unreachable ({dead_chain.note}); {outcome}"
     note = f"{result.note}; {disclosure}" if result.note else disclosure
     return replace(result, note=note, final_ref=dead_chain.final_ref or result.final_ref)
+
+
+async def _resolve_verse_chain_or_none(
+    ref: str, contract: str, token_id: int, settings: Settings, client, depth: int
+) -> Resolved | None:
+    """Attempt chain-first resolution for known (contract, token_id)
+    coordinates.
+
+    None means chain resolution simply isn't available here (RPC disabled,
+    or the call reverted/failed with no usable tokenURI) — the caller treats
+    that exactly like "no chain coordinates". A non-None result that is
+    itself unresolved means a real on-chain tokenURI WAS found but its
+    metadata/media is unreachable — that disclosure must not be dropped.
+    """
+    if not settings.eth_rpc_url:
+        return None
+    chain_token_uri = await _verse_chain_token_uri(client, settings, contract, token_id)
+    if not chain_token_uri:
+        return None
+    return await _resolve_token_uri(ref, chain_token_uri, settings, client, depth)
+
+
+async def _scrape_verse_media(ref: str, text: str, settings: Settings, client, depth: int) -> Resolved | None:
+    """The first of tokenUri / iframeUrl / og:image found in a Verse page's
+    markup, resolved into media — or None if the page yields nothing
+    playable. Shared by artwork-page and items-URL resolution: both fall
+    back to this exact scrape when chain resolution can't be used.
+    """
+    token_uri = _extract_embedded_value(text, "tokenUri")
+    if token_uri:
+        return await _resolve_token_uri(ref, token_uri, settings, client, depth)
+
+    iframe_url = _extract_embedded_value(text, "iframeUrl")
+    if iframe_url:
+        inner = await resolve_ref(iframe_url, settings, client, depth + 1)
+        return replace(inner, original_ref=ref, provider="verse", playback_method="send")
+
+    for match in _META_IMAGE_RE.finditer(text):
+        image_url = html.unescape(match.group(1))
+        if urlparse(image_url).path == "/opengraph-image.png":
+            continue  # verse's site-wide default, not the artwork
+        inner = await resolve_ref(_to_verse_source_url(image_url), settings, client, depth + 1)
+        return replace(inner, original_ref=ref, provider="verse")
+
+    return None
 
 
 async def _resolve_verse(
@@ -880,13 +959,11 @@ async def _resolve_verse(
             note = f"verse fetch failed: {exc}"
             continue
 
-        if settings.eth_rpc_url and dead_chain is None:
+        if dead_chain is None:
             coordinates = _extract_verse_chain_coordinates(text)
             if coordinates is not None:
-                contract, token_id = coordinates
-                chain_token_uri = await _verse_chain_token_uri(client, settings, contract, token_id)
-                if chain_token_uri:
-                    chain_result = await _resolve_token_uri(ref, chain_token_uri, settings, client, depth)
+                chain_result = await _resolve_verse_chain_or_none(ref, *coordinates, settings, client, depth)
+                if chain_result is not None:
                     if chain_result.resolved:
                         return chain_result
                     # A real on-chain tokenURI was found but its metadata/media
@@ -894,24 +971,40 @@ async def _resolve_verse(
                     # for playability, carrying disclosure of what's missing.
                     dead_chain = chain_result
 
-        token_uri = _extract_embedded_value(text, "tokenUri")
-        if token_uri:
-            return _disclose_dead_chain_ref(
-                await _resolve_token_uri(ref, token_uri, settings, client, depth), dead_chain
-            )
-
-        iframe_url = _extract_embedded_value(text, "iframeUrl")
-        if iframe_url:
-            inner = await resolve_ref(iframe_url, settings, client, depth + 1)
-            return _disclose_dead_chain_ref(
-                replace(inner, original_ref=ref, provider="verse", playback_method="send"), dead_chain
-            )
-
-        for match in _META_IMAGE_RE.finditer(text):
-            image_url = html.unescape(match.group(1))
-            if urlparse(image_url).path == "/opengraph-image.png":
-                continue  # verse's site-wide default, not the artwork
-            inner = await resolve_ref(_to_verse_source_url(image_url), settings, client, depth + 1)
-            return _disclose_dead_chain_ref(replace(inner, original_ref=ref, provider="verse"), dead_chain)
+        scraped = await _scrape_verse_media(ref, text, settings, client, depth)
+        if scraped is not None:
+            return _disclose_dead_chain_ref(scraped, dead_chain)
 
     return _disclose_dead_chain_ref(Resolved(ref, ref, "send", "verse", False, note=note), dead_chain)
+
+
+async def _resolve_verse_items(
+    ref: str, contract: str, token_id: int, settings: Settings, client, depth: int, origin: str | None
+) -> Resolved:
+    """`/items/ethereum/<contract>/<tokenId>` already names its chain
+    coordinates in the URL: skip page scraping and go straight to the chain.
+
+    Unlike an artwork page (`_resolve_verse`), there is no guaranteed
+    og:image to fall back to here — only the /items/ page itself, fetched
+    and scraped the same way, and used only if it actually yields something.
+    Total failure names the coordinates that were tried, so the catalogue
+    records what was attempted even when nothing plays.
+    """
+    coordinates_desc = f"contract {contract} token {token_id}"
+    chain_result = await _resolve_verse_chain_or_none(ref, contract, token_id, settings, client, depth)
+    if chain_result is not None and chain_result.resolved:
+        return chain_result
+    dead_chain = chain_result
+
+    try:
+        text = await _bounded_text(client, ref, settings.fetch_max_bytes, settings)
+    except (httpx.HTTPError, ValueError) as exc:
+        note = f"chain resolution failed for {coordinates_desc}; items page fetch failed: {exc}"
+        return _disclose_dead_chain_ref(Resolved(ref, ref, "play", "verse", False, note=note), dead_chain)
+
+    scraped = await _scrape_verse_media(ref, text, settings, client, depth)
+    if scraped is not None:
+        return _disclose_dead_chain_ref(scraped, dead_chain)
+
+    note = f"chain resolution failed for {coordinates_desc}; no tokenUri/iframeUrl/og:image found on items page"
+    return _disclose_dead_chain_ref(Resolved(ref, ref, "play", "verse", False, note=note), dead_chain)

@@ -663,6 +663,76 @@ async def test_verse_chain_erc1155_uri_substitutes_token_id():
     assert result.resolved_url == "http://box:8080/ipfs/bafy1155IMG/art.png"
 
 
+# --- verse.works /items/ethereum/<contract>/<tokenId> (chain coordinates in the URL) ---
+
+# Real contract/tokenId/tokenURI observed for verse.works/items/ethereum/.../1
+# (tokenURI(1) -> https://arweave.net/vqogyJ6jULRyaylzfCEtxHU5gm1IZe1Q7pyhTWcowIM, "Flatiron").
+ITEMS_CONTRACT = "0xf7d3e687883b98eafb8808fa9b53ee065fb2e43f"
+ITEMS_METADATA_TXID = "vqogyJ6jULRyaylzfCEtxHU5gm1IZe1Q7pyhTWcowIM"
+ITEMS_URL = f"https://verse.works/items/ethereum/{ITEMS_CONTRACT}/1"
+
+
+async def test_verse_items_url_resolves_through_chain_to_canonical_media():
+    chain_settings = SETTINGS.model_copy(update={"eth_rpc_url": CHAIN_RPC_URL})
+    routes = {
+        f"http://ar.internal/{ITEMS_METADATA_TXID}": {
+            "status_code": 200,
+            "headers": {"content-type": "application/json"},
+            "json": {"name": "Flatiron", "image": f"https://arweave.net/{TXID}"},
+        },
+        f"http://ar.internal/{TXID}": {
+            "status_code": 200, "headers": {"content-type": "image/png"},
+        },
+    }
+    async with fake_net_with_chain(
+        routes, CHAIN_RPC_URL, tokenuri_result=f"https://arweave.net/{ITEMS_METADATA_TXID}"
+    ) as client:
+        # No page fetch at all: the URL already names its chain coordinates.
+        result = await resolve_ref(ITEMS_URL, chain_settings, client)
+    assert result.resolved is True
+    assert result.provider == "verse"
+    assert result.source_kind == "arweave"
+    assert result.final_ref == f"ar://{TXID}"
+    assert result.resolved_url == f"http://box:3000/arweave/{TXID}"
+    assert result.title == "Flatiron"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        f"/items/tezos/{ITEMS_CONTRACT}/1",  # unsupported chain segment
+        "/items/ethereum/not-an-address/1",  # malformed address
+        f"/items/ethereum/{ITEMS_CONTRACT}/not-a-number",  # non-numeric token id
+    ],
+)
+async def test_verse_items_malformed_path_falls_through_to_generic_handling(path):
+    ref = f"https://verse.works{path}"
+    # fake_net_no_post proves no chain call is attempted for a shape this
+    # loose; falling through means ordinary HTTP handling, not a crash.
+    async with fake_net_no_post() as client:
+        result = await resolve_ref(ref, SETTINGS, client)
+    assert result.resolved is False  # unmocked plain HTTP fetch: a 404, not a raise
+    assert result.provider == "http"
+
+
+async def test_verse_items_chain_failure_falls_back_to_items_page_scrape():
+    chain_settings = SETTINGS.model_copy(update={"eth_rpc_url": CHAIN_RPC_URL})
+    page = '<meta property="og:image" content="https://verse.works/image/w1400/static%2Fflatiron.jpg@jpeg"/>'
+    routes = {ITEMS_URL: {"status_code": 200, "text": page}}
+    async with fake_net_with_chain(routes, CHAIN_RPC_URL) as client:  # both selectors revert
+        result = await resolve_ref(ITEMS_URL, chain_settings, client)
+    assert result.resolved_url == "https://verse.works/image/source/static%2Fflatiron.jpg"
+
+
+async def test_verse_items_chain_failure_with_no_scrape_fallback_names_coordinates():
+    chain_settings = SETTINGS.model_copy(update={"eth_rpc_url": CHAIN_RPC_URL})
+    routes = {ITEMS_URL: {"status_code": 404}}  # items page has nothing to scrape either
+    async with fake_net_with_chain(routes, CHAIN_RPC_URL) as client:  # both selectors revert
+        result = await resolve_ref(ITEMS_URL, chain_settings, client)
+    assert result.resolved is False
+    assert f"contract {ITEMS_CONTRACT} token 1" in (result.note or "")
+
+
 # --- ABI decode helper (chain-first tokenURI/uri return values) ---
 
 

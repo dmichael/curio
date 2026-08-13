@@ -62,7 +62,7 @@ Curio understands:
 | HTTP or inline JSON metadata | Followed to its selected media reference |
 | Other `data:` media | Decoded into the static store |
 | Small UnixFS wrappers | Followed to the selected media |
-| Verse artwork pages | Chain-first: on-chain tokenURI resolved recursively; scrape fallback only when chain resolution is impossible |
+| Verse artwork pages and /items/ URLs | Chain-first: on-chain tokenURI resolved recursively; scrape fallback only when chain resolution is impossible |
 
 HTML works can depend on uncaptured scripts, APIs, or other resources. Curio
 stores the primary artifact but reports these results as `live-dependent`.
