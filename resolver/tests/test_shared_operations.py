@@ -71,8 +71,9 @@ async def test_rest_and_mcp_share_resolution_override_and_favorite_workflows(
     assert calls == ["store", "store", "override", "override", "favorite", "favorite"]
     assert rest_favorite.json()["resolved_url"] is None
     assert rest_favorite.json()["playback_method"] == "play"
-    assert "resolved_url" not in mcp_favorite
-    assert "playback_method" not in mcp_favorite
+    # REST and MCP share operations.FavoriteCreation.response(): same shape.
+    assert mcp_favorite["resolved_url"] is None
+    assert mcp_favorite["playback_method"] == "play"
 
     get_settings.cache_clear()
     get_registry.cache_clear()

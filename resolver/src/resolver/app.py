@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import tempfile
 from contextlib import asynccontextmanager
-from dataclasses import asdict
 from importlib import metadata
-from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -40,9 +37,8 @@ from .overrides import (
     RegistryUnparseable,
     get_registry,
 )
-from .refs import canonical_ref_key
 from .seed import TooManySeedJobs, get_job, list_jobs, start_seed
-from .static_store import StaticStore, playable
+from .static_store import StaticStore
 from .wallets import list_wallet_tokens
 
 
@@ -105,13 +101,10 @@ _SCOPE_DESCRIPTION = (
 @app.get("/resolve")
 async def resolve_get(ref: str = Query(..., description="A reference previously stored by Curio")):
     """Redirect a known reference to its source-native Curio media route."""
-    settings = get_settings()
-    record = StaticStore(settings.static_root, settings.static_cache_max_bytes).resolution(
-        canonical_ref_key(ref)
-    )
+    record = operations.lookup_resolution(ref, get_settings())
     if record is None:
         return JSONResponse({"error": "reference not found"}, status_code=404)
-    if not playable(record):
+    if not record["playable"]:
         # Report the failure as absent rather than redirecting to a media
         # path the record itself says did not work.
         return JSONResponse(
@@ -179,39 +172,10 @@ async def resolve_post(
         )
         return JSONResponse(payload, status_code=200 if stored else 422)
 
-    store = StaticStore(settings.static_root, settings.static_cache_max_bytes)
-    store.root.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(dir=store.root, prefix=".upload-", delete=False) as output:
-            temporary = Path(output.name)
-            size = 0
-            while chunk := await file.read(65536):
-                size += len(chunk)
-                if size > settings.static_max_bytes:
-                    return JSONResponse(
-                        {"error": f"body exceeds {settings.static_max_bytes} bytes"},
-                        status_code=413,
-                    )
-                output.write(chunk)
-        entry = store.put_file(
-            temporary,
-            media_type=file.content_type,
-            filename=file.filename,
-            source_ref=None,
-            storage_status="stored",
-        )
-        temporary = None
-        payload = operations.record_upload(
-            entry,
-            filename=file.filename,
-            settings=settings,
-            origin=origin,
-        )
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-        await file.close()
+        payload = await operations.store_upload(file, settings, origin)
+    except operations.UploadTooLarge as exc:
+        return JSONResponse({"error": str(exc)}, status_code=413)
     return JSONResponse(payload, status_code=201)
 
 
@@ -321,8 +285,7 @@ async def override_list(
             return PlainTextResponse(registry.raw_text())
         except OverrideNotFound as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
-    entries = [asdict(entry) for entry in registry.entries()]
-    return JSONResponse({"count": len(entries), "entries": entries})
+    return JSONResponse(operations.override_listing(registry))
 
 
 @app.post("/override")
@@ -359,7 +322,7 @@ async def override_remove(
         return JSONResponse({"error": str(exc)}, status_code=404)
     except RegistryUnparseable as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
-    return JSONResponse({"removed": asdict(removed)})
+    return JSONResponse(operations.override_removed(removed))
 
 
 def _favorites_store() -> Favorites | None:
@@ -403,18 +366,7 @@ async def favorite_add(
         )
     except (DuplicateFavorite, FavoritesUnparseable) as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
-    result, record = created.result, created.record
-    return JSONResponse(
-        {
-            **record,
-            "resolved": result.resolved if result else None,
-            "resolved_url": result.resolved_url if result and result.resolved else None,
-            "playback_method": result.playback_method if result else None,
-            "final_ref": result.final_ref if result else record.get("final_ref"),
-            "source_ref": result.final_ref if result else record.get("final_ref"),
-        },
-        status_code=201,
-    )
+    return JSONResponse(created.response(), status_code=201)
 
 
 @app.delete("/favorites")
@@ -430,7 +382,7 @@ async def favorite_remove(
         return JSONResponse({"error": str(exc)}, status_code=404)
     except FavoritesUnparseable as exc:
         return JSONResponse({"error": str(exc)}, status_code=409)
-    return JSONResponse({"removed": removed})
+    return JSONResponse(operations.favorite_removed(removed))
 
 
 @app.get("/library")
@@ -489,34 +441,6 @@ async def ipfs_gateway(request: Request, path: str):
 @app.api_route("/arweave/{path:path}", methods=["GET", "HEAD"])
 async def arweave_gateway(request: Request, path: str):
     return await _gateway_proxy(request, "arweave", path)
-
-
-_SKILL_DIR = Path(__file__).parent / "skill"
-# Serve only this import-time whitelist, never a request-derived path.
-_SKILL_FILES = {
-    "SKILL.md": _SKILL_DIR / "SKILL.md",
-    **{f"{p.parent.name}/SKILL.md": p for p in sorted(_SKILL_DIR.glob("*/SKILL.md"))},
-}
-
-
-@app.get("/skill")
-async def skill():
-    """Agent instructions for this service, served by the service itself."""
-    return FileResponse(_SKILL_FILES["SKILL.md"], media_type="text/markdown")
-
-
-@app.get("/skill/{name:path}")
-async def skill_file(name: str):
-    """Skills shipped with the service — e.g. /skill/nft-preservation.
-    No ecosystem convention for distributing skills exists yet; this box's
-    convention is that it serves its own."""
-    path = _SKILL_FILES.get(name) or _SKILL_FILES.get(f"{name}/SKILL.md")
-    if path is None:
-        return JSONResponse(
-            {"error": "unknown skill", "available": sorted(_SKILL_FILES)},
-            status_code=404,
-        )
-    return FileResponse(path, media_type="text/markdown")
 
 
 @app.get("/healthz")

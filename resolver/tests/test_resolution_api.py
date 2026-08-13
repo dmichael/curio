@@ -171,6 +171,18 @@ def test_multipart_post_stores_upload_and_returned_ref_plays(http_client, tmp_pa
     get_settings.cache_clear()
 
 
+def test_multipart_post_over_cap_is_413(http_client, tmp_path, monkeypatch):
+    monkeypatch.setenv("RESOLVER_STATIC_ROOT", str(tmp_path / "media"))
+    monkeypatch.setenv("RESOLVER_STATIC_MAX_BYTES", "4")
+    get_settings.cache_clear()
+    response = http_client.post(
+        "/resolve", files={"file": ("big.png", b"way-too-many-bytes", "image/png")}
+    )
+    assert response.status_code == 413
+    assert response.json()["error"] == "body exceeds 4 bytes"
+    get_settings.cache_clear()
+
+
 async def test_storage_intent_bypasses_evictable_cache_quota(tmp_path):
     settings = Settings(
         static_root=str(tmp_path / "media"),

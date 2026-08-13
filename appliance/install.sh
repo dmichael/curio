@@ -142,6 +142,8 @@ EOF
     docker compose --project-name curio --env-file "$config_file" --file "$new_compose" up -d --wait --wait-timeout "$health_timeout" --remove-orphans || rollback "Compose start or health check failed"
     assert_state_owned || rollback "persistent state ownership check failed after start"
     install -m 0755 "$script_dir/curio" "$bin_home/curio"
+    port=$(read_env "$config_file" CURIO_PORT); [ -n "$port" ] || port=8090
     echo "Curio $version installed and healthy. Add $bin_home to PATH, then run: curio status"
+    echo "Agent access (MCP): http://<host>:$port/mcp"
 }
 [ "${CURIO_INSTALL_SH_SOURCE_ONLY:-0}" = 1 ] || main "$@"

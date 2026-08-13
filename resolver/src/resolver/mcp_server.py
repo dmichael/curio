@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import asdict
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -18,11 +16,18 @@ from .overrides import OverrideError, OverrideRegistry, get_registry
 from .seed import get_job, list_jobs, start_seed
 from .wallets import list_wallet_tokens
 
-_SKILL_PATH = Path(__file__).parent / "skill" / "SKILL.md"
+_INSTRUCTIONS = (
+    "Curio stores NFT media references and local files, then serves them "
+    "from one origin. It has no user authentication: it is intended for a "
+    "trusted household or studio network and must not be exposed directly "
+    "to the public internet. Binary media upload is REST-only (multipart "
+    "POST /resolve); media bytes are served on REST routes /media, /ipfs, "
+    "/arweave."
+)
 
 mcp = FastMCP(
     "curio",
-    instructions=_SKILL_PATH.read_text(),
+    instructions=_INSTRUCTIONS,
     stateless_http=True,
     # app.py validates request-derived origins before this mounted transport.
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
@@ -61,17 +66,42 @@ def _mcp_origin(ctx: Context | None = None) -> str:
 
 @mcp.tool()
 async def resolve(ref: str, ctx: Context = None) -> dict[str, Any]:
-    """Resolve and store an IPFS, Arweave, HTTP, data, or metadata reference.
+    """Resolve and store an IPFS, Arweave, HTTP, `data:` metadata or media,
+    or Verse artwork-page reference.
 
-    A successful response contains the reference to pass to HTTP
-    `GET /resolve?ref=...`, plus its final source identity and status. Runtime
-    HTML is stored as `live-dependent` because its network dependencies remain
-    outside Curio.
+    A successful response has status `ready` or `live-dependent`, plus the
+    reference to pass to `lookup` or HTTP `GET /resolve?ref=...`. `failed`
+    means Curio did not register the reference. `live-dependent` means the
+    stored primary HTML artifact still relies on network resources Curio has
+    not captured — never call such a runtime complete.
     """
     payload, _ = await operations.store_reference(
         ref, get_settings(), _require_client(), _mcp_origin(ctx)
     )
     return payload
+
+
+@mcp.tool()
+async def lookup(ref: str) -> dict[str, Any]:
+    """Look up a reference Curio already stored, without submitting it.
+
+    Unknown references answer {"found": false}; lookup never stores new
+    media (use resolve for that). A found record's `playable` is false when
+    the stored resolution failed, with `reason` explaining why. `media_type`
+    tells you how to play it: `text/html` should be sent as a page
+    (playback_method `send`); anything else plays directly (`play`).
+    """
+    record = operations.lookup_resolution(ref, get_settings())
+    if record is None:
+        return {"found": False}
+    return {
+        "found": True,
+        "playable": record["playable"],
+        "reason": record.get("reason"),
+        "media_path": record["media_path"],
+        "status": record["status"],
+        "media_type": record.get("media_type"),
+    }
 
 
 @mcp.tool()
@@ -125,7 +155,8 @@ async def seed_wallet(
     bytes never enter IPFS implicitly. Poll
     with seed_status. Re-running is safe; use limit for a partial run.
     scope="published" and "created" are Tezos-only; "contract" accepts a
-    literal 0x…/KT1… contract on either supported chain.
+    literal Ethereum or Tezos token-contract address on either supported
+    chain. Fully burned authored works are omitted unless include_burned=true.
     """
     job = await start_seed(
         ref, get_settings(), _require_client(),
@@ -157,12 +188,21 @@ def _require_registry() -> OverrideRegistry:
 
 
 @mcp.tool()
-async def list_overrides() -> dict[str, Any]:
+async def list_overrides(raw: bool = False) -> dict[str, Any]:
     """List the operator's override registry: dead canonical refs mapped to
-    replacement refs, each with a provenance status. Empty until the operator
-    records the first exception; everything ordinary resolves without it."""
-    entries = [asdict(entry) for entry in _require_registry().entries()]
-    return {"count": len(entries), "entries": entries}
+    replacement refs, each disclosing a provenance status
+    (canonical-recovered, captured-original, operator-attested, or
+    alternate-master). Empty until the operator records the first exception;
+    everything ordinary resolves without it. raw=true returns the registry
+    file verbatim (TOML) under "raw", for snapshots — matches REST
+    `GET /override?raw=1`."""
+    registry = _require_registry()
+    if raw:
+        try:
+            return {"raw": registry.raw_text()}
+        except OverrideError as exc:
+            raise ValueError(str(exc)) from exc
+    return operations.override_listing(registry)
 
 
 @mcp.tool()
@@ -224,7 +264,7 @@ async def remove_override(ref: str) -> dict[str, Any]:
         removed = _require_registry().remove(ref)
     except OverrideError as exc:
         raise ValueError(str(exc)) from exc
-    return {"removed": asdict(removed)}
+    return operations.override_removed(removed)
 
 
 def _require_favorites() -> Favorites:
@@ -272,13 +312,7 @@ async def add_favorite(
         )
     except FavoriteError as exc:
         raise ValueError(str(exc)) from exc
-    result, record = created.result, created.record
-    return {
-        **record,
-        "resolved": result.resolved if result else None,
-        "final_ref": result.final_ref if result else record.get("final_ref"),
-        "source_ref": result.final_ref if result else record.get("final_ref"),
-    }
+    return created.response()
 
 
 @mcp.tool()
@@ -289,7 +323,7 @@ async def remove_favorite(ref: str) -> dict[str, Any]:
         removed = _require_favorites().remove(ref)
     except FavoriteError as exc:
         raise ValueError(str(exc)) from exc
-    return {"removed": removed}
+    return operations.favorite_removed(removed)
 
 
 @mcp.tool()

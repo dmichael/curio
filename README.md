@@ -90,6 +90,20 @@ curl --get 'http://localhost:8090/wallet' \
 `/seed/<job-id>`. Ethereum creator lookup and direct contract/token RPC
 resolution are not implemented.
 
+## Connect your agent
+
+Curio serves MCP at `http://<host>:8090/mcp` (streamable HTTP); the tool
+descriptions carry the same semantics as the REST routes below. Register it
+with Claude Code:
+
+```bash
+claude mcp add --transport http curio http://<host>:8090/mcp
+```
+
+Any other MCP-capable tool — Codex, OpenCode, Gemini, Cursor, and the rest —
+registers the same URL through its own config. REST callers use the schema
+at `/openapi.json` instead.
+
 ## API and services
 
 OpenAPI is available at `/docs` and `/openapi.json`. MCP is mounted at `/mcp`.
