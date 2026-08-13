@@ -28,7 +28,6 @@ def client(http_client, tmp_path, monkeypatch):
     clears the caches again; the monkeypatch env restore lands after, so the
     next get_settings() rebuilds from the clean environment."""
     monkeypatch.setenv("RESOLVER_OVERRIDES_PATH", str(tmp_path / "overrides.toml"))
-    monkeypatch.setenv("RESOLVER_SEED_CAPTURE_DIR", str(tmp_path / "captures"))
     monkeypatch.setenv("RESOLVER_IPFS_PUBLIC_BASE", "http://box:8080")
     get_settings.cache_clear()
     get_registry.cache_clear()
@@ -144,16 +143,3 @@ def test_resolve_route_uploads_and_records(client):
     assert body["ref"].startswith("upload:sha256:")
     assert body["media_url"].startswith("http://testserver/resolve?")
     assert body["integrity"]["algorithm"] == "sha256"
-
-
-def test_upload_does_not_require_capture_dir(http_client, monkeypatch):
-    monkeypatch.delenv("RESOLVER_SEED_CAPTURE_DIR", raising=False)
-    get_settings.cache_clear()
-    try:
-        response = http_client.post(
-            "/resolve", files={"file": ("m.png", b"x", "image/png")}
-        )
-        assert response.status_code == 201
-        assert response.json()["source_kind"] == "upload"
-    finally:
-        get_settings.cache_clear()

@@ -73,10 +73,6 @@ class Settings(BaseSettings):
     seed_max_seconds: float = Field(default=14_400.0, gt=0)  # wall-clock cap per job
     seed_jobs_kept: int = Field(default=100, ge=1)  # finished-job history retained
     seed_recover_max_bytes: int = Field(default=1_073_741_824, gt=0)
-    # When set, /seed also captures plain-HTTP media (works with no content
-    # address — the refs most likely to vanish, cf. Horizon) into Kubo and
-    # appends provenance records to <dir>/captures.jsonl. Empty disables.
-    seed_capture_dir: str = ""
     # Public gateways tried as HTTP-recovery sources for CIDs whose IPFS
     # fetch fails — their caches often outlive the original providers.
     seed_recovery_gateways: list[str] = ["https://ipfs.io/ipfs", "https://dweb.link/ipfs"]

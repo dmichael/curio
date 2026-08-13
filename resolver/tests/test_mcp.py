@@ -265,7 +265,12 @@ async def test_mcp_add_favorite_response_matches_rest_shape(favorites_env):
     assert added["playback_method"] == "play"
 
 
-async def test_mcp_library_status_smoke():
+async def test_mcp_library_status_smoke(tmp_path, monkeypatch):
+    # Arweave inventory now comes from the resolutions catalogue at
+    # static_root — isolate it so another test's registered txid can't leak in.
+    monkeypatch.setenv("RESOLVER_STATIC_ROOT", str(tmp_path / "media"))
+    get_settings.cache_clear()
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v0/pin/ls":
             return httpx.Response(200, json={"Keys": {"bafyA": {"Type": "recursive"}}})
@@ -275,12 +280,15 @@ async def test_mcp_library_status_smoke():
             return httpx.Response(200, headers={"x-cache": "HIT"})
         raise AssertionError(f"unexpected network call: {request.url}")
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        mcp_server.set_client(client)
-        payload = await call("library_status", {})
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            mcp_server.set_client(client)
+            payload = await call("library_status", {})
+    finally:
+        get_settings.cache_clear()
     assert payload["ipfs"] == {"pinned": 1, "repo_size_bytes": 4096, "repo_objects": 12}
     assert payload["arweave"] == {"known_warmed": 0, "currently_cached": 0}
-    assert payload["registry"] == {"overrides": None, "favorites": None, "captures": None}
+    assert payload["registry"] == {"overrides": None, "favorites": None}
 
 
 async def test_mcp_override_tools_error_when_disabled(monkeypatch):
