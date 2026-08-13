@@ -129,11 +129,19 @@ grep -q '^CURIO_TRUSTED_PROXY_CIDRS=$' "$TMP/xdg-config/curio/curio.env" || fail
 first_pointer=$(readlink "$TMP/custom-app/current"); first_version=$(<"$TMP/custom-app/current/VERSION")
 # Simulate the next verified release: an update must replace both pointer and
 # installed package version, not nest a link below the old release directory.
+# The simulated next release is derived from the working tree's version so the
+# test survives real version bumps.
+current_version=$(awk -F '"' '/^version = /{print $2; exit}' "$ROOT/resolver/pyproject.toml")
+bumped_version="${current_version%.*}.$(( ${current_version##*.} + 1 ))"
+latest_version="${current_version%.*}.$(( ${current_version##*.} + 2 ))"
 cp "$ROOT/resolver/pyproject.toml" "$TMP/pyproject.orig"
-python3 - "$ROOT/resolver/pyproject.toml" <<'PY'
+CURIO_TEST_VERSION="$bumped_version" python3 - "$ROOT/resolver/pyproject.toml" <<'PY'
+import os, re
 from pathlib import Path
 path = Path(__import__('sys').argv[1])
-path.write_text(path.read_text().replace('version = "0.2.0"', 'version = "0.2.1"', 1))
+text = path.read_text()
+old = re.search(r'^version = ".*"$', text, flags=re.M)[0]
+path.write_text(text.replace(old, f'version = "{os.environ["CURIO_TEST_VERSION"]}"', 1))
 PY
 printf preserved >"$TMP/custom-state/sentinel"
 # Upgrade must not recursively remove historical state or rewrite obsolete keys.
@@ -158,21 +166,21 @@ grep -q 'up -d --wait --wait-timeout .* --remove-orphans' "$TMP/docker.log" || f
 # The installed wrapper must call the root verified bootstrap (not the
 # appliance installer directly), preserving an exact tag and empty/latest mode.
 grep -q 'Verified Curio release bootstrap' "$TMP/custom-app/current/install.sh" || fail 'installed update target is not the verified bootstrap'
-printf 'v0.2.2\n' >"$TMP/releases/latest/download/VERSION"
+printf 'v%s\n' "$latest_version" >"$TMP/releases/latest/download/VERSION"
 CURIO_RELEASE_BASE_URL="file://$TMP/releases" CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update --check >"$TMP/update-check"
-grep -q 'installed 0.2.1; latest v0.2.2' "$TMP/update-check" || fail 'update check did not use the release root latest path'
+grep -qF "installed $bumped_version; latest v$latest_version" "$TMP/update-check" || fail 'update check did not use the release root latest path'
 printf 'not-a-version\n' >"$TMP/releases/latest/download/VERSION"
 if CURIO_RELEASE_BASE_URL="file://$TMP/releases" CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update >/dev/null 2>&1; then fail 'wrapper accepted an invalid latest VERSION'; fi
-printf 'v0.2.2\n' >"$TMP/releases/latest/download/VERSION"
+printf 'v%s\n' "$latest_version" >"$TMP/releases/latest/download/VERSION"
 cat >"$TMP/custom-app/current/install.sh" <<EOF
 #!/bin/sh
 printf 'version=%s app=%s\\n' "\${CURIO_VERSION-unset}" "\${CURIO_APP_ROOT-unset}" >>"$TMP/wrapper-update.log"
 EOF
 chmod +x "$TMP/custom-app/current/install.sh"
-CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update --version v0.2.1
+CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update --version "v$bumped_version"
 CURIO_RELEASE_BASE_URL="file://$TMP/releases" CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update
-[[ $(sed -n '1p' "$TMP/wrapper-update.log") == "version=v0.2.1 app=$TMP/custom-app" ]] || fail 'wrapper did not propagate exact update version to bootstrap'
-[[ $(sed -n '2p' "$TMP/wrapper-update.log") == "version=v0.2.2 app=$TMP/custom-app" ]] || fail 'wrapper did not bind latest VERSION to an immutable release'
+[[ $(sed -n '1p' "$TMP/wrapper-update.log") == "version=v$bumped_version app=$TMP/custom-app" ]] || fail 'wrapper did not propagate exact update version to bootstrap'
+[[ $(sed -n '2p' "$TMP/wrapper-update.log") == "version=v$latest_version app=$TMP/custom-app" ]] || fail 'wrapper did not bind latest VERSION to an immutable release'
 CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_DOCKER_LOG="$TMP/docker.log" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" status
 
 grep -q -- '--file .*custom-app/current/compose.yaml' "$TMP/docker.log" || fail 'wrapper did not discover configured custom app root'
