@@ -58,6 +58,16 @@ Metadata and wrappers are followed to the selected final artifact. Overrides
 are checked during recursion and substitutions are disclosed in the POST
 response.
 
+Verse artwork pages resolve chain-first: the page's embedded contract address
+and token id drive an ERC-721 `tokenURI` (or ERC-1155 `uri`) call over
+`RESOLVER_ETH_RPC_URL`, and the returned tokenURI is resolved like any other
+metadata reference. Only when on-chain resolution is impossible — no
+coordinates on the page, RPC disabled or unreachable, or the chain-found
+metadata unreachable — does it fall back to scraping the page directly
+(embedded `tokenUri` / `iframeUrl` / `og:image`). A chain-found canonical ref
+that turns out to be dead is still disclosed in the response `note`, even
+when a scrape fallback is what actually plays.
+
 ## Source-native storage
 
 | Final source | Storage action | Playback path |

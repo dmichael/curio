@@ -1,6 +1,9 @@
+import json
+
 import httpx
 import pytest
 
+from resolver import resolve as resolve_module
 from resolver.config import Settings
 from resolver.refs import canonical_ref_key, ipfs_parts
 from resolver.resolve import resolve_ref
@@ -38,6 +41,60 @@ def no_net() -> httpx.AsyncClient:
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"unexpected network call: {request.method} {request.url}")
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def _encode_abi_string(value: str) -> str:
+    """ABI-encode a single dynamic `string` return value, matching what a
+    real eth_call response for tokenURI/uri looks like on the wire."""
+    data = value.encode()
+    padded_len = -(-len(data) // 32) * 32 if data else 0
+    payload = (32).to_bytes(32, "big") + len(data).to_bytes(32, "big") + data.ljust(padded_len, b"\x00")
+    return "0x" + payload.hex()
+
+
+def fake_net_with_chain(
+    routes: dict[str, dict] | None, rpc_url: str, *, tokenuri_result: str | None = None, uri_result: str | None = None
+) -> httpx.AsyncClient:
+    """Like `fake_net`, plus a POST-based eth_call router for `rpc_url` that
+    dispatches on the call's function selector: tokenURI(uint256) resolves to
+    `tokenuri_result` when given, ERC-1155 uri(uint256) to `uri_result`;
+    either left None reverts, like a contract that doesn't implement it."""
+    table = routes or {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and str(request.url) == rpc_url:
+            body = json.loads(request.content)
+            selector = body["params"][0]["data"][2:10]
+            result = (
+                tokenuri_result if selector == resolve_module._ERC721_TOKEN_URI_SELECTOR
+                else uri_result if selector == resolve_module._ERC1155_URI_SELECTOR
+                else None
+            )
+            if result is None:
+                return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "error": {"code": 3, "message": "execution reverted"}})
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": _encode_abi_string(result)})
+        spec = table.get(f"{request.method} {request.url}") or table.get(str(request.url))
+        if spec is None:
+            return httpx.Response(404)
+        return httpx.Response(**spec)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def fake_net_no_post(routes: dict[str, dict] | None = None) -> httpx.AsyncClient:
+    """Like `fake_net`, but fails the test if anything POSTs — used to prove
+    a disabled chain lookup makes no RPC call at all."""
+    table = routes or {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            raise AssertionError(f"unexpected POST: {request.url}")
+        spec = table.get(f"{request.method} {request.url}") or table.get(str(request.url))
+        if spec is None:
+            return httpx.Response(404)
+        return httpx.Response(**spec)
 
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
@@ -500,6 +557,143 @@ async def test_verse_fetch_failure_is_reported_not_raised():
         result = await resolve_ref(VERSE_URL, SETTINGS, client)
     assert result.resolved is False
     assert result.provider == "verse"
+
+
+# --- verse.works chain-first resolution ---
+
+CHAIN_CONTRACT = "0x92e4e31e4be8e944aed5b8fbaffd8f7050b2b8ef"
+CHAIN_RPC_URL = "http://eth.internal/rpc"
+CHAIN_OG_IMAGE_META = (
+    '<meta property="og:image" content="https://verse.works/image/w1400/static%2Fart.jpg@jpeg"/>'
+)
+
+
+def _verse_page_with_coords(token_id: int = 7, extra: str = "") -> str:
+    return (
+        r'\"contractAddress\":\"' + CHAIN_CONTRACT + r'\",\"tokenId\":' + str(token_id) + extra
+    )
+
+
+async def test_verse_chain_resolves_ipfs_token_uri_through_metadata():
+    chain_settings = SETTINGS.model_copy(update={"eth_rpc_url": CHAIN_RPC_URL})
+    routes = {
+        VERSE_URL: {"status_code": 200, "text": _verse_page_with_coords()},
+        "http://ipfs.internal/ipfs/bafyCMETA/meta.json": {
+            "status_code": 200,
+            "headers": {"content-type": "application/json"},
+            "json": {"name": "Chain Piece", "image": "ipfs://bafyCIMG/art.png"},
+        },
+        "http://ipfs.internal/ipfs/bafyCIMG/art.png": {
+            "status_code": 200, "headers": {"content-type": "image/png"},
+        },
+    }
+    async with fake_net_with_chain(routes, CHAIN_RPC_URL, tokenuri_result="ipfs://bafyCMETA/meta.json") as client:
+        result = await resolve_ref(VERSE_URL, chain_settings, client)
+    assert result.resolved is True
+    assert result.provider == "verse"
+    assert result.source_kind == "ipfs"
+    assert result.final_ref == "ipfs://bafyCIMG/art.png"
+    assert result.resolved_url == "http://box:8080/ipfs/bafyCIMG/art.png"
+    assert result.title == "Chain Piece"
+
+
+async def test_verse_chain_disabled_falls_back_to_scrape():
+    disabled_settings = SETTINGS.model_copy(update={"eth_rpc_url": ""})
+    page = _verse_page_with_coords(extra=CHAIN_OG_IMAGE_META)
+    routes = {VERSE_URL: {"status_code": 200, "text": page}}
+    # fake_net_no_post asserts no RPC call is attempted at all when disabled.
+    async with fake_net_no_post(routes) as client:
+        result = await resolve_ref(VERSE_URL, disabled_settings, client)
+    assert result.resolved_url == "https://verse.works/image/source/static%2Fart.jpg"
+    assert result.playback_method == "play"
+
+
+async def test_verse_chain_rpc_error_falls_back_to_scrape():
+    chain_settings = SETTINGS.model_copy(update={"eth_rpc_url": CHAIN_RPC_URL})
+    page = _verse_page_with_coords(extra=CHAIN_OG_IMAGE_META)
+    routes = {VERSE_URL: {"status_code": 200, "text": page}}
+    # No tokenuri_result/uri_result configured: both selectors revert.
+    async with fake_net_with_chain(routes, CHAIN_RPC_URL) as client:
+        result = await resolve_ref(VERSE_URL, chain_settings, client)
+    assert result.resolved_url == "https://verse.works/image/source/static%2Fart.jpg"
+    assert "on-chain canonical ref" not in (result.note or "")
+
+
+async def test_verse_chain_dead_pointer_discloses_and_falls_back_to_og_image(tmp_path):
+    chain_settings = SETTINGS.model_copy(update={"eth_rpc_url": CHAIN_RPC_URL, "static_root": str(tmp_path)})
+    page = _verse_page_with_coords(extra=CHAIN_OG_IMAGE_META)
+    routes = {
+        VERSE_URL: {"status_code": 200, "text": page},
+        "https://verse.works/image/source/static%2Fart.jpg": {
+            "status_code": 200, "headers": {"content-type": "image/jpeg"},
+        },
+        # ipfs.internal has nothing for bafyDEAD: the chain-found metadata is unreachable.
+    }
+    async with fake_net_with_chain(routes, CHAIN_RPC_URL, tokenuri_result="ipfs://bafyDEAD/meta.json") as client:
+        result = await resolve_ref(VERSE_URL, chain_settings, client)
+    assert result.resolved is True
+    assert result.provider == "verse"  # served by the scrape rendition, not chain
+    assert result.final_ref == "ipfs://bafyDEAD/meta.json"  # what SHOULD exist
+    assert "ipfs://bafyDEAD/meta.json" in (result.note or "")
+    assert "unreachable" in (result.note or "")
+
+
+async def test_verse_chain_erc1155_uri_substitutes_token_id():
+    chain_settings = SETTINGS.model_copy(update={"eth_rpc_url": CHAIN_RPC_URL})
+    routes = {
+        VERSE_URL: {"status_code": 200, "text": _verse_page_with_coords(token_id=7)},
+        # ERC-1155's {id} substitutes the full 64-hex-char zero-padded token id.
+        f"http://ipfs.internal/ipfs/bafy1155META/{7:064x}.json": {
+            "status_code": 200,
+            "headers": {"content-type": "application/json"},
+            "json": {"name": "1155 Piece", "image": "ipfs://bafy1155IMG/art.png"},
+        },
+        "http://ipfs.internal/ipfs/bafy1155IMG/art.png": {
+            "status_code": 200, "headers": {"content-type": "image/png"},
+        },
+    }
+    # tokenURI(uint256) reverts (no tokenuri_result); uri(uint256) returns the
+    # ERC-1155 template with the standard {id} placeholder.
+    async with fake_net_with_chain(
+        routes, CHAIN_RPC_URL, uri_result="ipfs://bafy1155META/{id}.json"
+    ) as client:
+        result = await resolve_ref(VERSE_URL, chain_settings, client)
+    assert result.resolved is True
+    assert result.final_ref == "ipfs://bafy1155IMG/art.png"
+    assert result.resolved_url == "http://box:8080/ipfs/bafy1155IMG/art.png"
+
+
+# --- ABI decode helper (chain-first tokenURI/uri return values) ---
+
+
+def test_decode_abi_string_happy_path():
+    encoded = bytes.fromhex(_encode_abi_string("ipfs://bafyCID/meta.json")[2:])
+    assert resolve_module._decode_abi_string(encoded) == "ipfs://bafyCID/meta.json"
+
+
+def test_decode_abi_string_empty_string():
+    encoded = bytes.fromhex(_encode_abi_string("")[2:])
+    assert resolve_module._decode_abi_string(encoded) == ""
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    [
+        b"",
+        b"\x00" * 10,  # shorter than the 64-byte offset+length header
+        # offset points past the end of the payload
+        (999).to_bytes(32, "big") + (0).to_bytes(32, "big"),
+        # declared length longer than the remaining bytes
+        (32).to_bytes(32, "big") + (999).to_bytes(32, "big") + b"short",
+    ],
+)
+def test_decode_abi_string_rejects_short_or_malformed_input(garbage):
+    assert resolve_module._decode_abi_string(garbage) is None
+
+
+def test_encode_uint256_call_pads_token_id_to_32_bytes():
+    call = resolve_module._encode_uint256_call("c87b56dd", 7)
+    assert call == "0xc87b56dd" + "0" * 63 + "7"
 
 
 # --- data: URIs (fully on-chain tokenURIs) ---

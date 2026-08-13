@@ -69,6 +69,14 @@ async def resolve(ref: str, ctx: Context = None) -> dict[str, Any]:
     """Resolve and store an IPFS, Arweave, HTTP, `data:` metadata or media,
     or Verse artwork-page reference.
 
+    Verse artwork pages resolve chain-first: the contract address and token
+    id are read from the page, a tokenURI/uri chain call fetches the
+    canonical metadata, and its media is resolved recursively. Only when
+    on-chain resolution is impossible (no coordinates on the page, RPC
+    disabled or unreachable, chain metadata unreachable) does it fall back to
+    scraping the page directly — and a chain-found-but-dead canonical ref is
+    disclosed in `note` even when a scrape fallback plays instead.
+
     A successful response has status `ready` or `live-dependent`, plus the
     reference to pass to `lookup` or HTTP `GET /resolve?ref=...`. `failed`
     means Curio did not register the reference. `live-dependent` means the
