@@ -50,7 +50,7 @@ from .fixups import (
 )
 from .overrides import get_registry
 from .refs import arweave_parts, ipfs_parts
-from .static_store import CacheQuotaError, ResolutionStatus, StaticStore
+from .static_store import CacheQuotaError, ResolutionStatus, StaticStore, playable
 
 __all__ = [
     "Resolved",
@@ -277,6 +277,18 @@ async def resolve_ref(
         ).resolution(ref)
         if record is None:
             return Resolved(ref, ref, "play", None, False, note="stored reference not found")
+        if not playable(record):
+            # Mirror GET /resolve: a recorded failure resolves to nothing,
+            # never to the media path the record says did not work.
+            return Resolved(
+                ref,
+                ref,
+                "play",
+                None,
+                False,
+                status=ResolutionStatus.FAILED,
+                note=str(record.get("reason") or "recorded failure"),
+            )
         base = origin.rstrip("/") if origin else settings.ipfs_public_base.rstrip("/")
         media_type = record.get("media_type")
         status = ResolutionStatus(str(record["status"]))

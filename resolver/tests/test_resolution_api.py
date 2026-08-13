@@ -7,7 +7,7 @@ import httpx
 
 from resolver import operations
 from resolver.config import Settings, get_settings
-from resolver.resolve import Resolved
+from resolver.resolve import Resolved, resolve_ref
 from resolver.static_store import ResolutionStatus, StaticStore
 
 
@@ -213,6 +213,26 @@ def test_get_does_not_redirect_a_recorded_failure(http_client, tmp_path, monkeyp
     assert response.status_code == 404
     assert response.json()["reason"] == "providers gone"
     get_settings.cache_clear()
+
+
+async def test_resolve_ref_does_not_play_a_recorded_failure(tmp_path):
+    # Every reader of the resolutions table must give the same answer as
+    # GET /resolve: a FAILED record is not playable.
+    settings = Settings(static_root=str(tmp_path / "media"), ssrf_dns_check=False)
+    StaticStore(settings.static_root).record_resolution(
+        canonical_ref="upload:sha256:deadbeef",
+        ref="upload:sha256:deadbeef",
+        final_ref="upload:sha256:deadbeef",
+        media_path="/media/deadbeef",
+        status=ResolutionStatus.FAILED,
+        reason="stored bytes rejected",
+    )
+    async with httpx.AsyncClient() as client:
+        result = await resolve_ref("upload:sha256:deadbeef", settings, client)
+    assert result.resolved is False
+    assert result.status == ResolutionStatus.FAILED
+    assert result.resolved_url == "upload:sha256:deadbeef"
+    assert result.note == "stored bytes rejected"
 
 
 def test_resolution_schema_migrates_existing_static_database(tmp_path):

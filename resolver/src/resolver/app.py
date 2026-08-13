@@ -42,7 +42,7 @@ from .overrides import (
 )
 from .refs import canonical_ref_key
 from .seed import TooManySeedJobs, get_job, list_jobs, start_seed
-from .static_store import ResolutionStatus, StaticStore
+from .static_store import StaticStore, playable
 from .wallets import list_wallet_tokens
 
 
@@ -111,9 +111,9 @@ async def resolve_get(ref: str = Query(..., description="A reference previously 
     )
     if record is None:
         return JSONResponse({"error": "reference not found"}, status_code=404)
-    if record["status"] == ResolutionStatus.FAILED.value:
-        # A recorded failure is not playable. Report it as absent rather than
-        # redirecting to a media path the record itself says did not work.
+    if not playable(record):
+        # Report the failure as absent rather than redirecting to a media
+        # path the record itself says did not work.
         return JSONResponse(
             {"error": "reference is not playable", "reason": record.get("reason")},
             status_code=404,

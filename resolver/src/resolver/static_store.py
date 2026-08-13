@@ -20,6 +20,15 @@ class ResolutionStatus(StrEnum):
     FAILED = "failed"
 
 
+def playable(record: dict[str, object]) -> bool:
+    """Whether a stored resolution record may be served for playback.
+
+    The one shared answer for every reader of the resolutions table: a
+    recorded failure is not playable, whatever media_path it retained.
+    """
+    return record["status"] != ResolutionStatus.FAILED.value
+
+
 class CacheQuotaError(ValueError):
     """The evictable public cache cannot admit another object."""
 
