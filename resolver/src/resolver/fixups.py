@@ -14,6 +14,7 @@ These encode three quirks:
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 from urllib.parse import urlparse
 
 import httpx
@@ -59,6 +60,30 @@ def ext_from_content_type(content_type: str | None) -> str | None:
     if not content_type:
         return None
     return CONTENT_TYPE_EXT.get(content_type.split(";", 1)[0].strip().lower())
+
+
+def mint_display_extension(media_path: str, media_type: str | None) -> str:
+    """Append the extension implied by media_type to a bare Curio identity
+    path: /arweave/<txid>, /ipfs/<cid>, or /media/<id>, with no inner path
+    and no extension yet.
+
+    Arweave txids, IPFS CIDs, and Curio's own uuid4 media ids never contain
+    a dot, so a dot already in the identity segment unambiguously means an
+    extension is there; a slash means a manifest/inner path follows. Either
+    way, the path is left untouched — as it is when media_type is unknown.
+    """
+    if not media_type:
+        return media_path
+    for prefix in ("/arweave/", "/ipfs/", "/media/"):
+        if not media_path.startswith(prefix):
+            continue
+        identity, sep, tail = media_path[len(prefix):].partition("?")
+        if "/" in identity or "." in identity:
+            return media_path
+        main = media_type.split(";", 1)[0].strip().lower()
+        ext = CONTENT_TYPE_EXT.get(main) or (mimetypes.guess_extension(main) or "").lstrip(".")
+        return f"{prefix}{identity}.{ext}{sep}{tail}" if ext else media_path
+    return media_path
 
 
 async def probe_headers(

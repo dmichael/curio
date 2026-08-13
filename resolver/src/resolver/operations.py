@@ -13,6 +13,7 @@ from starlette.datastructures import UploadFile
 
 from .config import Settings
 from .favorites import Favorites
+from .fixups import mint_display_extension
 from .library import store_resolved
 from .overrides import Override, OverrideRegistry, validate_entry
 from .refs import canonical_ref_key
@@ -107,7 +108,7 @@ def record_result(
         canonical_ref=canonical_ref_key(public_ref),
         ref=public_ref,
         final_ref=final_ref,
-        media_path=_media_path(result.resolved_url),
+        media_path=mint_display_extension(_media_path(result.resolved_url), result.content_type),
         status=status,
         media_type=result.content_type,
         reason=result.note,
@@ -199,14 +200,15 @@ def record_upload(
 ) -> dict[str, Any]:
     """Give an uploaded static object the same reference contract as remote media."""
     ref = f"upload:sha256:{entry['digest']}"
+    media_type = str(entry["media_type"]) if entry.get("media_type") else None
     store = StaticStore(settings.static_root, settings.static_cache_max_bytes)
     record = store.record_resolution(
         canonical_ref=ref,
         ref=ref,
         final_ref=ref,
-        media_path=f"/media/{entry['id']}",
+        media_path=mint_display_extension(f"/media/{entry['id']}", media_type),
         status=ResolutionStatus.READY,
-        media_type=str(entry["media_type"]) if entry.get("media_type") else None,
+        media_type=media_type,
     )
     payload = resolution_payload(record, origin)
     payload.update(

@@ -204,7 +204,9 @@ async def test_storage_intent_bypasses_evictable_cache_quota(tmp_path):
     assert stored and payload["status"] == "ready"
     store = StaticStore(settings.static_root, settings.static_cache_max_bytes)
     record = store.resolution("https://example.com/art.png")
-    media_id = str(record["media_path"]).rsplit("/", 1)[-1]
+    # media_path now carries a minted display extension (e.g. ".png"); media
+    # ids are dot-free uuid4 hex, so the id is everything before the first dot.
+    media_id = str(record["media_path"]).rsplit("/", 1)[-1].split(".", 1)[0]
     assert store.get(media_id)[0]["storage_status"] == "stored"
 
 
