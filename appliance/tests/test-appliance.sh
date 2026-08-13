@@ -178,6 +178,8 @@ CURIO_RELEASE_BASE_URL="file://$TMP/releases" CURIO_DOCKER_BIN="$TMP/bin/docker"
 grep -qF "installed $bumped_version; latest v$latest_version" "$TMP/update-check" || fail 'update check did not use the release root latest path'
 printf 'not-a-version\n' >"$TMP/releases/latest/download/VERSION"
 if CURIO_RELEASE_BASE_URL="file://$TMP/releases" CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update >/dev/null 2>&1; then fail 'wrapper accepted an invalid latest VERSION'; fi
+# An empty --version must be a usage error, never a silent latest-mode update.
+if CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update --version "" >/dev/null 2>&1; then fail 'wrapper accepted an empty --version'; fi
 printf 'v%s\n' "$latest_version" >"$TMP/releases/latest/download/VERSION"
 cat >"$TMP/custom-app/current/install.sh" <<EOF
 #!/bin/sh

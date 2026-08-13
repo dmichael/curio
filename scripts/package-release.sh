@@ -3,10 +3,16 @@ set -eu
 
 ROOT=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
 VERSION=${1:-}
-case "$VERSION" in
-    v[0-9]*.[0-9]*.[0-9]*) ;;
-    *) echo "usage: scripts/package-release.sh vX.Y.Z" >&2; exit 2 ;;
-esac
+# Strict digits-only X.Y.Z, matching what the installed curio wrapper accepts:
+# a looser tag (v1.0.0rc1) would publish a release every appliance rejects.
+valid_release_version() {
+    case "$1" in v*) numbers=${1#v} ;; *) return 1 ;; esac
+    case "$numbers" in ''|.*|*.|*..*|*[!0-9.]*) return 1 ;; esac
+    old_ifs=$IFS; IFS=.; set -- $numbers; IFS=$old_ifs
+    [ "$#" -eq 3 ]
+}
+valid_release_version "$VERSION" \
+    || { echo "usage: scripts/package-release.sh vX.Y.Z" >&2; exit 2; }
 
 cd "$ROOT"
 git rev-parse --verify "refs/tags/$VERSION" >/dev/null 2>&1 \

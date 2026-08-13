@@ -27,10 +27,11 @@ command -v systemd-detect-virt >/dev/null && systemd-detect-virt --quiet || fail
 for c in docker curl python3 sha256sum; do command -v "$c" >/dev/null || fail "$c is required"; done
 docker compose version >/dev/null || fail 'docker compose plugin is required'
 if [[ -n $RELEASE_BASE_URL ]]; then
-  [[ $INSTALL_VERSION == v*.*.* && $UPDATE_VERSION == v*.*.* && $LATEST_VERSION == v*.*.* ]] || fail 'release qualification requires install, exact-update, and latest versions'
+  valid_version(){ [[ $1 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+  valid_version "$INSTALL_VERSION" && valid_version "$UPDATE_VERSION" && valid_version "$LATEST_VERSION" || fail 'release qualification requires install, exact-update, and latest versions'
   [[ $INSTALL_VERSION != "$UPDATE_VERSION" && $INSTALL_VERSION != "$LATEST_VERSION" && $UPDATE_VERSION != "$LATEST_VERSION" ]] || fail 'install, exact-update, and latest versions must differ'
   for version in "$REJECT_VERSION" "$FAILED_UPDATE_VERSION"; do
-    [[ -z $version || $version == v*.*.* ]] || fail "invalid test release version: $version"
+    [[ -z $version ]] || valid_version "$version" || fail "invalid test release version: $version"
   done
   published_latest=$(curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 "$RELEASE_BASE_URL/latest/download/VERSION") || fail 'latest VERSION fixture is unavailable'
   [[ $published_latest == "$LATEST_VERSION" ]] || fail "latest fixture publishes $published_latest, expected $LATEST_VERSION"

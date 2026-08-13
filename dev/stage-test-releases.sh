@@ -11,12 +11,13 @@ fail(){ echo "stage-test-releases: $*" >&2; exit 1; }
   echo "usage: $0 OUTPUT_DIR LATEST_TAG TAG [TAG ...]" >&2
   exit 2
 }
-[[ $LATEST == v*.*.* ]] || fail 'latest tag must look like vX.Y.Z'
+valid_version(){ [[ $1 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+valid_version "$LATEST" || fail 'latest tag must look like vX.Y.Z'
 [[ ! -e $OUTPUT ]] || fail "output already exists: $OUTPUT"
 
 found_latest=false
 for tag in "$@"; do
-  [[ $tag == v*.*.* ]] || fail "invalid release tag: $tag"
+  valid_version "$tag" || fail "invalid release tag: $tag"
   [[ $tag != "$LATEST" ]] || found_latest=true
   "$ROOT/scripts/package-release.sh" "$tag"
   target="$OUTPUT/download/$tag"

@@ -54,7 +54,7 @@ command=${1:-}; [ -n "$command" ] || fail "usage: curio {start|stop|restart|stat
 shift || true
 case "$command" in
     version) [ "$#" -eq 0 ] || fail "version takes no arguments"; version ;;
-    update) case "${1:-}" in --check) [ "$#" -eq 1 ] || fail "update --check takes no other arguments"; check_update ;; --version) [ "$#" -eq 2 ] || fail "usage: curio update --version vX.Y.Z"; update "$2" ;; '') update ;; *) fail "usage: curio update [--check|--version vX.Y.Z]";; esac ;;
+    update) case "${1:-}" in --check) [ "$#" -eq 1 ] || fail "update --check takes no other arguments"; check_update ;; --version) [ "$#" -eq 2 ] && [ -n "$2" ] || fail "usage: curio update --version vX.Y.Z"; update "$2" ;; '') update ;; *) fail "usage: curio update [--check|--version vX.Y.Z]";; esac ;;
     start|stop|status|logs) require_installation; compose "$command" "$@" ;;
     restart) require_installation; compose restart "$@" ;;
     health) require_installation; compose exec -T resolver python -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8090/healthz").read().decode())' ;;
