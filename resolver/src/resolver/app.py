@@ -393,7 +393,9 @@ async def library():
 @app.get("/media/{file_id}")
 async def media(file_id: str):
     settings = get_settings()
-    item = StaticStore(settings.static_root, settings.static_cache_max_bytes).get(file_id)
+    item = StaticStore(settings.static_root, settings.static_cache_max_bytes).get(
+        _strip_display_extension(file_id)
+    )
     if item is None:
         return JSONResponse({"error": "media not found"}, status_code=404)
     record, path = item
@@ -401,9 +403,21 @@ async def media(file_id: str):
     return FileResponse(path, media_type=record.get("media_type") or "application/octet-stream")
 
 
+def _strip_display_extension(path: str) -> str:
+    """Strip a minted display extension from a serving path's first (identity)
+    segment only. Identities (txids, CIDs, media ids) never contain a dot, so
+    this only ever removes an extension Curio appended at minting time —
+    a real manifest/inner path, which starts past the first "/", is untouched.
+    """
+    first, sep, rest = path.partition("/")
+    name, dot, _ext = first.rpartition(".")
+    return f"{name if dot else first}{sep}{rest}"
+
+
 async def _gateway_proxy(request: Request, backend: str, path: str):
     """One public origin for native gateways; backend ports stay private."""
     settings = get_settings()
+    path = _strip_display_extension(path)
     base = settings.ipfs_internal if backend == "ipfs" else settings.arweave_internal
     upstream_path = f"/ipfs/{path}" if backend == "ipfs" else f"/{path}"
     url = f"{base.rstrip('/')}{upstream_path}"
