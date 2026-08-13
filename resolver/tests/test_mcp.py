@@ -54,6 +54,7 @@ async def test_mcp_exposes_the_curated_tools():
         "list_favorites",
         "add_favorite",
         "remove_favorite",
+        "dp1_playlist",
     }
 
 

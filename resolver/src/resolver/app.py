@@ -12,7 +12,7 @@ from fastapi.responses import (
     RedirectResponse,
     StreamingResponse,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 from starlette.datastructures import UploadFile
 
@@ -388,6 +388,30 @@ async def favorite_remove(
 @app.get("/library")
 async def library():
     return JSONResponse(await library_status(get_settings(), app.state.client))
+
+
+class DP1PlaylistBody(BaseModel):
+    """DP-1 playlist request body: refs already stored by Curio."""
+
+    refs: list[str] = Field(min_length=1)
+    title: str | None = None
+    duration: int | None = Field(default=None, gt=0)
+
+
+@app.post("/playlist/dp1")
+async def playlist_dp1(request: Request, body: DP1PlaylistBody):
+    """Emit a complete, unsigned DP-1 1.0.0 playlist for catalogued refs."""
+    try:
+        playlist = operations.dp1_playlist(
+            body.refs,
+            get_settings(),
+            request_origin(request),
+            title=body.title,
+            duration=body.duration,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    return JSONResponse(playlist)
 
 
 # Media bytes are public web resources: browser players read them cross-origin

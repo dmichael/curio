@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import re
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode, urlsplit
@@ -162,6 +165,60 @@ def lookup_resolution(ref: str, settings: Settings) -> dict[str, Any] | None:
     if record is None:
         return None
     return {**record, "playable": playable(record)}
+
+
+_SLUG_INVALID = re.compile(r"[^a-z0-9_-]+")
+
+
+def _slugify(title: str) -> str:
+    slug = _SLUG_INVALID.sub("-", title.strip().lower()).strip("-")
+    return slug[:64].strip("-") or "curio-playlist"
+
+
+def dp1_playlist(
+    refs: list[str],
+    settings: Settings,
+    origin: str,
+    *,
+    title: str | None = None,
+    duration: int | None = None,
+) -> dict[str, Any]:
+    """Build a complete, unsigned DP-1 1.0.0 playlist from catalogued refs.
+
+    Every ref must already be stored and playable (see lookup_resolution /
+    playable()); an unknown or failed ref raises ValueError naming it — a
+    playlist must never silently drop or include broken work. Curio only
+    speaks the wire format here: signing and device delivery stay with the
+    operator's DP-1 tooling (e.g. ff-cli).
+    """
+    items: list[dict[str, Any]] = []
+    for ref in refs:
+        record = lookup_resolution(ref, settings)
+        if record is None or not record["playable"]:
+            raise ValueError(f"ref is not catalogued or not playable: {ref}")
+        media_type = str(record.get("media_type") or "")
+        item: dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "source": f"{origin.rstrip('/')}{record['media_path']}",
+            "duration": duration or 86400,
+            "license": "open",
+        }
+        if media_type.startswith(("video/", "audio/")):
+            # A lone looping work must never end — `ended` triggers
+            # playlist-advance reload on DP-1 players (black flash);
+            # loop:true keeps looping native and seamless.
+            item["display"] = {"loop": True}
+        items.append(item)
+
+    playlist_title = title or "Curio playlist"
+    return {
+        "dpVersion": "1.0.0",
+        "id": str(uuid.uuid4()),
+        "slug": _slugify(playlist_title),
+        "title": playlist_title,
+        "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "items": items,
+    }
 
 
 async def store_reference(

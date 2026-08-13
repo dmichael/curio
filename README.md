@@ -104,6 +104,10 @@ Any other MCP-capable tool — Codex, OpenCode, Gemini, Cursor, and the rest —
 registers the same URL through its own config. REST callers use the schema
 at `/openapi.json` instead.
 
+Curio can also export catalogued works as an unsigned DP-1 playlist for
+DP-1 players (e.g. the Feral File FF1) — see
+[docs/dp1-players.md](docs/dp1-players.md).
+
 ## API and services
 
 OpenAPI is available at `/docs` and `/openapi.json`. MCP is mounted at `/mcp`.

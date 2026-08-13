@@ -327,6 +327,30 @@ async def remove_favorite(ref: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+async def dp1_playlist(
+    refs: list[str],
+    title: str | None = None,
+    duration: int | None = None,
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Emit an unsigned DP-1 1.0.0 playlist for catalogued works.
+
+    DP-1 is the display protocol spoken by DP-1 players (e.g. the Feral File
+    FF1). Time-based media (video/audio) gets display.loop=true and a long
+    duration so a single work loops natively instead of ending and
+    triggering a playlist-advance reload. Sign and play the result with the
+    operator's DP-1 tooling (e.g. `ff-cli validate`, `ff-cli sign`, `ff-cli
+    play`) — Curio never signs a playlist or talks to a device. Every ref
+    must already be catalogued and playable (resolve it first); an unknown
+    or failed ref raises rather than being silently dropped from the
+    playlist.
+    """
+    return operations.dp1_playlist(
+        refs, get_settings(), _mcp_origin(ctx), title=title, duration=duration
+    )
+
+
+@mcp.tool()
 async def health() -> dict[str, Any]:
     """Reachability of the box's own IPFS and Arweave gateways."""
     return await gateway_health(get_settings(), _require_client())
