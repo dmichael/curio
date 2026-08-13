@@ -1,25 +1,30 @@
 <h1 align="center">Curio</h1>
 
-<p align="center"><strong>Put NFT media into storage you control.</strong></p>
+<p align="center"><strong>A preservation and delivery appliance for digital art.</strong></p>
 
-Curio accepts NFT media references and local files, stores their final artifacts,
-and gives media players one URL space on your own server. It uses Kubo for IPFS,
-AR.IO Core for Arweave, and a local static store for ordinary files.
+Curio solves the gap between having a reference to a digital artwork and being
+able to display that artwork reliably in the future.
+
+Digital art is often scattered across IPFS, Arweave, ordinary web servers,
+metadata documents, and local files. These sources can be difficult for media
+players to resolve, dependent on third-party infrastructure, or vulnerable to
+link rot. Curio resolves each reference to its final media, stores it locally,
+and makes it reliably available to players through one URL space on your own
+server. It uses Kubo for IPFS, AR.IO Core for Arweave, and a local static store
+for ordinary files.
 
 ## Install
 
-Curio needs Linux, Docker Engine, and the Docker Compose plugin. Install from a
-checkout as the user who will run it:
+Curio needs Linux, Docker Engine, and the Docker Compose plugin. Install the
+latest release as the user who will run it:
 
 ```bash
-git clone https://github.com/dmichael/curio.git
-cd curio
-./appliance/install.sh
+curl -fsSL https://github.com/dmichael/curio/releases/latest/download/install.sh | sh
 ```
 
-The installer uses per-user XDG paths and does not call `sudo`. No release
-assets have been published yet, so the release download URL and remote update
-commands are not available.
+The bootstrap downloads an immutable release archive and verifies its SHA-256
+checksum before installing it. Installation uses per-user XDG paths and does
+not call `sudo`.
 
 ```bash
 curio status
