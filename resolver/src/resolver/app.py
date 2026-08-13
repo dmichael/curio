@@ -390,6 +390,12 @@ async def library():
     return JSONResponse(await library_status(get_settings(), app.state.client))
 
 
+# Media bytes are public web resources: browser players read them cross-origin
+# (blob loaders, canvas, WebGL). Only the media routes carry this — the REST
+# API is unauthenticated and stays same-origin.
+_MEDIA_CORS = {"access-control-allow-origin": "*"}
+
+
 @app.get("/media/{file_id}")
 async def media(file_id: str):
     settings = get_settings()
@@ -400,7 +406,11 @@ async def media(file_id: str):
         return JSONResponse({"error": "media not found"}, status_code=404)
     record, path = item
     # filename= would make Starlette send Content-Disposition: attachment.
-    return FileResponse(path, media_type=record.get("media_type") or "application/octet-stream")
+    return FileResponse(
+        path,
+        media_type=record.get("media_type") or "application/octet-stream",
+        headers=_MEDIA_CORS,
+    )
 
 
 def _strip_display_extension(path: str) -> str:
@@ -443,6 +453,7 @@ async def _gateway_proxy(request: Request, backend: str, path: str):
         return JSONResponse({"error": "native backend request failed"}, status_code=503)
     headers = {k: v for k, v in upstream.headers.items() if k.lower() in
                {"content-type", "content-length", "content-range", "accept-ranges", "etag", "cache-control", "x-cache", "content-encoding", "vary"}}
+    headers.update(_MEDIA_CORS)
     return StreamingResponse(upstream.aiter_raw(), status_code=upstream.status_code, headers=headers,
                              background=BackgroundTask(upstream.aclose))
 

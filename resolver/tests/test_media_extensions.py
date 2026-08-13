@@ -75,6 +75,8 @@ def test_proxy_strips_display_extension_from_first_segment(http_client, monkeypa
         app_module.app.state.client = real
     assert response.status_code == 200
     assert requested == ["http://ar.internal/TXID"]
+    # Media bytes are public web resources; browser blob loaders need this.
+    assert response.headers["access-control-allow-origin"] == "*"
     get_settings.cache_clear()
 
 
@@ -172,4 +174,6 @@ def test_uploaded_media_url_carries_extension_and_both_paths_serve_the_same_obje
     assert with_ext.status_code == without_ext.status_code == 200
     assert with_ext.content == without_ext.content == b"png-bytes"
     assert with_ext.headers["content-type"] == without_ext.headers["content-type"] == "image/png"
+    # Media bytes are public web resources; browser blob loaders need this.
+    assert with_ext.headers["access-control-allow-origin"] == "*"
     get_settings.cache_clear()
