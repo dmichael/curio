@@ -156,6 +156,13 @@ second_pointer=$(readlink "$TMP/custom-app/current")
 [[ $(<"$TMP/custom-state/ar-io-retained/redis/sentinel") == legacy ]] || fail 'rerun removed obsolete state'
 grep -q '^CURIO_REDIS_MAX_MEMORY=256mb$' "$TMP/xdg-config/curio/curio.env" || fail 'rerun rewrote obsolete configuration'
 if XDG_DATA_HOME="$TMP/xdg-data" XDG_CONFIG_HOME="$TMP/xdg-config" XDG_BIN_HOME="$TMP/bin-out" CURIO_APP_ROOT="$TMP/custom-app" CURIO_DATA_ROOT="$TMP/conflicting-state" CURIO_DOCKER_LOG="$TMP/docker.log" PATH="$TMP/bin:$PATH" "$ROOT/appliance/install.sh" >/dev/null 2>&1; then fail 'installer accepted conflicting CURIO_DATA_ROOT on rerun'; fi
+# An explicit environment file must be reused as-is; a missing one is an
+# error, never a silent fresh install onto a new data root.
+if CURIO_ENV_FILE="$TMP/does-not-exist.env" XDG_BIN_HOME="$TMP/bin-out" CURIO_DOCKER_LOG="$TMP/docker.log" PATH="$TMP/bin:$PATH" "$ROOT/appliance/install.sh" >/dev/null 2>&1; then fail 'installer accepted a missing CURIO_ENV_FILE'; fi
+CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" XDG_BIN_HOME="$TMP/bin-out" CURIO_DOCKER_LOG="$TMP/docker.log" PATH="$TMP/bin:$PATH" "$ROOT/appliance/install.sh" >/dev/null
+grep -q "^CURIO_DATA_ROOT=$TMP/custom-state$" "$TMP/xdg-config/curio/curio.env" || fail 'explicit CURIO_ENV_FILE was not reused'
+[[ $(<"$TMP/custom-state/sentinel") == preserved ]] || fail 'explicit-env update damaged persistent state'
+second_pointer=$(readlink "$TMP/custom-app/current")
 # Failed start/health must restore the previous pointer and deployment.
 up_before=$(grep -c 'up -d' "$TMP/docker.log" || true)
 if XDG_DATA_HOME="$TMP/xdg-data" XDG_CONFIG_HOME="$TMP/xdg-config" XDG_BIN_HOME="$TMP/bin-out" CURIO_APP_ROOT="$TMP/custom-app" CURIO_DOCKER_LOG="$TMP/docker.log" CURIO_DOCKER_FAIL_UP=1 CURIO_DOCKER_FAIL_ONCE_FILE="$TMP/fail-once" PATH="$TMP/bin:$PATH" "$ROOT/appliance/install.sh" >/dev/null 2>&1; then fail 'installer accepted failed Compose health'; fi
@@ -174,13 +181,13 @@ if CURIO_RELEASE_BASE_URL="file://$TMP/releases" CURIO_DOCKER_BIN="$TMP/bin/dock
 printf 'v%s\n' "$latest_version" >"$TMP/releases/latest/download/VERSION"
 cat >"$TMP/custom-app/current/install.sh" <<EOF
 #!/bin/sh
-printf 'version=%s app=%s\\n' "\${CURIO_VERSION-unset}" "\${CURIO_APP_ROOT-unset}" >>"$TMP/wrapper-update.log"
+printf 'version=%s app=%s env=%s\\n' "\${CURIO_VERSION-unset}" "\${CURIO_APP_ROOT-unset}" "\${CURIO_ENV_FILE-unset}" >>"$TMP/wrapper-update.log"
 EOF
 chmod +x "$TMP/custom-app/current/install.sh"
 CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update --version "v$bumped_version"
 CURIO_RELEASE_BASE_URL="file://$TMP/releases" CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" update
-[[ $(sed -n '1p' "$TMP/wrapper-update.log") == "version=v$bumped_version app=$TMP/custom-app" ]] || fail 'wrapper did not propagate exact update version to bootstrap'
-[[ $(sed -n '2p' "$TMP/wrapper-update.log") == "version=v$latest_version app=$TMP/custom-app" ]] || fail 'wrapper did not bind latest VERSION to an immutable release'
+[[ $(sed -n '1p' "$TMP/wrapper-update.log") == "version=v$bumped_version app=$TMP/custom-app env=$TMP/xdg-config/curio/curio.env" ]] || fail 'wrapper did not propagate exact update version and environment file to bootstrap'
+[[ $(sed -n '2p' "$TMP/wrapper-update.log") == "version=v$latest_version app=$TMP/custom-app env=$TMP/xdg-config/curio/curio.env" ]] || fail 'wrapper did not bind latest VERSION to an immutable release'
 CURIO_DOCKER_BIN="$TMP/bin/docker" CURIO_DOCKER_LOG="$TMP/docker.log" CURIO_ENV_FILE="$TMP/xdg-config/curio/curio.env" "$TMP/bin-out/curio" status
 
 grep -q -- '--file .*custom-app/current/compose.yaml' "$TMP/docker.log" || fail 'wrapper did not discover configured custom app root'

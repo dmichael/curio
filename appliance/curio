@@ -48,7 +48,7 @@ update() {
     if [ -z "$requested" ]; then requested=$(latest_release); fi
     valid_release_version "$requested" || fail "version must look like vX.Y.Z"
     require_installation
-    CURIO_APP_ROOT="$APP_ROOT" CURIO_VERSION="$requested" "$APP_ROOT/current/install.sh"
+    CURIO_APP_ROOT="$APP_ROOT" CURIO_ENV_FILE="$ENV_FILE" CURIO_VERSION="$requested" "$APP_ROOT/current/install.sh"
 }
 command=${1:-}; [ -n "$command" ] || fail "usage: curio {start|stop|restart|status|logs|health|version|update}"
 shift || true

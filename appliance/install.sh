@@ -77,7 +77,12 @@ main() {
     docker compose version >/dev/null 2>&1 || fail "Docker Compose plugin is required"
     docker info >/dev/null 2>&1 || fail "cannot access Docker as this user"
     data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}; config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}; bin_home=${XDG_BIN_HOME:-"$HOME/.local/bin"}
-    config_dir="$config_home/curio"; config_file="$config_dir/curio.env"
+    # An explicitly configured environment file (as the curio wrapper passes
+    # during update) must be reused, never silently replaced by a fresh
+    # default-location install.
+    config_file=${CURIO_ENV_FILE:-"$config_home/curio/curio.env"}
+    config_dir=$(dirname "$config_file")
+    [ -z "${CURIO_ENV_FILE:-}" ] || [ -f "$config_file" ] || fail "CURIO_ENV_FILE is set but $config_file does not exist"
     requested_app_root=${CURIO_APP_ROOT:-"$data_home/curio/app"}; requested_data_root=${CURIO_DATA_ROOT:-"$data_home/curio/state"}
     valid_root "$requested_app_root" || fail "CURIO_APP_ROOT must be a safe absolute non-root path"
     valid_root "$requested_data_root" || fail "CURIO_DATA_ROOT must be a safe absolute non-root path"
