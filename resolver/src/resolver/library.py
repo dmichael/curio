@@ -180,7 +180,10 @@ def _arweave_txids(settings: Settings) -> list[str]:
     store = StaticStore(settings.static_root, settings.static_cache_max_bytes)
     txids: dict[str, None] = {}  # ordered de-dupe
     for media_path in store.arweave_media_paths():
-        txid = media_path[len("/arweave/"):].split("/", 1)[0]
+        # The identity segment may carry a minted display extension
+        # (/arweave/<txid>.png); txids never contain dots, so strip from the
+        # first dot to recover the txid Core actually knows.
+        txid = media_path[len("/arweave/"):].split("/", 1)[0].split(".", 1)[0]
         if txid:
             txids[txid] = None
     return list(txids)
