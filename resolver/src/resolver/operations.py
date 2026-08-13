@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import tempfile
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode, urlsplit
 
 import httpx
+from starlette.datastructures import UploadFile
 
 from .config import Settings
 from .favorites import Favorites
 from .library import store_resolved
-from .overrides import OverrideRegistry, validate_entry
+from .overrides import Override, OverrideRegistry, validate_entry
 from .refs import canonical_ref_key
 from .resolve import Resolved, resolve_ref, storage_intent
-from .static_store import ResolutionStatus, StaticStore
+from .static_store import ResolutionStatus, StaticStore, playable
 
 
 def store_static(result: Resolved, settings: Settings) -> bool:
@@ -112,6 +115,54 @@ def record_result(
     return resolution_payload(record, origin, result)
 
 
+class UploadTooLarge(ValueError):
+    """The uploaded body exceeded the configured static byte cap."""
+
+
+async def store_upload(file: UploadFile, settings: Settings, origin: str) -> dict[str, Any]:
+    """Persist a multipart upload as a static object and record its playback route."""
+    store = StaticStore(settings.static_root, settings.static_cache_max_bytes)
+    store.root.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=store.root, prefix=".upload-", delete=False) as output:
+            temporary = Path(output.name)
+            size = 0
+            while chunk := await file.read(65536):
+                size += len(chunk)
+                if size > settings.static_max_bytes:
+                    raise UploadTooLarge(f"body exceeds {settings.static_max_bytes} bytes")
+                output.write(chunk)
+        entry = store.put_file(
+            temporary,
+            media_type=file.content_type,
+            filename=file.filename,
+            source_ref=None,
+            storage_status="stored",
+        )
+        temporary = None
+        return record_upload(entry, filename=file.filename, settings=settings, origin=origin)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        await file.close()
+
+
+def lookup_resolution(ref: str, settings: Settings) -> dict[str, Any] | None:
+    """Canonicalize `ref` and return its stored resolution plus playability.
+
+    None means Curio has no record of this reference at all — REST 404s,
+    MCP's lookup tool answers found=false. `playable` mirrors
+    static_store.playable(): False whenever the stored resolution failed.
+    """
+    record = StaticStore(settings.static_root, settings.static_cache_max_bytes).resolution(
+        canonical_ref_key(ref)
+    )
+    if record is None:
+        return None
+    return {**record, "playable": playable(record)}
+
+
 async def store_reference(
     ref: str,
     settings: Settings,
@@ -198,12 +249,39 @@ async def create_override(
     }
 
 
+def override_listing(registry: OverrideRegistry) -> dict[str, Any]:
+    """The list_overrides shape shared by REST `GET /override` and MCP."""
+    entries = [asdict(entry) for entry in registry.entries()]
+    return {"count": len(entries), "entries": entries}
+
+
+def override_removed(entry: Override) -> dict[str, Any]:
+    """The remove-override shape shared by REST `DELETE /override` and MCP."""
+    return {"removed": asdict(entry)}
+
+
+def favorite_removed(record: dict[str, Any]) -> dict[str, Any]:
+    """The remove-favorite shape shared by REST `DELETE /favorites` and MCP."""
+    return {"removed": record}
+
+
 @dataclass
 class FavoriteCreation:
-    """Shared favorite facts; adapters add their own response fields."""
+    """Shared favorite facts, formatted identically by both adapters."""
 
     record: dict[str, Any]
     result: Resolved | None
+
+    def response(self) -> dict[str, Any]:
+        result, record = self.result, self.record
+        return {
+            **record,
+            "resolved": result.resolved if result else None,
+            "resolved_url": result.resolved_url if result and result.resolved else None,
+            "playback_method": result.playback_method if result else None,
+            "final_ref": result.final_ref if result else record.get("final_ref"),
+            "source_ref": result.final_ref if result else record.get("final_ref"),
+        }
 
 
 async def create_favorite(

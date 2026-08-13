@@ -8,6 +8,7 @@ from resolver.config import get_settings
 from resolver.favorites import get_favorites
 from resolver.mcp_server import mcp
 from resolver.overrides import get_registry
+from resolver.static_store import ResolutionStatus, StaticStore
 
 
 def no_net() -> httpx.AsyncClient:
@@ -41,6 +42,7 @@ async def test_mcp_exposes_the_curated_tools():
     tools = {tool.name for tool in await mcp.list_tools()}
     assert tools == {
         "resolve",
+        "lookup",
         "wallet_tokens",
         "seed_wallet",
         "seed_status",
@@ -127,6 +129,60 @@ async def test_mcp_resolve_tool_round_trips():
     assert "/resolve?ref=" in payload["media_url"]
 
 
+async def test_mcp_lookup_tool_found_and_playable(tmp_path, monkeypatch):
+    monkeypatch.setenv("RESOLVER_STATIC_ROOT", str(tmp_path / "media"))
+    get_settings.cache_clear()
+    StaticStore(str(tmp_path / "media")).record_resolution(
+        canonical_ref="ipfs://bafyOK/art.png",
+        ref="ipfs://bafyOK/art.png",
+        final_ref="ipfs://bafyOK/art.png",
+        media_path="/ipfs/bafyOK/art.png",
+        status=ResolutionStatus.READY,
+        media_type="image/png",
+    )
+    try:
+        found = await call("lookup", {"ref": "/ipfs/bafyOK/art.png"})  # any spelling
+    finally:
+        get_settings.cache_clear()
+    assert found == {
+        "found": True,
+        "playable": True,
+        "reason": None,
+        "media_path": "/ipfs/bafyOK/art.png",
+        "status": "ready",
+        "media_type": "image/png",
+    }
+
+
+async def test_mcp_lookup_tool_found_and_not_playable(tmp_path, monkeypatch):
+    monkeypatch.setenv("RESOLVER_STATIC_ROOT", str(tmp_path / "media"))
+    get_settings.cache_clear()
+    StaticStore(str(tmp_path / "media")).record_resolution(
+        canonical_ref="ipfs://bafyDEAD/art.png",
+        ref="ipfs://bafyDEAD/art.png",
+        final_ref="ipfs://bafyDEAD/art.png",
+        media_path="/ipfs/bafyDEAD/art.png",
+        status=ResolutionStatus.FAILED,
+        reason="providers gone",
+    )
+    try:
+        found = await call("lookup", {"ref": "ipfs://bafyDEAD/art.png"})
+    finally:
+        get_settings.cache_clear()
+    assert found["playable"] is False
+    assert found["reason"] == "providers gone"
+
+
+async def test_mcp_lookup_tool_unknown_ref(tmp_path, monkeypatch):
+    monkeypatch.setenv("RESOLVER_STATIC_ROOT", str(tmp_path / "media"))
+    get_settings.cache_clear()
+    try:
+        found = await call("lookup", {"ref": "ipfs://bafyNEVERSEEN/art.png"})
+    finally:
+        get_settings.cache_clear()
+    assert found == {"found": False}
+
+
 async def test_mcp_override_tools_round_trip(override_env):
     async with no_net() as client:
         mcp_server.set_client(client)
@@ -149,6 +205,22 @@ async def test_mcp_override_tools_round_trip(override_env):
         removed = await call("remove_override", {"ref": "/ipfs/bafyDEAD/art.png"})
         assert removed["removed"]["ref"] == "ipfs://bafyDEAD/art.png"
         assert (await call("list_overrides", {}))["count"] == 0
+
+
+async def test_mcp_list_overrides_raw_matches_rest(override_env):
+    async with no_net() as client:
+        mcp_server.set_client(client)
+        await call(
+            "add_override",
+            {
+                "ref": "ipfs://bafyDEAD/art.png",
+                "replacement": "ipfs://bafyALT/master.png",
+                "status": "alternate-master",
+            },
+        )
+        raw = await call("list_overrides", {"raw": True})
+    assert "ipfs://bafyDEAD/art.png" in raw["raw"]
+    assert "ipfs://bafyALT/master.png" in raw["raw"]
 
 
 @pytest.fixture
@@ -182,6 +254,17 @@ async def test_mcp_favorite_tools_round_trip(favorites_env):
         assert (await call("list_favorites", {}))["count"] == 0
 
 
+async def test_mcp_add_favorite_response_matches_rest_shape(favorites_env):
+    """Regression test: add_favorite once omitted resolved_url and
+    playback_method that REST's POST /favorites always included."""
+    async with no_net() as client:
+        mcp_server.set_client(client)
+        added = await call("add_favorite", {"ref": "ipfs://bafyFAV2/art.png"})
+    assert added["resolved"] is True
+    assert added["resolved_url"].endswith("/ipfs/bafyFAV2/art.png")
+    assert added["playback_method"] == "play"
+
+
 async def test_mcp_library_status_smoke():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v0/pin/ls":
@@ -210,6 +293,8 @@ async def test_mcp_override_tools_error_when_disabled(monkeypatch):
         get_settings.cache_clear()
 
 
-async def test_mcp_instructions_come_from_the_skill():
-    assert "# Curio" in (mcp.instructions or "")
-    assert "/resolve" in (mcp.instructions or "")
+async def test_mcp_instructions_describe_the_service():
+    instructions = mcp.instructions or ""
+    assert "no user authentication" in instructions
+    assert "public internet" in instructions
+    assert "POST /resolve" in instructions
