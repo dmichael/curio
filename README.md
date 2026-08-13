@@ -1,8 +1,8 @@
-<h1 align="center">Curio</h1>
+<h1>Curio</h1>
 
-<p align="center"><strong>A preservation and delivery appliance for digital art.</strong></p>
 
-<img src="docs/flatiron.jpg" align="left" width="440" alt="Flatiron — a painting by David Michael">
+<h3>A preservation and delivery appliance for digital art.</h3>
+<a href="https://verse.works/items/ethereum/0xf7d3e687883b98eafb8808fa9b53ee065fb2e43f/1"><img src="docs/flatiron.jpg" align="right" width="475" alt="Flatiron — a painting by David Michael"></a>
 
 <p>Curio solves the gap between having a reference to a digital artwork and being
 able to display that artwork reliably in the future.</p>
@@ -16,7 +16,7 @@ for ordinary files.</p>
 
 <br clear="left">
 
-<p><a href="https://verse.works/items/ethereum/0xf7d3e687883b98eafb8808fa9b53ee065fb2e43f/1"><em>Flatiron</em> by David Michael</a></p>
+
 
 ## Install
 
