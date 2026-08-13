@@ -73,6 +73,26 @@ def test_arweave_txids_counts_registered_not_failed(tmp_path):
     assert sorted(txids) == ["txLIVE", "txREADY"]  # failures never register
 
 
+def test_arweave_txids_strip_minted_display_extension(tmp_path):
+    settings = SETTINGS.model_copy(update={"static_root": str(tmp_path)})
+    store = StaticStore(settings.static_root, settings.static_cache_max_bytes)
+    # Minted paths carry a display extension; the probe must ask Core for the
+    # bare txid. Both spellings of one txid count once.
+    store.record_resolution(
+        canonical_ref="ar://txMINTED", ref="ar://txMINTED", final_ref="ar://txMINTED",
+        media_path="/arweave/txMINTED.png", status=ResolutionStatus.READY,
+    )
+    store.record_resolution(
+        canonical_ref="ar://txMINTED/spelling", ref="ar://txMINTED/spelling",
+        final_ref="ar://txMINTED", media_path="/arweave/txMINTED",
+        status=ResolutionStatus.READY,
+    )
+
+    from resolver.library import _arweave_txids
+
+    assert _arweave_txids(settings) == ["txMINTED"]
+
+
 async def test_warm_txid_records_success_not_failure():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/txGOOD":
