@@ -1,7 +1,7 @@
-"""Warm/capture ledgers and cross-plane library status (library.py, /library)."""
+"""Arweave inventory (resolutions catalogue) and cross-plane library status
+(library.py, /library)."""
 
 import asyncio
-import json
 from types import SimpleNamespace
 
 import httpx
@@ -10,9 +10,10 @@ import pytest
 from resolver import app as app_module
 from resolver.config import Settings, get_settings
 from resolver.favorites import get_favorites
-from resolver.library import library_status, record_warm, store_resolved, warmed_txids
+from resolver.library import library_status, store_resolved
 from resolver.overrides import get_registry
 from resolver.seed import SeedJob, _warm_txid, run_seed
+from resolver.static_store import ResolutionStatus, StaticStore
 
 SETTINGS = Settings(
     ipfs_internal="http://ipfs.internal",
@@ -45,35 +46,34 @@ def fake_net(routes: dict[str, dict | list]) -> tuple[httpx.AsyncClient, list[st
     return httpx.AsyncClient(transport=httpx.MockTransport(handler)), log
 
 
-# --- warm ledger ------------------------------------------------------------
+def register_arweave(settings: Settings, txid: str, *, status: ResolutionStatus = ResolutionStatus.READY) -> None:
+    """Give a txid a playback route in the resolutions catalogue — the
+    registration that now makes /library's Arweave section count it."""
+    StaticStore(settings.static_root, settings.static_cache_max_bytes).record_resolution(
+        canonical_ref=f"ar://{txid}",
+        ref=f"ar://{txid}",
+        final_ref=f"ar://{txid}",
+        media_path=f"/arweave/{txid}",
+        status=status,
+    )
 
 
-def test_record_warm_dedups_and_reads_back_in_order(tmp_path):
-    settings = SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path)})
-    record_warm("txA", settings, why="seed")
-    record_warm("txB", settings, why="favorite")
-    record_warm("txA", settings, why="resolve pin")  # already ledgered — dropped
-
-    assert warmed_txids(settings) == ["txA", "txB"]
-    records = [
-        json.loads(line) for line in (tmp_path / "warmed.jsonl").read_text().splitlines()
-    ]
-    assert len(records) == 2
-    assert records[0]["why"] == "seed"
-    assert records[1]["why"] == "favorite"
-    assert all(record["warmed_at"] for record in records)
+# --- arweave inventory (resolutions catalogue) -------------------------------
 
 
-def test_record_warm_noops_when_capture_disabled(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)  # a stray relative write would land here
-    record_warm("txA", SETTINGS, why="seed")  # seed_capture_dir unset
-    assert warmed_txids(SETTINGS) == []
-    assert not list(tmp_path.iterdir())
+def test_arweave_txids_counts_registered_not_failed(tmp_path):
+    settings = SETTINGS.model_copy(update={"static_root": str(tmp_path)})
+    register_arweave(settings, "txREADY")
+    register_arweave(settings, "txLIVE", status=ResolutionStatus.LIVE_DEPENDENT)
+    register_arweave(settings, "txFAILED", status=ResolutionStatus.FAILED)
+
+    from resolver.library import _arweave_txids
+
+    txids = _arweave_txids(settings)
+    assert sorted(txids) == ["txLIVE", "txREADY"]  # failures never register
 
 
-async def test_warm_txid_records_success_not_failure(tmp_path):
-    settings = SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path)})
-
+async def test_warm_txid_records_success_not_failure():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/txGOOD":
             return httpx.Response(200, content=b"0" * 100)
@@ -82,18 +82,14 @@ async def test_warm_txid_records_success_not_failure(tmp_path):
     job = SeedJob(id="test1234", ref="0xAB", chain="ethereum", started_at="t")
     sem = asyncio.Semaphore(1)
     async with client_for(handler) as client:
-        await _warm_txid("txGOOD", job, settings, client, sem)
-        await _warm_txid("txGONE", job, settings, client, sem)
+        await _warm_txid("txGOOD", job, SETTINGS, client, sem)
+        await _warm_txid("txGONE", job, SETTINGS, client, sem)
 
     assert job.warmed == 1
     assert job.failed == 1
-    assert warmed_txids(settings) == ["txGOOD"]  # failures record nothing
-    record = json.loads((tmp_path / "warmed.jsonl").read_text())
-    assert record["why"] == "seed"
 
 
-async def test_store_resolved_arweave_warm_records_the_caller_why(tmp_path):
-    settings = SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path)})
+async def test_store_resolved_arweave_verifies_the_same_core_cache():
     result = SimpleNamespace(
         resolved=True,
         resolved_url="http://ar.internal/txFAV",
@@ -105,13 +101,12 @@ async def test_store_resolved_arweave_warm_records_the_caller_why(tmp_path):
         return httpx.Response(200, headers={"x-cache": "HIT"}, content=b"art bytes")
 
     async with client_for(handler) as client:
-        outcome = await store_resolved(result, settings, client, why="favorite")
+        outcome = await store_resolved(result, SETTINGS, client)
 
     assert outcome == "stored"
-    assert warmed_txids(settings) == ["txFAV"]
 
 
-# --- capture ledger (seed-driven) --------------------------------------------
+# --- seed-driven HTTP capture -------------------------------------------------
 
 SEED_SETTINGS = SETTINGS.model_copy(update={"blockscout_base": "http://bs.internal/api/v2"})
 
@@ -148,7 +143,7 @@ def capture_routes():
 
 
 async def test_http_only_media_is_captured_with_provenance(tmp_path):
-    settings = SEED_SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path), "static_root": str(tmp_path / "media"), "ssrf_dns_check": False})
+    settings = SEED_SETTINGS.model_copy(update={"static_root": str(tmp_path / "media"), "ssrf_dns_check": False})
     client, _ = fake_net(capture_routes())
     job = make_job(ETH_ADDR, "ethereum")
     async with client:
@@ -156,11 +151,10 @@ async def test_http_only_media_is_captured_with_provenance(tmp_path):
     assert job.status == "done", job.errors
     assert job.captured == 1
     assert job.skipped == 0 and job.failed == 0
-    assert not (tmp_path / "captures.jsonl").exists()  # HTTP never enters Kubo
 
 
 async def test_capture_is_once_per_url_across_jobs(tmp_path):
-    settings = SEED_SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path), "static_root": str(tmp_path / "media"), "ssrf_dns_check": False})
+    settings = SEED_SETTINGS.model_copy(update={"static_root": str(tmp_path / "media"), "ssrf_dns_check": False})
     first, _ = fake_net(capture_routes())
     async with first:
         await run_seed(make_job(ETH_ADDR, "ethereum"), settings, first)
@@ -175,19 +169,8 @@ async def test_capture_is_once_per_url_across_jobs(tmp_path):
     assert any(CAPTURE_URL in line for line in log)  # explicit seed retains HTTP statically
 
 
-async def test_http_media_is_skipped_when_capture_is_off():
-    settings = SEED_SETTINGS.model_copy(update={"static_root": "/tmp/curio-seed-test", "ssrf_dns_check": False})
-    client, _ = fake_net(capture_routes())
-    job = make_job(ETH_ADDR, "ethereum")
-    async with client:
-        await run_seed(job, settings, client)
-    assert job.status == "done", job.errors
-    assert job.captured == 1
-    assert job.skipped == 0 and job.failed == 0
-
-
 async def test_capture_failure_is_counted_not_fatal(tmp_path):
-    settings = SEED_SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path), "static_root": str(tmp_path / "media"), "ssrf_dns_check": False})
+    settings = SEED_SETTINGS.model_copy(update={"static_root": str(tmp_path / "media"), "ssrf_dns_check": False})
     routes = capture_routes()
     routes[CAPTURE_URL] = {"status_code": 410}  # the domain died mid-seed
     client, _ = fake_net(routes)
@@ -197,7 +180,6 @@ async def test_capture_failure_is_counted_not_fatal(tmp_path):
     assert job.status == "done"
     assert job.captured == 0
     assert job.failed == 1 and job.skipped == 0
-    assert not (tmp_path / "captures.jsonl").exists()
 
 
 # --- library_status ----------------------------------------------------------
@@ -214,9 +196,9 @@ def kubo_handler(request: httpx.Request) -> httpx.Response | None:
 
 
 async def test_library_status_counts_all_three_planes(tmp_path):
-    settings = SETTINGS.model_copy(update={"seed_capture_dir": str(tmp_path)})
-    record_warm("txHIT", settings, why="seed")
-    record_warm("txEVICTED", settings, why="favorite")
+    settings = SETTINGS.model_copy(update={"static_root": str(tmp_path)})
+    register_arweave(settings, "txHIT")
+    register_arweave(settings, "txEVICTED")
 
     def handler(request: httpx.Request) -> httpx.Response:
         kubo = kubo_handler(request)
@@ -233,21 +215,22 @@ async def test_library_status_counts_all_three_planes(tmp_path):
     assert status["arweave"]["known_warmed"] == 2
     assert status["arweave"]["currently_cached"] == 1
     assert "same persistent Core" in status["arweave"]["operation"]
-    # capture enabled but nothing captured yet; overrides/favorites disabled
-    assert status["registry"] == {"overrides": None, "favorites": None, "captures": 0}
+    assert status["registry"] == {"overrides": None, "favorites": None}
 
 
-async def test_library_status_degrades_per_plane():
-    # Kubo down, ledger disabled, no operator state: still a 3-section answer.
+async def test_library_status_degrades_per_plane(tmp_path):
+    # Kubo down, nothing registered, no operator state: still a 3-section answer.
+    settings = SETTINGS.model_copy(update={"static_root": str(tmp_path)})
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500)
 
     async with client_for(handler) as client:
-        status = await library_status(SETTINGS, client)
+        status = await library_status(settings, client)
 
     assert "error" in status["ipfs"]
     assert status["arweave"] == {"known_warmed": 0, "currently_cached": 0}
-    assert status["registry"] == {"overrides": None, "favorites": None, "captures": None}
+    assert status["registry"] == {"overrides": None, "favorites": None}
 
 
 # --- GET /library -------------------------------------------------------------
@@ -256,7 +239,7 @@ async def test_library_status_degrades_per_plane():
 @pytest.fixture
 def library_env(http_client, tmp_path, monkeypatch):
     """The shared client with every subsystem enabled against tmp paths."""
-    monkeypatch.setenv("RESOLVER_SEED_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("RESOLVER_STATIC_ROOT", str(tmp_path / "media"))
     monkeypatch.setenv("RESOLVER_OVERRIDES_PATH", str(tmp_path / "overrides.toml"))
     monkeypatch.setenv("RESOLVER_FAVORITES_PATH", str(tmp_path / "favorites.json"))
     get_settings.cache_clear()
@@ -269,7 +252,7 @@ def library_env(http_client, tmp_path, monkeypatch):
 
 
 def test_library_route_reports_the_three_planes(library_env):
-    record_warm("txROUTE", get_settings(), why="seed")
+    register_arweave(get_settings(), "txROUTE")
 
     def handler(request: httpx.Request) -> httpx.Response:
         kubo = kubo_handler(request)
@@ -290,4 +273,4 @@ def test_library_route_reports_the_three_planes(library_env):
     assert set(body) == {"ipfs", "arweave", "registry"}
     assert body["ipfs"]["pinned"] == 3
     assert body["arweave"]["known_warmed"] == 1 and body["arweave"]["currently_cached"] == 1
-    assert body["registry"] == {"overrides": 0, "favorites": 0, "captures": 0}
+    assert body["registry"] == {"overrides": 0, "favorites": 0}

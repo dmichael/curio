@@ -11,8 +11,6 @@ import asyncio
 import hashlib
 import json
 import tempfile
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, NamedTuple
 
 import httpx
@@ -24,6 +22,7 @@ from .overrides import get_registry
 from .refs import ipfs_parts
 from .resolve import Resolved
 from .safe_fetch import safe_stream
+from .static_store import StaticStore
 
 _STATUS_TIMEOUT = 10.0  # per probe: status must answer even when a plane hangs
 
@@ -97,7 +96,7 @@ async def ingest_url(
 
 
 async def store_resolved(
-    result: Resolved, settings: Settings, client: httpx.AsyncClient, why: str = "pin"
+    result: Resolved, settings: Settings, client: httpx.AsyncClient
 ) -> str | None:
     """Store one resolved artifact on its source-native storage plane.
 
@@ -131,82 +130,8 @@ async def store_resolved(
         if arweave is None:
             return "failed"
         txid, path = arweave
-        outcome = await store_arweave(txid, path, settings, client)
-        if outcome == "stored":
-            record_warm(txid, settings, why)
-        return outcome
+        return await store_arweave(txid, path, settings, client)
     return None
-
-
-def captures_file(settings: Settings) -> Path:
-    """One provenance ledger for everything that enters Kubo without a
-    canonical content address: seed captures and operator uploads (store.py)."""
-    return Path(settings.seed_capture_dir) / "captures.jsonl"
-
-
-# File I/O around captures (this read, the tempfile buffers in ingest_url and
-# the jsonl appends) is deliberately synchronous inside async code: at
-# household scale the blocking is microseconds against network-bound work,
-# and async-file machinery isn't worth it. Don't "fix" it.
-def _captured_sources(settings: Settings) -> set[str]:
-    """Source URLs already captured — capture is once per URL, ever."""
-    sources: set[str] = set()
-    try:
-        with open(captures_file(settings)) as fh:
-            for line in fh:
-                try:
-                    source = json.loads(line)["source"]
-                except (ValueError, KeyError, TypeError):
-                    continue
-                if isinstance(source, str):
-                    sources.add(source)
-    except OSError:
-        pass
-    return sources
-
-
-def warmed_file(settings: Settings) -> Path:
-    """Ledger of Arweave txids verified through the box's one Core cache."""
-    return Path(settings.seed_capture_dir) / "warmed.jsonl"
-
-
-def record_warm(txid: str, settings: Settings, why: str) -> None:
-    """Append a successful same-Core verification — once per txid, ever.
-
-    No-op when capture is disabled. Same deliberately-synchronous file I/O
-    as the captures ledger — see the note above _captured_sources."""
-    if not settings.seed_capture_dir:
-        return
-    if txid in warmed_txids(settings):
-        return
-    record = {
-        "txid": txid,
-        "warmed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "why": why,
-    }
-    path = warmed_file(settings)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a") as fh:
-        fh.write(json.dumps(record) + "\n")
-
-
-def warmed_txids(settings: Settings) -> list[str]:
-    """Ordered unique txids from the warm ledger; [] when disabled/missing."""
-    if not settings.seed_capture_dir:
-        return []
-    txids: dict[str, None] = {}  # ordered de-dupe
-    try:
-        with open(warmed_file(settings)) as fh:
-            for line in fh:
-                try:
-                    txid = json.loads(line)["txid"]
-                except (ValueError, KeyError, TypeError):
-                    continue
-                if isinstance(txid, str):
-                    txids[txid] = None
-    except OSError:
-        pass
-    return list(txids)
 
 
 async def library_status(settings: Settings, client: httpx.AsyncClient) -> dict[str, Any]:
@@ -246,8 +171,23 @@ async def _ipfs_status(settings: Settings, client: httpx.AsyncClient) -> dict[st
         return {"error": f"{type(exc).__name__}: {exc}"}
 
 
+def _arweave_txids(settings: Settings) -> list[str]:
+    """Registered Arweave txids: the catalogue's resolutions, not the cache.
+
+    A reference counts once it has a live playback route — the txid segment
+    right after `/arweave/` in media_path, deduped, failures excluded.
+    """
+    store = StaticStore(settings.static_root, settings.static_cache_max_bytes)
+    txids: dict[str, None] = {}  # ordered de-dupe
+    for media_path in store.arweave_media_paths():
+        txid = media_path[len("/arweave/"):].split("/", 1)[0]
+        if txid:
+            txids[txid] = None
+    return list(txids)
+
+
 async def _arweave_status(settings: Settings, client: httpx.AsyncClient) -> dict[str, Any]:
-    txids = warmed_txids(settings)
+    txids = _arweave_txids(settings)
     if not txids:
         return {"known_warmed": 0, "currently_cached": 0}
     sem = asyncio.Semaphore(settings.seed_concurrency)
@@ -274,13 +214,6 @@ async def _arweave_status(settings: Settings, client: httpx.AsyncClient) -> dict
 
 def _registry_status(settings: Settings) -> dict[str, Any]:
     """Counts of the operator-state files; None marks a disabled subsystem."""
-    captures = None
-    if settings.seed_capture_dir:
-        try:
-            with open(captures_file(settings)) as fh:
-                captures = sum(1 for _ in fh)
-        except OSError:
-            captures = 0  # enabled but nothing captured yet
     return {
         "overrides": (
             len(get_registry(settings.overrides_path).entries())
@@ -292,5 +225,4 @@ def _registry_status(settings: Settings) -> dict[str, Any]:
             if settings.favorites_path
             else None
         ),
-        "captures": captures,
     }

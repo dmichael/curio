@@ -179,7 +179,7 @@ async def store_reference(
         if result.source_kind in {"http", "data", "upload"}:
             stored = store_static(result, settings)
         else:
-            outcome = await store_resolved(result, settings, client, why="resolve")
+            outcome = await store_resolved(result, settings, client)
             stored = outcome in {"pinned", "stored"}
     except Exception as exc:
         return failed_resolution_payload(ref, f"{type(exc).__name__}: {exc}"), False

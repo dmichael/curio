@@ -348,5 +348,21 @@ class StaticStore:
         finally:
             db.close()
 
+    def arweave_media_paths(self) -> list[str]:
+        """Distinct media_path values for non-failed Arweave resolutions.
+
+        The catalogue's registered Arweave inventory: /library counts a txid
+        once it has a live playback route, not merely a cache hit.
+        """
+        db = self._connection()
+        try:
+            rows = db.execute(
+                "SELECT DISTINCT media_path FROM resolutions "
+                "WHERE media_path LIKE '/arweave/%' AND status != 'failed'"
+            ).fetchall()
+            return [row["media_path"] for row in rows]
+        finally:
+            db.close()
+
     def guessed_type(self, filename: str | None) -> str | None:
         return mimetypes.guess_type(filename or "")[0]

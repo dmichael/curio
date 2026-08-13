@@ -30,7 +30,7 @@ import httpx
 
 from .arweave_cache import store_arweave
 from .config import Settings
-from .library import ingest_url, record_warm, track_task
+from .library import ingest_url, track_task
 from .operations import record_result
 from .refs import arweave_parts, ipfs_parts
 from .resolve import Resolved, external_url_ok, resolve_ref, storage_intent
@@ -337,7 +337,6 @@ async def _warm_txid(
                 async for _ in response.aiter_bytes(65536):
                     pass
             job.warmed += 1
-            record_warm(txid, settings, why="seed")
         except httpx.HTTPError as exc:
             job.failed += 1
             _note_error(job, f"warm {txid}: {type(exc).__name__}: {exc}")
@@ -351,7 +350,6 @@ async def _store_txid(
         outcome = await store_arweave(txid, path, settings, client)
         if outcome == "stored":
             job.warmed += 1
-            record_warm(txid, settings, why="seed")
             return True
         job.failed += 1
         _note_error(job, f"store {txid}{path}: same-Core cache verification failed")
