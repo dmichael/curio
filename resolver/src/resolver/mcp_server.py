@@ -67,7 +67,18 @@ def _mcp_origin(ctx: Context | None = None) -> str:
 @mcp.tool()
 async def resolve(ref: str, ctx: Context = None) -> dict[str, Any]:
     """Resolve and store an IPFS, Arweave, HTTP, `data:` metadata or media,
-    or Verse artwork-page reference.
+    or Verse reference (artwork page or /items/ URL).
+
+    Both Verse URL forms resolve chain-first. An artwork page
+    (verse.works/artworks/<id>) has its contract address and token id read
+    from the page; an /items/ethereum/<contract>/<tokenId> URL already names
+    them and skips page scraping entirely. Either way, a tokenURI/uri chain
+    call fetches the canonical metadata and its media is resolved
+    recursively. Only when on-chain resolution is impossible (no
+    coordinates, RPC disabled or unreachable, chain metadata unreachable)
+    does it fall back to scraping the page directly — and a
+    chain-found-but-dead canonical ref is disclosed in `note` even when a
+    scrape fallback plays instead.
 
     A successful response has status `ready` or `live-dependent`, plus the
     reference to pass to `lookup` or HTTP `GET /resolve?ref=...`. `failed`

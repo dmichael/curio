@@ -52,11 +52,33 @@ POST resolution recognizes:
 - HTTP media and JSON metadata;
 - `data:` metadata and media;
 - small UnixFS directory wrappers;
-- Verse artwork pages.
+- Verse artwork pages and /items/ URLs.
 
 Metadata and wrappers are followed to the selected final artifact. Overrides
 are checked during recursion and substitutions are disclosed in the POST
 response.
+
+Verse references resolve chain-first, in two shapes:
+
+- Artwork pages (`verse.works/artworks/<id>`) have their contract address and
+  token id read from the page's embedded JSON.
+- `verse.works/items/ethereum/<contract>/<tokenId>` already names its chain
+  coordinates in the URL, so no page scrape is needed to find them. Only the
+  `ethereum` chain segment is recognized today; any other chain segment, a
+  malformed address, or a non-numeric token id is not treated as a Verse
+  chain reference at all and falls through to ordinary HTTP handling.
+
+Either way, an ERC-721 `tokenURI` (or ERC-1155 `uri`) call over
+`RESOLVER_ETH_RPC_URL` fetches the canonical metadata, resolved like any
+other metadata reference. Only when on-chain resolution is impossible — no
+coordinates found, RPC disabled or unreachable, or the chain-found metadata
+unreachable — does it fall back to scraping a page directly (embedded
+`tokenUri` / `iframeUrl` / `og:image`). An artwork page always has one to try;
+an /items/ URL only has the /items/ page itself, and only if it actually
+yields something — otherwise resolution fails with a note naming the
+on-chain coordinates that were tried. A chain-found canonical ref that turns
+out to be dead is always disclosed in the response `note`, even when a
+scrape fallback is what actually plays.
 
 ## Source-native storage
 

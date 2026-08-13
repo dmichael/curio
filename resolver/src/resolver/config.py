@@ -44,6 +44,13 @@ class Settings(BaseSettings):
     redirect_max_hops: int = Field(default=5, ge=0)
     ssrf_dns_check: bool = True
 
+    # Ethereum mainnet JSON-RPC endpoint for chain-first Verse resolution
+    # (ERC-721 tokenURI / ERC-1155 uri calls). Default is PublicNode's free,
+    # keyless public endpoint — no account needed, reasonably reliable, run
+    # by Allnodes. Empty disables chain lookup; callers fall back to scraping
+    # the Verse page directly.
+    eth_rpc_url: str = "https://ethereum.publicnode.com"
+
     # Operator-curated exception registry (overrides.py, docs/design.md):
     # a TOML file mapping dead canonical refs to replacements. Empty disables
     # it. Reloaded whenever the file's mtime changes — edits need no restart.
