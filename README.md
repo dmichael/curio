@@ -1,10 +1,17 @@
 <h1 align="center">Curio</h1>
 
-<p align="center"><strong>Put NFT media into storage you control.</strong></p>
+<p align="center"><strong>A preservation and delivery appliance for digital art.</strong></p>
 
-Curio accepts NFT media references and local files, stores their final artifacts,
-and gives media players one URL space on your own server. It uses Kubo for IPFS,
-AR.IO Core for Arweave, and a local static store for ordinary files.
+Curio solves the gap between having a reference to a digital artwork and being
+able to display that artwork reliably in the future.
+
+Digital art is often scattered across IPFS, Arweave, ordinary web servers,
+metadata documents, and local files. These sources can be difficult for media
+players to resolve, dependent on third-party infrastructure, or vulnerable to
+link rot. Curio resolves each reference to its final media, stores it locally,
+and makes it reliably available to players through one URL space on your own
+server. It uses Kubo for IPFS, AR.IO Core for Arweave, and a local static store
+for ordinary files.
 
 ## Install
 
