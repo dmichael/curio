@@ -1,10 +1,10 @@
 """What a wallet or contract points at: enumerate NFTs and their media refs.
 
 Serves `GET /wallet` — a live, normalized inventory of a wallet's NFTs
-(Blockscout for Ethereum, TzKT for Tezos — keyless public APIs; no snapshot
-files, no local database) — and supplies seeding (seed.py) with the same
-enumerators. The default scope answers for the wallet's holdings; the other
-scopes change the question:
+(Blockscout coordinates plus current contract metadata for Ethereum, TzKT for
+Tezos; no snapshot files or local wallet database) — and supplies seeding
+(seed.py) with the same enumerators. The default scope answers for the wallet's
+holdings; the other scopes change the question:
 
 `scope=published` flips the question to "everything this wallet *first-minted*"
 (TzKT's firstMinter index; Tezos only — Ethereum has no keyless creator index).
@@ -39,7 +39,12 @@ from typing import Any
 import httpx
 
 from .config import Settings
-from .resolve import pick_media_field, resolve_ref
+from .resolve import (
+    ethereum_token_uri,
+    pick_media_field,
+    read_token_metadata,
+    resolve_ref,
+)
 
 _ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _TEZOS_ADDRESS_RE = re.compile(r"^(tz[123]|KT1)[1-9A-HJ-NP-Za-km-z]{33}$")
@@ -126,21 +131,98 @@ async def _resolve_wallet(
     return domains[0]["address"]["address"]
 
 
+_ETH_CHAIN_CONCURRENCY = 8
+
+
+async def _eth_chain_item(
+    item: dict[str, Any], settings: Settings, client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+) -> dict[str, Any]:
+    """Replace Blockscout's cached metadata with current contract metadata.
+
+    Blockscout remains the holdings index. A successful contract call is the
+    media-identity boundary: if its token URI is unreachable, keep that
+    failure visible instead of falling back to stale indexed fields. Only an
+    impossible contract call permits the explicitly labeled indexer fallback.
+    """
+    raw_token = item.get("token")
+    token = raw_token if isinstance(raw_token, dict) else {}
+    current = {**item, "token": {**token}}
+    if not isinstance(current.get("metadata"), dict):
+        current["metadata"] = {}
+    contract = current["token"].get("address_hash")
+    standard = current["token"].get("type")
+    raw_token_id = current.get("id")
+    if not settings.eth_rpc_url or not isinstance(contract, str):
+        current["metadata_source"] = "indexer-fallback"
+        return current
+    try:
+        token_id = int(str(raw_token_id))
+    except (TypeError, ValueError):
+        current["metadata_source"] = "indexer-fallback"
+        return current
+
+    async with sem:
+        token_uri = await ethereum_token_uri(
+            client, settings, contract, token_id,
+            standard=standard if isinstance(standard, str) else None,
+        )
+        if not token_uri:
+            current["metadata_source"] = "indexer-fallback"
+            return current
+        metadata = await read_token_metadata(token_uri, settings, client)
+
+    current["token_uri"] = token_uri
+    current["metadata"] = metadata or {}
+    current["metadata_source"] = "chain" if metadata is not None else "chain-unreachable"
+    # These are Blockscout-rendered derivatives or stale cached fields. Once a
+    # chain URI exists, only its metadata may name canonical media.
+    for field in _MEDIA_FIELDS:
+        if field in current:
+            current[field] = None
+    current["media_type"] = None
+    return current
+
+
+async def _eth_chain_page(
+    items: list[dict[str, Any]], settings: Settings, client: httpx.AsyncClient
+) -> list[dict[str, Any]]:
+    sem = asyncio.Semaphore(_ETH_CHAIN_CONCURRENCY)
+    return await asyncio.gather(
+        *(_eth_chain_item(item, settings, client, sem) for item in items)
+    )
+
+
 async def _eth_items(
-    address: str, settings: Settings, client: httpx.AsyncClient
+    address: str,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    limit: int | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """Blockscout v2 NFT holdings, all pages. Raw metadata comes inline."""
+    """Blockscout holdings coordinates enriched from current chain metadata."""
     url = f"{settings.blockscout_base}/addresses/{address}/nft"
     params: dict[str, Any] = {"type": "ERC-721,ERC-1155"}
+    yielded = 0
     while True:
         response = await client.get(url, params=params)
         response.raise_for_status()
         data = response.json()
-        for item in data.get("items", []):
+        if not isinstance(data, dict) or not isinstance(data.get("items", []), list):
+            raise ValueError("Blockscout holdings response has invalid items")
+        raw_page = [item for item in data.get("items", []) if isinstance(item, dict)]
+        if limit is not None:
+            raw_page = raw_page[: max(0, limit - yielded)]
+        page = await _eth_chain_page(raw_page, settings, client)
+        for item in page:
             yield item
+            yielded += 1
+        if limit is not None and yielded >= limit:
+            return
         next_page = data.get("next_page_params")
         if not next_page:
             return
+        if not isinstance(next_page, dict):
+            raise ValueError("Blockscout holdings response has invalid pagination")
         params = {**next_page, "type": "ERC-721,ERC-1155"}
 
 
@@ -317,30 +399,62 @@ def _tezos_contract_items(
 
 
 async def _eth_contract_items(
-    contract: str, settings: Settings, client: httpx.AsyncClient
+    contract: str,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    limit: int | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """Blockscout v2 token instances — every token the contract ever issued,
-    all pages. Normalized to the holdings item shape so _media_refs and
-    _token_record just work; the item-level image_url/animation_url are kept
-    because _media_refs scans the item dict too."""
-    url = f"{settings.blockscout_base}/tokens/{contract}/instances"
+    """Every indexed token instance, enriched from current chain metadata."""
+    token_url = f"{settings.blockscout_base}/tokens/{contract}"
+    contract_standard: str | None = None
+    try:
+        token_response = await client.get(token_url)
+        token_response.raise_for_status()
+        token_payload = token_response.json()
+        candidate = token_payload.get("type") if isinstance(token_payload, dict) else None
+        if isinstance(candidate, str):
+            contract_standard = candidate
+    except (httpx.HTTPError, ValueError):
+        pass  # Per-instance type or unknown-standard selector fallback remains.
+
+    url = f"{token_url}/instances"
     params: dict[str, Any] = {}
+    yielded = 0
     while True:
         response = await client.get(url, params=params)
         response.raise_for_status()
         data = response.json()
-        for item in data.get("items", []):
-            yield {
-                "token": {"address_hash": contract},
+        if not isinstance(data, dict) or not isinstance(data.get("items", []), list):
+            raise ValueError("Blockscout token response has invalid items")
+        raw_page = [item for item in data.get("items", []) if isinstance(item, dict)]
+        if limit is not None:
+            raw_page = raw_page[: max(0, limit - yielded)]
+        normalized: list[dict[str, Any]] = []
+        for item in raw_page:
+            raw_token = item.get("token")
+            item_token = raw_token if isinstance(raw_token, dict) else {}
+            standard = item_token.get("type") or item.get("token_type") or contract_standard
+            token = {"address_hash": contract}
+            if isinstance(standard, str):
+                token["type"] = standard
+            normalized.append({
+                "token": token,
                 "id": item.get("id"),
                 "metadata": item.get("metadata") or {},
                 "media_type": item.get("media_type"),
                 "image_url": item.get("image_url"),
                 "animation_url": item.get("animation_url"),
-            }
+            })
+        for item in await _eth_chain_page(normalized, settings, client):
+            yield item
+            yielded += 1
+        if limit is not None and yielded >= limit:
+            return
         next_page = data.get("next_page_params")
         if not next_page:
             return
+        if not isinstance(next_page, dict):
+            raise ValueError("Blockscout token response has invalid pagination")
         params = next_page
 
 
@@ -355,9 +469,12 @@ async def list_wallet_tokens(
 ) -> dict[str, Any] | None:
     """Live, normalized inventory of a wallet's NFTs — the browse/pick step.
 
-    Enumerates the same indexers seeding uses (no snapshot files, no local
-    database); each token carries its media refs so a consumer can hand the
-    chosen one straight to /resolve. None when `ref` isn't wallet-shaped.
+    Enumerates the same discovery sources seeding uses (no snapshot files or
+    local wallet database). Ethereum coordinates come from Blockscout but
+    metadata comes from the current on-chain token URI whenever RPC is
+    available. Each token carries its metadata source and media refs so a
+    consumer can hand the chosen primary ref straight to /resolve. None when
+    `ref` isn't wallet-shaped.
     scope="published" lists the works the wallet first-minted (Tezos only)
     instead of its holdings; scope="created" lists what the wallet authored
     (creators/authors metadata, Tezos only), dropping fully-burned works
@@ -376,8 +493,13 @@ async def list_wallet_tokens(
     _check_scope(ref, chain, scope)
     address = ref if scope == "contract" else await _resolve_wallet(ref, chain, settings, client)
     items = _enumerator(chain, scope, include_burned)
+    iterator = (
+        items(address, settings, client, limit=limit)
+        if chain == "ethereum"
+        else items(address, settings, client)
+    )
     tokens: list[dict[str, Any]] = []
-    async for item in items(address, settings, client):
+    async for item in iterator:
         tokens.append(_token_record(chain, item))
         if limit is not None and len(tokens) >= limit:
             break
@@ -473,6 +595,8 @@ def _token_record(chain: str, item: dict[str, Any]) -> dict[str, Any]:
         "name": name if isinstance(name, str) else None,
         "mime": mime if isinstance(mime, str) else None,
         "creators": creators if isinstance(creators, list) else None,
+        "token_uri": item.get("token_uri") if chain == "ethereum" else None,
+        "metadata_source": item.get("metadata_source") if chain == "ethereum" else "indexer",
         "primary_ref": pick_media_field(metadata) or (refs[0] if refs else None),
         "refs": refs,
     }
@@ -484,7 +608,12 @@ def _media_refs(item: dict[str, Any]) -> list[str]:
     when metadata is missing)."""
     refs: list[str] = []
     metadata = item.get("metadata") or {}
-    sources: list[dict[str, Any]] = [metadata, item]
+    # Item-level Ethereum URLs are Blockscout cache output. They remain useful
+    # only when the contract call itself was impossible and the fallback is
+    # disclosed; a chain-derived token URI excludes them categorically.
+    sources: list[dict[str, Any]] = [metadata]
+    if item.get("metadata_source") not in {"chain", "chain-unreachable"}:
+        sources.append(item)
     for source in sources:
         for key in _MEDIA_FIELDS:
             value = source.get(key)
@@ -496,4 +625,14 @@ def _media_refs(item: dict[str, Any]) -> list[str]:
             uri = entry.get("uri") if isinstance(entry, dict) else None
             if isinstance(uri, str) and uri and uri not in refs:
                 refs.append(uri)
+    token_uri = item.get("token_uri")
+    if (
+        not refs
+        and item.get("metadata_source") == "chain-unreachable"
+        and isinstance(token_uri, str)
+        and token_uri
+    ):
+        # Preserve a current-but-unreachable metadata pointer as the token's
+        # primary ref so audits and seed jobs report the actual chain failure.
+        refs.append(token_uri)
     return refs

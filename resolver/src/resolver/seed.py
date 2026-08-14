@@ -204,11 +204,16 @@ async def _run_seed_inner(
 ) -> None:
     # job.address was resolved by start_seed, before admission control.
     items = _enumerator(job.chain, job.scope, job.include_burned)
+    iterator = (
+        items(job.address, settings, client, limit=limit)
+        if job.chain == "ethereum"
+        else items(job.address, settings, client)
+    )
     refs: dict[str, None] = {}
     # Resolve every discovered input before deciding its storage plane. A
     # collection often supplies HTTP/data metadata whose final artifact is
     # IPFS or Arweave; retaining the metadata document is not enough.
-    async for item in items(job.address, settings, client):
+    async for item in iterator:
         job.tokens += 1
         for ref in _media_refs(item):
             job.refs_found += 1

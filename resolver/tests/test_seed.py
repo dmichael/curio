@@ -12,6 +12,7 @@ SETTINGS = Settings(
     ipfs_api="http://kubo.internal",
     blockscout_base="http://bs.internal/api/v2",
     bens_base="http://bens.internal/api/v1/1",
+    eth_rpc_url="http://rpc.internal",
     tzkt_base="http://tzkt.internal/v1",
     seed_recovery_gateways=["http://gw.fallback/ipfs"],
 )
@@ -19,6 +20,17 @@ SETTINGS = Settings(
 ETH_ADDR = "0xAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb"
 TZ_ADDR = "tz1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 TXID = "abcdefghijklmnopqrstuvwxyz0123456789_ABCDEF"
+
+
+def encode_abi_string(value: str) -> str:
+    data = value.encode()
+    padded = -(-len(data) // 32) * 32
+    payload = (
+        (32).to_bytes(32, "big")
+        + len(data).to_bytes(32, "big")
+        + data.ljust(padded, b"\x00")
+    )
+    return "0x" + payload.hex()
 
 
 def fake_net(routes: dict[str, dict | list]) -> tuple[httpx.AsyncClient, list[str]]:
@@ -104,6 +116,44 @@ async def test_eth_wallet_seed_pins_and_warms():
     assert job.skipped == 1  # duplicate CID was deduped across token spellings
     assert job.failed == 0
     assert sum("pin/add" in line for line in log) == 1  # deduped across tokens
+
+
+async def test_eth_seed_uses_chain_metadata_not_stale_blockscout_metadata():
+    token_uri = "ipfs://bafyCURRENT/1.json"
+    routes = {
+        f"http://bs.internal/api/v2/addresses/{ETH_ADDR}/nft?type=ERC-721%2CERC-1155": {
+            "status_code": 200,
+            "json": {
+                "items": [{
+                    "id": "1",
+                    "metadata": {"image": "ipfs://bafySTALE/old.png"},
+                    "token": {"address_hash": "0xC0FFEE"},
+                }],
+                "next_page_params": None,
+            },
+        },
+        "POST http://rpc.internal": {
+            "status_code": 200,
+            "json": {"jsonrpc": "2.0", "id": 1, "result": encode_abi_string(token_uri)},
+        },
+        "http://ipfs.internal/ipfs/bafyCURRENT/1.json": {
+            "status_code": 200,
+            "json": {"image": "ipfs://bafyLIVE/art.png"},
+        },
+        "POST http://kubo.internal/api/v0/pin/add?arg=%2Fipfs%2FbafyLIVE": {
+            "status_code": 200,
+            "json": {},
+        },
+    }
+    client, log = fake_net(routes)
+    job = make_job(ETH_ADDR, "ethereum")
+    async with client:
+        await run_seed(job, SETTINGS, client)
+    assert job.status == "done", job.errors
+    assert job.pinned == 1
+    assert job.failed == 0
+    assert any("bafyLIVE" in line for line in log)
+    assert not any("bafySTALE" in line for line in log)
 
 
 async def test_ens_name_resolves_via_bens():
