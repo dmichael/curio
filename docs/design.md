@@ -52,9 +52,15 @@ not evicted. Curio does not silently convert ordinary files to IPFS.
 
 ## Curation
 
-Wallet endpoints use public Ethereum and Tezos indexers to discover references.
-They do not prove ownership history, authorship, or authenticity. A seed job is
-the batch form of storage intent for a selected wallet or contract.
+Wallet endpoints use public Ethereum and Tezos indexers for discovery. Indexer
+metadata is not media identity: Ethereum contract/token coordinates must be
+resolved through current `tokenURI`/`uri` state before Curio makes preservation
+or recovery decisions. The rationale, fallback boundary, and current
+implementation gap are recorded in
+[architecture decision 0002](decisions/0002-indexers-discover-chain-defines-ethereum-media.md).
+
+Indexer results do not prove ownership history, authorship, or authenticity. A
+seed job is the batch form of storage intent for a selected wallet or contract.
 
 Overrides are explicit mappings for dead references. Substituted results carry
 the override status so clients can distinguish a recovered canonical object

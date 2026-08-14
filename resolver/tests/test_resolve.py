@@ -766,6 +766,53 @@ def test_encode_uint256_call_pads_token_id_to_32_bytes():
     assert call == "0xc87b56dd" + "0" * 63 + "7"
 
 
+async def test_known_erc1155_prefers_uri_when_contract_exposes_both_selectors():
+    chain_settings = SETTINGS.model_copy(update={"eth_rpc_url": CHAIN_RPC_URL})
+    erc721_value = "ipfs://wrong/metadata.json"
+    erc1155_value = "ipfs://right/{id}.json"
+    async with fake_net_with_chain(
+        {}, CHAIN_RPC_URL,
+        tokenuri_result=erc721_value,
+        uri_result=erc1155_value,
+    ) as client:
+        result = await resolve_module.ethereum_token_uri(
+            client, chain_settings, ITEMS_CONTRACT, 7, standard="ERC-1155"
+        )
+    assert result == f"ipfs://right/{7:064x}.json"
+
+
+async def test_known_erc1155_does_not_fall_through_to_tokenuri():
+    chain_settings = SETTINGS.model_copy(update={"eth_rpc_url": CHAIN_RPC_URL})
+    async with fake_net_with_chain(
+        {}, CHAIN_RPC_URL,
+        tokenuri_result="ipfs://wrong/metadata.json",
+        uri_result=None,
+    ) as client:
+        result = await resolve_module.ethereum_token_uri(
+            client, chain_settings, ITEMS_CONTRACT, 7, standard="ERC-1155"
+        )
+    assert result is None
+
+
+@pytest.mark.parametrize(
+    "rpc_payload",
+    [
+        [],
+        {"jsonrpc": "2.0", "id": 1, "result": 123},
+        {"jsonrpc": "2.0", "id": 1, "result": "not-hex"},
+    ],
+)
+async def test_ethereum_token_uri_degrades_on_malformed_rpc_json(rpc_payload):
+    chain_settings = SETTINGS.model_copy(update={"eth_rpc_url": CHAIN_RPC_URL})
+    async with fake_net({
+        f"POST {CHAIN_RPC_URL}": {"status_code": 200, "json": rpc_payload},
+    }) as client:
+        result = await resolve_module.ethereum_token_uri(
+            client, chain_settings, ITEMS_CONTRACT, 7, standard="ERC-721"
+        )
+    assert result is None
+
+
 # --- data: URIs (fully on-chain tokenURIs) ---
 
 

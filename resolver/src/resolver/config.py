@@ -44,11 +44,11 @@ class Settings(BaseSettings):
     redirect_max_hops: int = Field(default=5, ge=0)
     ssrf_dns_check: bool = True
 
-    # Ethereum mainnet JSON-RPC endpoint for chain-first Verse resolution
-    # (ERC-721 tokenURI / ERC-1155 uri calls). Default is PublicNode's free,
-    # keyless public endpoint — no account needed, reasonably reliable, run
-    # by Allnodes. Empty disables chain lookup; callers fall back to scraping
-    # the Verse page directly.
+    # Ethereum mainnet JSON-RPC endpoint for chain-first wallet and Verse
+    # resolution (ERC-721 tokenURI / ERC-1155 uri calls). Default is
+    # PublicNode's free, keyless public endpoint, run by Allnodes. Empty
+    # disables chain lookup; wallet results then disclose Blockscout metadata
+    # as an indexer fallback and Verse pages fall back to scraping.
     eth_rpc_url: str = "https://ethereum.publicnode.com"
 
     # Operator-curated exception registry (overrides.py, docs/design.md):
@@ -65,8 +65,9 @@ class Settings(BaseSettings):
     # verse pages, directory listings). Media bytes are never buffered here.
     fetch_max_bytes: int = Field(default=2_000_000, gt=0)
 
-    # Seeding (/seed): the box's Kubo API, and the keyless public indexers
-    # used to enumerate a wallet's holdings.
+    # Seeding (/seed): the box's Kubo API and keyless public indexers used for
+    # discovery. Blockscout supplies ETH coordinates, never authoritative
+    # metadata when the contract can be read through eth_rpc_url.
     ipfs_api: str = "http://127.0.0.1:5001"
     blockscout_base: str = "https://eth.blockscout.com/api/v2"
     bens_base: str = "https://bens.services.blockscout.com/api/v1/1"

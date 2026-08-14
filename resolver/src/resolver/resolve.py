@@ -646,6 +646,48 @@ async def _resolve_metadata_dict(
 _DATA_URI_RE = re.compile(r"^data:([^,]*),(.*)$", re.DOTALL)
 
 
+async def read_token_metadata(
+    token_uri: str, settings: Settings, client: httpx.AsyncClient
+) -> dict[str, Any] | None:
+    """Read a current chain-derived token URI as a bounded JSON object.
+
+    This is shared by wallet enumeration and the resolver so Ethereum indexers
+    never become the authority for mutable token metadata. None means the
+    contract returned a pointer whose metadata cannot currently be read; the
+    caller must not silently replace it with an indexer's stale copy.
+    """
+    match = _DATA_URI_RE.match(token_uri)
+    if match is not None:
+        params, payload = match.group(1).split(";"), match.group(2)
+        mediatype = params[0].strip().lower() or "text/plain"
+        if mediatype != "application/json":
+            return None
+        if len(payload) > settings.data_max_bytes * (4 // 3 + 1) + 16:
+            return None
+        try:
+            text = (
+                base64.b64decode(payload, validate=False).decode("utf-8", errors="replace")
+                if any(p.strip().lower() == "base64" for p in params[1:])
+                else unquote(payload)
+            )
+            if len(text.encode("utf-8")) > settings.data_max_bytes:
+                return None
+            metadata: Any = json.loads(text)
+        except ValueError:
+            return None
+        return metadata if isinstance(metadata, dict) else None
+
+    try:
+        metadata = json.loads(
+            await _bounded_text(
+                client, _internal_fetch_url(token_uri, settings), settings.fetch_max_bytes, settings
+            )
+        )
+    except (httpx.HTTPError, ValueError):
+        return None
+    return metadata if isinstance(metadata, dict) else None
+
+
 async def _resolve_data_uri(
     ref: str, settings: Settings, client, depth: int, origin: str | None
 ) -> Resolved:
@@ -829,30 +871,57 @@ async def _eth_call(client, settings: Settings, contract: str, call_data: str) -
         payload = response.json()
     except (httpx.HTTPError, ValueError):
         return None
+    if not isinstance(payload, dict):
+        return None
     result = payload.get("result")
-    if payload.get("error") or not result or result == "0x":
+    if (
+        payload.get("error")
+        or not isinstance(result, str)
+        or not result.startswith("0x")
+        or result == "0x"
+    ):
         return None
     try:
         return bytes.fromhex(result[2:])
-    except ValueError:
+    except (TypeError, ValueError):
         return None
 
 
-async def _verse_chain_token_uri(client, settings: Settings, contract: str, token_id: int) -> str | None:
-    """ERC-721 tokenURI(uint256), falling back to ERC-1155 uri(uint256) with
-    the standard `{id}` hex substitution when the 721 call fails or reverts."""
-    data = await _eth_call(client, settings, contract, _encode_uint256_call(_ERC721_TOKEN_URI_SELECTOR, token_id))
-    if data is not None:
+async def ethereum_token_uri(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    contract: str,
+    token_id: int,
+    standard: str | None = None,
+) -> str | None:
+    """Read the current ERC-721 tokenURI or ERC-1155 uri from Ethereum.
+
+    A discovered token standard chooses the first selector, avoiding the wrong
+    result from hybrid contracts that expose both. Unknown or non-standard
+    contracts retain the ERC-721-then-ERC-1155 compatibility fallback. The
+    ERC-1155 `{id}` expansion is applied whenever that selector succeeds.
+    """
+    normalized = (standard or "").upper()
+    if normalized == "ERC-1155":
+        selectors = (_ERC1155_URI_SELECTOR,)
+    elif normalized == "ERC-721":
+        selectors = (_ERC721_TOKEN_URI_SELECTOR,)
+    else:
+        selectors = (_ERC721_TOKEN_URI_SELECTOR, _ERC1155_URI_SELECTOR)
+    for selector in selectors:
+        data = await _eth_call(
+            client, settings, contract, _encode_uint256_call(selector, token_id)
+        )
+        if data is None:
+            continue
         uri = _decode_abi_string(data)
         if uri:
-            return uri
-    data = await _eth_call(client, settings, contract, _encode_uint256_call(_ERC1155_URI_SELECTOR, token_id))
-    if data is None:
-        return None
-    uri = _decode_abi_string(data)
-    if not uri:
-        return None
-    return uri.replace("{id}", format(token_id, "064x"))
+            return (
+                uri.replace("{id}", format(token_id, "064x"))
+                if selector == _ERC1155_URI_SELECTOR
+                else uri
+            )
+    return None
 
 
 async def _resolve_token_uri(ref: str, token_uri: str, settings: Settings, client, depth: int) -> Resolved:
@@ -916,7 +985,7 @@ async def _resolve_verse_chain_or_none(
     """
     if not settings.eth_rpc_url:
         return None
-    chain_token_uri = await _verse_chain_token_uri(client, settings, contract, token_id)
+    chain_token_uri = await ethereum_token_uri(client, settings, contract, token_id)
     if not chain_token_uri:
         return None
     return await _resolve_token_uri(ref, chain_token_uri, settings, client, depth)

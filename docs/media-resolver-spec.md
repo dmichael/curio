@@ -119,7 +119,12 @@ headers are accepted only from an immediate proxy listed in
 
 ## Wallet discovery
 
-Curio reads Ethereum mainnet inventory through Blockscout and BENS, and Tezos
-mainnet inventory through TzKT. Wallet results are discovery data, not proof of
-authorship or authenticity. Curio does not currently resolve a contract/token
-pair by querying a chain RPC.
+Curio uses Blockscout and BENS for Ethereum holding discovery and contract/token
+coordinates. It reads each coordinate's current ERC-721 `tokenURI` or ERC-1155
+`uri` through Ethereum RPC and resolves that metadata source-natively.
+Blockscout's inline metadata is an explicitly labeled fallback only when the
+contract call is impossible; it is never authoritative after a chain URI is
+found. Wallet token records disclose `token_uri` and `metadata_source`.
+
+Tezos mainnet inventory and indexed metadata come from TzKT. Wallet results are
+discovery data, not proof of authorship, authenticity, or ownership history.

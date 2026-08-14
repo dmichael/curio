@@ -89,8 +89,10 @@ Uploads remain in Curio's static store. Curio does not add them to IPFS.
 
 ## Wallets
 
-Curio can list Ethereum mainnet NFTs through Blockscout and BENS, and Tezos
-mainnet NFTs through TzKT:
+Curio uses Blockscout and BENS to discover Ethereum mainnet holdings and token
+coordinates, then reads each token's current `tokenURI` or `uri` through
+Ethereum RPC. Blockscout's cached metadata is only a disclosed fallback. Tezos
+mainnet inventory comes from TzKT:
 
 ```bash
 curl --get 'http://localhost:8090/wallet' \
@@ -98,8 +100,7 @@ curl --get 'http://localhost:8090/wallet' \
 ```
 
 `POST /seed` starts a background storage job for a wallet or contract; poll
-`/seed/<job-id>`. Ethereum creator lookup and direct contract/token RPC
-resolution are not implemented.
+`/seed/<job-id>`. Ethereum creator lookup is not implemented.
 
 ## Connect your agent
 
@@ -116,8 +117,9 @@ registers the same URL through its own config. REST callers use the schema
 at `/openapi.json` instead.
 
 Curio can also export catalogued works as an unsigned DP-1 playlist for
-DP-1 players (e.g. the Feral File FF1) — see
-[docs/dp1-players.md](docs/dp1-players.md).
+DP-1 players such as the Feral File FF1. Install Feral File's official
+`@feralfile/cli` (`ff-cli`) locally for signing and playback; see
+[docs/dp1-players.md](docs/dp1-players.md) for operation and orientation checks.
 
 ## API and services
 
@@ -125,11 +127,31 @@ OpenAPI is available at `/docs` and `/openapi.json`. MCP is mounted at `/mcp`.
 The main routes are `/resolve`, `/wallet`, `/seed`, `/favorites`, `/override`,
 `/library`, and `/healthz`.
 
-The appliance runs three services:
+The appliance runs three local services:
 
 - Curio resolver
 - Kubo
 - AR.IO Core
+
+### External dependencies
+
+Curio is self-hosted, but source discovery and retrieval necessarily contact
+external networks. The default dependencies and their trust boundaries are:
+
+| Dependency | Used for | Not trusted for |
+|---|---|---|
+| Ethereum JSON-RPC (`ethereum.publicnode.com` by default) | Current ERC-721 `tokenURI` and ERC-1155 `uri` reads | Wallet enumeration or authorship |
+| Blockscout (`eth.blockscout.com`) | Ethereum holding and contract/token discovery | Current token metadata or media identity |
+| BENS (`bens.services.blockscout.com`) | Resolving `.eth` names for wallet discovery | Token metadata |
+| TzKT (`api.tzkt.io`) | Tezos names, balances, contracts, creator indexes, and indexed token metadata | Proof of authorship, authenticity, or ownership history |
+| IPFS network | Retrieving content addressed by an IPFS CID | Availability guarantees |
+| Public IPFS gateways (`ipfs.io`, `dweb.link`) | Recovery copies when normal IPFS retrieval fails | Canonical identity without CID verification |
+| AR.IO trusted gateways (`arweave.net`, `ar-io.dev`, `turbo-gateway.com`, `permagate.io`) | Retrieving Arweave transactions into the local Core | Proof that Curio created an Arweave replica |
+| Referenced HTTP origins | Fetching ordinary metadata and media | Permanence or content identity unless the reference supplies a hash |
+
+Installation and updates may also contact GitHub Releases, Docker Hub, and the
+GitHub Container Registry; they are not runtime media dependencies. See [the design](docs/design.md) and
+[the indexer trust decision](docs/decisions/0002-indexers-discover-chain-defines-ethereum-media.md).
 
 Port 8090 is the only public HTTP port. Kubo also publishes port 4001 over TCP
 and UDP for IPFS peers. Kubo's HTTP interfaces and AR.IO Core stay on the

@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -20,6 +21,7 @@ SETTINGS = Settings(
     ipfs_api="http://kubo.internal",
     blockscout_base="http://bs.internal/api/v2",
     bens_base="http://bens.internal/api/v1/1",
+    eth_rpc_url="http://rpc.internal",
     tzkt_base="http://tzkt.internal/v1",
     seed_recovery_gateways=["http://gw.fallback/ipfs"],
 )
@@ -27,6 +29,17 @@ SETTINGS = Settings(
 ETH_ADDR = "0xAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb"
 TZ_ADDR = "tz1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 KT1_ADDR = "KT1" + "a" * 33
+
+
+def encode_abi_string(value: str) -> str:
+    data = value.encode()
+    padded = -(-len(data) // 32) * 32
+    payload = (
+        (32).to_bytes(32, "big")
+        + len(data).to_bytes(32, "big")
+        + data.ljust(padded, b"\x00")
+    )
+    return "0x" + payload.hex()
 
 
 def fake_net(routes: dict[str, dict | list]) -> tuple[httpx.AsyncClient, list[str]]:
@@ -220,7 +233,45 @@ async def test_eth_contract_items_normalize_and_page():
         "media_type": None,
         "image_url": None,
         "animation_url": None,
+        "metadata_source": "indexer-fallback",
     }
+
+
+async def test_eth_contract_scope_uses_contract_standard_for_chain_lookup():
+    base = f"http://bs.internal/api/v2/tokens/{ETH_ADDR}"
+    selectors: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if request.method == "GET" and url == base:
+            return httpx.Response(200, json={"type": "ERC-1155"})
+        if request.method == "GET" and url == f"{base}/instances":
+            return httpx.Response(200, json={
+                "items": [{"id": "7", "metadata": {"image": "ipfs://stale"}}],
+                "next_page_params": None,
+            })
+        if request.method == "POST" and url == "http://rpc.internal":
+            selector = json.loads(request.content)["params"][0]["data"][2:10]
+            selectors.append(selector)
+            return httpx.Response(200, json={
+                "jsonrpc": "2.0", "id": 1,
+                "result": encode_abi_string("ipfs://bafy1155/{id}.json"),
+            })
+        expected = f"http://ipfs.internal/ipfs/bafy1155/{7:064x}.json"
+        if request.method == "GET" and url == expected:
+            return httpx.Response(200, json={"image": "ipfs://bafyLIVE/art.png"})
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    async with client:
+        items = [
+            item async for item in _eth_contract_items(
+                ETH_ADDR, SETTINGS, client, limit=1
+            )
+        ]
+    assert selectors == ["0e89341c"]  # uri(uint256), never tokenURI(uint256)
+    assert items[0]["metadata"] == {"image": "ipfs://bafyLIVE/art.png"}
+    assert items[0]["metadata_source"] == "chain"
 
 
 async def test_tezos_contract_items_normalize():
@@ -313,6 +364,150 @@ async def test_wallet_inventory_normalizes_eth_tokens():
     assert token["contract"] == "0xC0FFEE"
     assert token["token_id"] == "309"
     assert token["primary_ref"] == "ipfs://bafyIMG"
+    assert token["metadata_source"] == "indexer-fallback"
+    assert token["token_uri"] is None
+
+
+async def test_eth_wallet_prefers_current_chain_metadata_over_stale_index():
+    token_uri = "ipfs://bafyCURRENT/309.json"
+    routes = {
+        f"http://bs.internal/api/v2/addresses/{ETH_ADDR}/nft?type=ERC-721%2CERC-1155": {
+            "status_code": 200,
+            "json": {
+                "items": [{
+                    "id": "309",
+                    "media_type": "image/png",
+                    "image_url": "https://index.example/ipfs/bafySTALE",
+                    "metadata": {"name": "Stale", "image": "ipfs://bafySTALE/old.png"},
+                    "token": {"address_hash": "0xC0FFEE", "name": "Collection"},
+                }],
+                "next_page_params": None,
+            },
+        },
+        "POST http://rpc.internal": {
+            "status_code": 200,
+            "json": {"jsonrpc": "2.0", "id": 1, "result": encode_abi_string(token_uri)},
+        },
+        "http://ipfs.internal/ipfs/bafyCURRENT/309.json": {
+            "status_code": 200,
+            "json": {"name": "Current", "image": "ipfs://bafyLIVE/art.png"},
+        },
+    }
+    client, _ = fake_net(routes)
+    async with client:
+        result = await list_wallet_tokens(ETH_ADDR, SETTINGS, client)
+    token = result["tokens"][0]
+    assert token["name"] == "Current"
+    assert token["token_uri"] == token_uri
+    assert token["metadata_source"] == "chain"
+    assert token["primary_ref"] == "ipfs://bafyLIVE/art.png"
+    assert token["refs"] == ["ipfs://bafyLIVE/art.png"]
+
+
+async def test_eth_wallet_keeps_unreachable_chain_uri_instead_of_stale_index():
+    token_uri = "ipfs://bafyMISSING/309.json"
+    routes = {
+        f"http://bs.internal/api/v2/addresses/{ETH_ADDR}/nft?type=ERC-721%2CERC-1155": {
+            "status_code": 200,
+            "json": {
+                "items": [{
+                    "id": "309",
+                    "metadata": {"name": "Stale", "image": "ipfs://bafySTALE/old.png"},
+                    "token": {"address_hash": "0xC0FFEE"},
+                }],
+                "next_page_params": None,
+            },
+        },
+        "POST http://rpc.internal": {
+            "status_code": 200,
+            "json": {"jsonrpc": "2.0", "id": 1, "result": encode_abi_string(token_uri)},
+        },
+        "http://ipfs.internal/ipfs/bafyMISSING/309.json": {"status_code": 404},
+    }
+    client, _ = fake_net(routes)
+    async with client:
+        result = await list_wallet_tokens(ETH_ADDR, SETTINGS, client)
+    token = result["tokens"][0]
+    assert token["name"] is None
+    assert token["metadata_source"] == "chain-unreachable"
+    assert token["token_uri"] == token_uri
+    assert token["primary_ref"] == token_uri
+    assert token["refs"] == [token_uri]
+
+
+async def test_eth_chain_metadata_without_media_remains_no_ref():
+    token_uri = "ipfs://bafyTEXT/1.json"
+    routes = {
+        f"http://bs.internal/api/v2/addresses/{ETH_ADDR}/nft?type=ERC-721%2CERC-1155": {
+            "status_code": 200,
+            "json": {
+                "items": [{
+                    "id": "1",
+                    "metadata": {"image": "ipfs://bafySTALE/old.png"},
+                    "token": {"address_hash": "0xC0FFEE"},
+                }],
+                "next_page_params": None,
+            },
+        },
+        "POST http://rpc.internal": {
+            "status_code": 200,
+            "json": {"jsonrpc": "2.0", "id": 1, "result": encode_abi_string(token_uri)},
+        },
+        "http://ipfs.internal/ipfs/bafyTEXT/1.json": {
+            "status_code": 200,
+            "json": {"name": "Text only"},
+        },
+    }
+    client, _ = fake_net(routes)
+    async with client:
+        result = await list_wallet_tokens(ETH_ADDR, SETTINGS, client)
+    token = result["tokens"][0]
+    assert token["metadata_source"] == "chain"
+    assert token["token_uri"] == token_uri
+    assert token["primary_ref"] is None
+    assert token["refs"] == []
+
+
+async def test_eth_wallet_rejects_malformed_blockscout_items_shape():
+    routes = {
+        f"http://bs.internal/api/v2/addresses/{ETH_ADDR}/nft?type=ERC-721%2CERC-1155": {
+            "status_code": 200,
+            "json": {"items": "not-a-list", "next_page_params": None},
+        },
+    }
+    client, _ = fake_net(routes)
+    async with client:
+        with pytest.raises(ValueError, match="Blockscout"):
+            await list_wallet_tokens(ETH_ADDR, SETTINGS, client)
+
+
+async def test_eth_wallet_limit_only_enriches_requested_tokens():
+    token_uri = "ipfs://bafyONE/1.json"
+    routes = {
+        f"http://bs.internal/api/v2/addresses/{ETH_ADDR}/nft?type=ERC-721%2CERC-1155": {
+            "status_code": 200,
+            "json": {
+                "items": [
+                    {"id": "1", "metadata": {}, "token": {"address_hash": "0xC0FFEE"}},
+                    {"id": "2", "metadata": {}, "token": {"address_hash": "0xC0FFEE"}},
+                ],
+                "next_page_params": None,
+            },
+        },
+        "POST http://rpc.internal": {
+            "status_code": 200,
+            "json": {"jsonrpc": "2.0", "id": 1, "result": encode_abi_string(token_uri)},
+        },
+        "http://ipfs.internal/ipfs/bafyONE/1.json": {
+            "status_code": 200,
+            "json": {"image": "ipfs://bafyLIVE/one.png"},
+        },
+    }
+    client, log = fake_net(routes)
+    async with client:
+        result = await list_wallet_tokens(ETH_ADDR, SETTINGS, client, limit=1)
+    assert result["count"] == 1
+    assert sum(line == "POST http://rpc.internal" for line in log) == 1
 
 
 async def test_wallet_inventory_rejects_non_wallets():

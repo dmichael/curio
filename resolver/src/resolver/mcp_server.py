@@ -123,11 +123,14 @@ async def wallet_tokens(
     status: bool = False,
     include_burned: bool = False,
 ) -> dict[str, Any]:
-    """List a wallet's NFTs live from the public indexers (browse/pick step).
+    """List a wallet's NFTs live from discovery services (browse/pick step).
 
-    Call this to choose something to display: ref is 0x…, name.eth, tz1…, or
-    name.tez. Each token carries name, contract, token_id, mime, refs, and
-    primary_ref — pass primary_ref to the resolve tool to get a playable URL.
+    Ethereum holdings and coordinates come from Blockscout, but current
+    tokenURI/uri metadata comes directly from Ethereum RPC; cached Blockscout
+    metadata is used only as a labeled fallback. Call this to choose something
+    to display: ref is 0x…, name.eth, tz1…, or name.tez. Each token carries
+    name, contract, token_id, token_uri, metadata_source, mime, refs, and
+    primary_ref — pass primary_ref to resolve for a playable URL.
     Use seed_wallet to store every listed work. scope="published" (Tezos
     only) lists the works the wallet FIRST-MINTED — its published
     catalog — instead of its holdings. scope="created" (Tezos only) lists
