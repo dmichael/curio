@@ -48,6 +48,34 @@ def test_display_form_requires_same_origin(http_client, monkeypatch):
         assert response.status_code == 403
 
 
+def test_display_form_uses_browser_origin_when_media_origin_is_configured(
+    http_client, monkeypatch
+):
+    monkeypatch.setenv("RESOLVER_PUBLIC_BASE_URL", "http://192.168.1.132:8090")
+    get_settings.cache_clear()
+    calls = []
+
+    async def preview(ref, _settings, _client, origin):
+        calls.append((ref, origin))
+        return Resolved(
+            ref, f"{origin}/ipfs/bafyPREVIEW/art.png", "play", "ipfs", True,
+            content_type="image/png", source_kind="ipfs",
+        )
+
+    monkeypatch.setattr(operations, "preview_reference", preview)
+    response = http_client.post(
+        "/display",
+        data={"uri": "ipfs://bafyPREVIEW/art.png"},
+        headers={"Host": "siskin.local:8090", "Origin": "http://siskin.local:8090"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert calls == [
+        ("ipfs://bafyPREVIEW/art.png", "http://192.168.1.132:8090")
+    ]
+    get_settings.cache_clear()
+
+
 def test_preview_resolves_once_without_storing(http_client, monkeypatch):
     calls = []
 

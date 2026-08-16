@@ -126,14 +126,22 @@ async def web_display_script():
 
 @app.post("/display", response_class=HTMLResponse)
 async def display_resolve(request: Request):
+    settings = get_settings()
     origin = request_origin(request)
+    # CSRF follows the origin in the browser's address bar, which may differ
+    # from Curio's configured media origin (for example siskin.local in the
+    # browser while FF1-facing URLs use the appliance's IP address).
+    browser_origin = effective_origin(request, "", settings.trusted_proxy_cidrs)
     submitted_origins = request.headers.getlist("origin")
-    if len(submitted_origins) != 1 or normalize_origin(submitted_origins[0]) != origin:
-        raise HTTPException(403, "display form requires the Curio origin")
+    if (
+        browser_origin is None
+        or len(submitted_origins) != 1
+        or normalize_origin(submitted_origins[0]) != browser_origin
+    ):
+        raise HTTPException(403, "display form requires the browser's Curio origin")
     form = await request.form()
     candidate = form.get("uri")
     uri = candidate.strip() if isinstance(candidate, str) else ""
-    settings = get_settings()
     if not uri:
         return HTMLResponse(
             web.homepage(_version(), error="Enter an artwork URI."),
