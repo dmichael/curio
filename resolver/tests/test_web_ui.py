@@ -41,7 +41,11 @@ def test_display_form_requires_same_origin(http_client, monkeypatch):
         raise AssertionError("cross-origin form must not reach resolution")
 
     monkeypatch.setattr(operations, "preview_reference", forbidden)
-    for headers in ({}, {"Origin": "https://attacker.example"}):
+    for headers in (
+        {},
+        {"Origin": "https://attacker.example"},
+        {"Sec-Fetch-Site": "cross-site"},
+    ):
         response = http_client.post(
             "/display", data={"uri": "https://example.com/art.png"}, headers=headers
         )
@@ -66,7 +70,7 @@ def test_display_form_uses_browser_origin_when_media_origin_is_configured(
     response = http_client.post(
         "/display",
         data={"uri": "ipfs://bafyPREVIEW/art.png"},
-        headers={"Host": "siskin.local:8090", "Origin": "http://siskin.local:8090"},
+        headers={"Host": "siskin.local:8090", "Sec-Fetch-Site": "same-origin"},
         follow_redirects=False,
     )
     assert response.status_code == 303

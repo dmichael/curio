@@ -133,11 +133,14 @@ async def display_resolve(request: Request):
     # browser while FF1-facing URLs use the appliance's IP address).
     browser_origin = effective_origin(request, "", settings.trusted_proxy_cidrs)
     submitted_origins = request.headers.getlist("origin")
-    if (
-        browser_origin is None
-        or len(submitted_origins) != 1
-        or normalize_origin(submitted_origins[0]) != browser_origin
-    ):
+    fetch_sites = request.headers.getlist("sec-fetch-site")
+    origin_matches = (
+        browser_origin is not None
+        and len(submitted_origins) == 1
+        and normalize_origin(submitted_origins[0]) == browser_origin
+    )
+    fetch_metadata_matches = len(fetch_sites) == 1 and fetch_sites[0] == "same-origin"
+    if not origin_matches and not fetch_metadata_matches:
         raise HTTPException(403, "display form requires the browser's Curio origin")
     form = await request.form()
     candidate = form.get("uri")
