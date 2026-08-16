@@ -1019,6 +1019,14 @@ async def _scrape_verse_media(ref: str, text: str, settings: Settings, client, d
 async def _resolve_verse(
     ref: str, settings: Settings, client, depth: int, origin: str | None
 ) -> Resolved:
+    """Resolve a Verse artwork page, including works that are not minted yet.
+
+    Unminted works may have no contract/token coordinates, so the absence of
+    coordinates is not itself an error. In that case the page scrape checks
+    embedded tokenUri, then iframeUrl, then og:image. A work that exposes only
+    og:image therefore resolves to its static preview until a canonical token
+    URI or runtime URL becomes available.
+    """
     note = "no tokenUri/iframeUrl/og:image found in verse page"
     dead_chain: Resolved | None = None
     for page_url in _verse_scrape_urls(ref):
