@@ -2,7 +2,7 @@ name: curio
 
 services:
   resolver:
-    image: curio-resolver:0.2.11
+    image: curio-resolver:0.2.12
     build:
       context: ${CURIO_APP_ROOT:?set CURIO_APP_ROOT}/current/resolver
       dockerfile: Dockerfile
