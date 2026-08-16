@@ -40,6 +40,25 @@ curio logs resolver --follow
 Configuration defaults to `~/.config/curio/curio.env`; state defaults to
 `~/.local/share/curio/state`.
 
+## Open Curio in a browser
+
+Visit `http://<curio-host>:8090/` for Curio's minimal web interface. Enter an
+artwork URI and select **Resolve** to preview it. Preview media may use Curio's
+evictable caches but is not added to the durable library. Select **Save to
+Curio** before resolving to store it with the same semantics as the REST and
+MCP APIs. Both paths open the result at `/display`.
+
+For local homepage development without Compose or media backends:
+
+```bash
+cd resolver
+pip install -e '.[dev]'
+content-resolver
+```
+
+Then open `http://localhost:8090/`. Resolving IPFS or Arweave media still
+requires the corresponding appliance backends.
+
 ## Store a reference
 
 `POST /resolve` expresses storage intent:

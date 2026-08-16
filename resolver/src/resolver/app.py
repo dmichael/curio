@@ -2,21 +2,24 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from importlib import metadata
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import (
     FileResponse,
+    HTMLResponse,
     JSONResponse,
     PlainTextResponse,
     RedirectResponse,
+    Response,
     StreamingResponse,
 )
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 from starlette.datastructures import UploadFile
 
-from . import operations
+from . import operations, web
 from .config import get_settings
 from .favorites import (
     DuplicateFavorite,
@@ -91,6 +94,101 @@ def request_origin(request: Request) -> str:
     return origin
 
 
+def _version() -> str:
+    try:
+        return metadata.version("content-resolver")
+    except metadata.PackageNotFoundError:
+        return "unknown"
+
+
+@app.get("/", response_class=HTMLResponse)
+async def homepage():
+    return HTMLResponse(web.homepage(_version()), headers=web.page_headers())
+
+
+@app.get("/web/curio.css")
+async def web_styles():
+    return Response(
+        web.STYLES,
+        media_type="text/css",
+        headers={"cache-control": "public, max-age=3600", "x-content-type-options": "nosniff"},
+    )
+
+
+@app.get("/web/display.js")
+async def web_display_script():
+    return Response(
+        web.DISPLAY_SCRIPT,
+        media_type="text/javascript",
+        headers={"cache-control": "public, max-age=3600", "x-content-type-options": "nosniff"},
+    )
+
+
+@app.post("/display", response_class=HTMLResponse)
+async def display_resolve(request: Request):
+    origin = request_origin(request)
+    submitted_origins = request.headers.getlist("origin")
+    if len(submitted_origins) != 1 or normalize_origin(submitted_origins[0]) != origin:
+        raise HTTPException(403, "display form requires the Curio origin")
+    form = await request.form()
+    candidate = form.get("uri")
+    uri = candidate.strip() if isinstance(candidate, str) else ""
+    settings = get_settings()
+    if not uri:
+        return HTMLResponse(
+            web.homepage(_version(), error="Enter an artwork URI."),
+            status_code=400,
+            headers=web.page_headers(),
+        )
+
+    if form.get("save") is not None:
+        payload, stored = await operations.store_reference(uri, settings, app.state.client, origin)
+        if not stored:
+            return HTMLResponse(
+                web.homepage(
+                    _version(),
+                    error=str(payload.get("reason") or "Curio could not store that URI."), uri=uri,
+                ),
+                status_code=422,
+                headers=web.page_headers(),
+            )
+        target = str(payload["media_url"])
+    else:
+        result = await operations.preview_reference(uri, settings, app.state.client, origin)
+        if not result.resolved:
+            return HTMLResponse(
+                web.homepage(
+                    _version(),
+                    error=result.note or "Curio could not resolve that URI.", uri=uri,
+                ),
+                status_code=422,
+                headers=web.page_headers(),
+            )
+        target = result.resolved_url
+
+    return RedirectResponse(
+        f"/display?{urlencode({'uri': target})}",
+        status_code=303,
+    )
+
+
+@app.get("/display", response_class=HTMLResponse)
+async def display(request: Request, uri: str = Query(..., description="A Curio-served media URI")):
+    settings = get_settings()
+    target, error = web.validate_display_uri(
+        uri,
+        origin=request_origin(request),
+        store=StaticStore(settings.static_root, settings.static_cache_max_bytes),
+    )
+    if error or target is None:
+        return HTMLResponse(
+            web.homepage(_version(), error=error or "Invalid media URI."),
+            status_code=404,
+            headers=web.page_headers(),
+        )
+    return HTMLResponse(web.display_page(target), headers=web.page_headers())
+
+
 _SCOPE_DESCRIPTION = (
     "'held' = holdings; 'published' = works the wallet first-minted (Tezos only); "
     "'created' = works the wallet authored, i.e. creators/authors metadata, fully-burned "
@@ -98,7 +196,7 @@ _SCOPE_DESCRIPTION = (
 )
 
 
-@app.get("/resolve")
+@app.api_route("/resolve", methods=["GET", "HEAD"])
 async def resolve_get(ref: str = Query(..., description="A reference previously stored by Curio")):
     """Redirect a known reference to its source-native Curio media route."""
     record = operations.lookup_resolution(ref, get_settings())
@@ -420,7 +518,7 @@ async def playlist_dp1(request: Request, body: DP1PlaylistBody):
 _MEDIA_CORS = {"access-control-allow-origin": "*"}
 
 
-@app.get("/media/{file_id}")
+@app.api_route("/media/{file_id}", methods=["GET", "HEAD"])
 async def media(file_id: str):
     settings = get_settings()
     item = StaticStore(settings.static_root, settings.static_cache_max_bytes).get(
@@ -494,12 +592,8 @@ async def arweave_gateway(request: Request, path: str):
 
 @app.get("/healthz")
 async def healthz():
-    try:
-        version = metadata.version("content-resolver")
-    except metadata.PackageNotFoundError:
-        version = "unknown"
     result = await gateway_health(get_settings(), app.state.client)
-    result["version"] = version
+    result["version"] = _version()
     return JSONResponse(result, status_code=200 if result["healthy"] else 503)
 
 

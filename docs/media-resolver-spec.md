@@ -43,6 +43,18 @@ Equivalent IPFS and Arweave gateway spellings share a lookup key. Ordinary HTTP
 URIs remain distinct identities. Multiple HTTP URIs may point to one deduplicated
 SHA-256 object without becoming the same reference.
 
+## Browser preview and display
+
+`GET /` serves a minimal web form. Its Resolve action previews by default:
+Curio resolves the submitted URI without creating a durable resolution record,
+pinning IPFS, or promoting static media to stored status. Preview may populate
+evictable local and gateway caches. Selecting **Save to Curio** gives the action
+the same durable semantics as `POST /resolve`.
+
+Both paths redirect to `GET /display?uri=...`, which accepts only same-origin
+Curio playback routes and renders one work according to its HTTP Content-Type.
+The display GET performs no resolution or storage.
+
 ## Reference adapters
 
 POST resolution recognizes:

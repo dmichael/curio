@@ -221,6 +221,16 @@ def dp1_playlist(
     }
 
 
+async def preview_reference(
+    ref: str,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    origin: str,
+) -> Resolved:
+    """Resolve for transient playback without pinning or recording the reference."""
+    return await resolve_ref(ref, settings, client, origin=origin)
+
+
 async def store_reference(
     ref: str,
     settings: Settings,
