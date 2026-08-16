@@ -36,6 +36,14 @@ def test_homepage_is_a_simple_preview_first_form(http_client):
     assert 'href="/web/curio.css?v=' in response.text
 
 
+def test_homepage_lets_the_browser_send_its_origin(http_client):
+    # "no-referrer" makes Chrome send "Origin: null" on the form POST, and a
+    # plain-HTTP LAN origin gets no Sec-Fetch metadata, so both CSRF signals
+    # disappear and every submission is rejected.
+    response = http_client.get("/")
+    assert response.headers["referrer-policy"] == "same-origin"
+
+
 def test_display_form_requires_same_origin(http_client, monkeypatch):
     async def forbidden(*_args, **_kwargs):
         raise AssertionError("cross-origin form must not reach resolution")

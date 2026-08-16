@@ -19,7 +19,7 @@ _PAGE_HEADERS = {
         "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'"
     ),
     "x-content-type-options": "nosniff",
-    "referrer-policy": "no-referrer",
+    "referrer-policy": "same-origin",
 }
 
 _ASSETS = resources.files(__package__).joinpath("web_assets")
