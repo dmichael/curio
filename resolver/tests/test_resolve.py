@@ -331,6 +331,54 @@ async def test_directory_cid_descends_to_its_single_file():
     assert result.playback_method == "play"
 
 
+async def test_unslashed_directory_probe_301_still_descends():
+    # Kubo 301s a HEAD on an unslashed directory path; the non-redirecting
+    # client reports that as a failed probe. The API listing disambiguates a
+    # directory from a genuinely unavailable artifact — the fxhash-generator
+    # shape, seed query and all.
+    routes = {
+        "HEAD http://ipfs.internal/ipfs/bafyDIR": {"status_code": 301},
+        "POST http://kubo.internal/api/v0/ls?arg=%2Fipfs%2FbafyDIR": {
+            "status_code": 200,
+            "json": {"Objects": [{"Links": [
+                {"Name": "index.html", "Hash": "QmI", "Size": 10502, "Type": 2},
+                {"Name": "bundle.js", "Hash": "QmJ", "Size": 691463, "Type": 2},
+            ]}]},
+        },
+        "http://ipfs.internal/ipfs/bafyDIR/index.html": {
+            "status_code": 200, "headers": {"content-type": "text/html"},
+            "content": SELF_CONTAINED_SHELL,
+        },
+    }
+    async with fake_net(routes) as client:
+        result = await resolve_ref("ipfs://bafyDIR?fxhash=SEED", SETTINGS, client)
+    assert result.resolved_url == "http://box:8080/ipfs/bafyDIR/index.html?fxhash=SEED"
+    assert result.original_ref == "ipfs://bafyDIR?fxhash=SEED"
+    assert result.playback_method == "send"
+    assert result.status == ResolutionStatus.READY
+
+
+async def test_directory_with_index_html_prefers_it_over_the_largest_child():
+    routes = {
+        "HEAD http://ipfs.internal/ipfs/bafyDIR": {"status_code": 200},
+        "POST http://kubo.internal/api/v0/ls?arg=%2Fipfs%2FbafyDIR": {
+            "status_code": 200,
+            "json": {"Objects": [{"Links": [
+                {"Name": "index.html", "Hash": "QmI", "Size": 10, "Type": 2},
+                {"Name": "bundle.js", "Hash": "QmJ", "Size": 900000, "Type": 2},
+            ]}]},
+        },
+        "http://ipfs.internal/ipfs/bafyDIR/index.html": {
+            "status_code": 200, "headers": {"content-type": "text/html"},
+            "content": SELF_CONTAINED_SHELL,
+        },
+    }
+    async with fake_net(routes) as client:
+        result = await resolve_ref("ipfs://bafyDIR", SETTINGS, client)
+    assert result.resolved_url == "http://box:8080/ipfs/bafyDIR/index.html"
+    assert result.playback_method == "send"
+
+
 async def test_directory_cid_with_several_files_descends_to_the_largest():
     routes = {
         "HEAD http://ipfs.internal/ipfs/bafyDIR": {"status_code": 200},
