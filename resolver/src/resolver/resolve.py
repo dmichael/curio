@@ -56,6 +56,7 @@ from .fixups import (
     infer_playback_method,
     probe_headers,
 )
+from .html_audit import external_markup_refs
 from .overrides import get_registry
 from .refs import arweave_parts, ipfs_parts
 from .static_store import CacheQuotaError, ResolutionStatus, StaticStore, playable
@@ -215,6 +216,28 @@ async def _bounded_text(client: httpx.AsyncClient, url: str, max_bytes: int, set
             chunks.append(chunk)
         encoding = response.encoding or "utf-8"
     return b"".join(chunks).decode(encoding, errors="replace")
+
+
+async def _audit_runtime_html(
+    internal: str, settings: Settings, client
+) -> tuple[ResolutionStatus, str | None]:
+    """Classify a stored HTML artifact by its declared subresources.
+
+    Markup whose references are all relative lives entirely inside the pinned
+    CID graph or Arweave manifest, so the artifact is `ready`. Any absolute
+    reference — or a body the audit cannot read — keeps the conservative
+    `live-dependent` answer. Markup-level only: a URL a script assembles at
+    runtime is invisible here (see html_audit).
+    """
+    try:
+        text = await _bounded_text(client, internal, settings.fetch_max_bytes, settings)
+    except (httpx.HTTPError, ValueError):
+        return ResolutionStatus.LIVE_DEPENDENT, None
+    external = external_markup_refs(text)
+    if external:
+        shown = ", ".join(external[:3])
+        return ResolutionStatus.LIVE_DEPENDENT, f"external references: {shown}"
+    return ResolutionStatus.READY, None
 
 
 def _internal_fetch_url(ref: str, settings: Settings) -> str:
@@ -418,9 +441,10 @@ async def _resolve_ipfs(
         if descended is not None:
             return descended
     if main == "text/html":
+        status, note = await _audit_runtime_html(internal, settings, client)
         return Resolved(
             ref, public, "send", "ipfs", True, content_type=content_type,
-            source_kind="ipfs", final_ref=native_ref, status=ResolutionStatus.LIVE_DEPENDENT,
+            note=note, source_kind="ipfs", final_ref=native_ref, status=status,
             integrity={"algorithm": "ipfs-cid", "digest": cid},
         )
 
@@ -498,12 +522,17 @@ async def _resolve_arweave(
             ref, internal, "arweave", settings, client, depth,
             source_kind="arweave", final_ref=native_ref,
         )
-    method = "send" if main == "text/html" else "play"
+    if main == "text/html":
+        status, note = await _audit_runtime_html(internal, settings, client)
+        return Resolved(
+            ref, public, "send", "arweave", True, content_type=content_type,
+            note=note, source_kind="arweave", final_ref=native_ref,
+            status=status, integrity=integrity,
+        )
     return Resolved(
-        ref, public, method, "arweave", True, content_type=content_type,
+        ref, public, "play", "arweave", True, content_type=content_type,
         source_kind="arweave", final_ref=native_ref,
-        status=ResolutionStatus.LIVE_DEPENDENT if main == "text/html" else ResolutionStatus.READY,
-        integrity=integrity,
+        status=ResolutionStatus.READY, integrity=integrity,
     )
 
 

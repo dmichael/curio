@@ -32,9 +32,14 @@ distinct. Static bytes are independently deduplicated by SHA-256.
 its `/ipfs`, `/arweave`, or `/media` path; an unknown reference returns 404.
 How clients browse the contents of Curio is a separate concern.
 
-Statuses are `ready`, `live-dependent`, and `failed`. HTML is
-`live-dependent`: Curio stores the primary artifact without claiming to have
-captured every script, API, worker, font, or other runtime dependency.
+Statuses are `ready`, `live-dependent`, and `failed`. IPFS and Arweave HTML
+gets a markup audit: when every declared reference (src, href, srcset, CSS
+url()) is relative, the whole work lives inside the pinned CID graph or
+manifest and the status is `ready`. HTML with an absolute reference, an
+unreadable body, or an HTTP/`data:` source stays `live-dependent`: Curio
+stores the primary artifact without claiming to have captured every runtime
+dependency. The audit reads markup only, so a URL a script assembles at
+runtime is not seen.
 
 ## Three storage paths
 
