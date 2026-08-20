@@ -28,7 +28,8 @@ Status is one of:
 
 - `ready`: stored and playable through Curio;
 - `live-dependent`: the primary HTML artifact is stored, but uncaptured network
-  dependencies may remain;
+  dependencies may remain. IPFS and Arweave HTML whose markup declares only
+  relative references audits as fully stored and reports `ready` instead;
 - `failed`: Curio could not complete the request.
 
 Failed submissions are not registered for playback.

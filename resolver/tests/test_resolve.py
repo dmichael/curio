@@ -7,6 +7,7 @@ from resolver import resolve as resolve_module
 from resolver.config import Settings
 from resolver.refs import canonical_ref_key, ipfs_parts
 from resolver.resolve import resolve_ref
+from resolver.static_store import ResolutionStatus
 
 SETTINGS = Settings(
     ipfs_internal="http://ipfs.internal",
@@ -231,6 +232,72 @@ async def test_bare_cid_html_runtime_work_is_sent_without_hint():
     assert result.resolved_url == "http://box:8080/ipfs/bafyCID"
     assert result.playback_method == "send"
     assert result.integrity == {"algorithm": "ipfs-cid", "digest": "bafyCID"}
+
+
+# --- markup self-containment audit -----------------------------------------
+# HTML whose declared references are all relative lives entirely inside the
+# pinned CID graph or Arweave manifest, so it is `ready`. Any absolute
+# reference, or an unreadable body, keeps `live-dependent`.
+
+
+SELF_CONTAINED_SHELL = (
+    b'<html><head><link href="./style.css" rel="stylesheet"></head>'
+    b'<body><script src="./bundle.js"></script><img src="wait/wait-01.png">'
+    b'<script>const inert = "https://example.com/in-a-string";</script></body></html>'
+)
+
+
+async def test_relative_only_ipfs_html_is_ready():
+    routes = {
+        "http://ipfs.internal/ipfs/bafyCID/index.html": {
+            "status_code": 200, "headers": {"content-type": "text/html"},
+            "content": SELF_CONTAINED_SHELL,
+        }
+    }
+    async with fake_net(routes) as client:
+        result = await resolve_ref("ipfs://bafyCID/index.html", SETTINGS, client)
+    assert result.status == ResolutionStatus.READY
+    assert result.playback_method == "send"
+    assert result.note is None
+
+
+async def test_externally_referencing_ipfs_html_stays_live_dependent():
+    routes = {
+        "http://ipfs.internal/ipfs/bafyCID/index.html": {
+            "status_code": 200, "headers": {"content-type": "text/html"},
+            "content": b'<script src="https://cdn.example/three.js"></script>',
+        }
+    }
+    async with fake_net(routes) as client:
+        result = await resolve_ref("ipfs://bafyCID/index.html", SETTINGS, client)
+    assert result.status == ResolutionStatus.LIVE_DEPENDENT
+    assert result.playback_method == "send"
+    assert "cdn.example" in result.note
+
+
+async def test_unreadable_html_body_stays_live_dependent():
+    routes = {
+        "HEAD http://ipfs.internal/ipfs/bafyCID/index.html": {
+            "status_code": 200, "headers": {"content-type": "text/html"},
+        }
+        # GET 404s: the audit cannot read the body, so no upgrade.
+    }
+    async with fake_net(routes) as client:
+        result = await resolve_ref("ipfs://bafyCID/index.html", SETTINGS, client)
+    assert result.status == ResolutionStatus.LIVE_DEPENDENT
+
+
+async def test_relative_only_arweave_html_is_ready():
+    routes = {
+        f"http://ar.internal/{TXID}/index.html": {
+            "status_code": 200, "headers": {"content-type": "text/html"},
+            "content": SELF_CONTAINED_SHELL,
+        }
+    }
+    async with fake_net(routes) as client:
+        result = await resolve_ref(f"ar://{TXID}/index.html", SETTINGS, client)
+    assert result.status == ResolutionStatus.READY
+    assert result.playback_method == "send"
 
 
 async def test_bare_cid_probe_failure_is_unresolved():

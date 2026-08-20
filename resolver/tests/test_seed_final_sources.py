@@ -72,12 +72,17 @@ async def test_seed_stores_native_html_and_records_live_dependency(tmp_path):
                 "image": "ipfs://bafyRUNTIME/index.html",
                 "animation_url": f"ar://{txid}/index.html",
             }}], "next_page_params": None})
+        # An external script keeps the audit's answer live-dependent; a
+        # relative-only body would upgrade the work to ready.
+        shell = b'<script src="https://cdn.example/lib.js"></script>'
         if request.method == "HEAD" and request.url.host == "ipfs.internal":
             return httpx.Response(200, headers={"content-type": "text/html"})
+        if request.method == "GET" and request.url.host == "ipfs.internal":
+            return httpx.Response(200, headers={"content-type": "text/html"}, content=shell)
         if request.method == "HEAD" and request.url.host == "ar.internal":
             return httpx.Response(200, headers={"content-type": "text/html"})
         if request.method == "GET" and request.url.host == "ar.internal":
-            return httpx.Response(200, headers={"x-cache": "HIT"}, content=b"html")
+            return httpx.Response(200, headers={"x-cache": "HIT", "content-type": "text/html"}, content=shell)
         if request.url.path == "/api/v0/pin/add":
             return httpx.Response(200, json={"Pins": ["bafyRUNTIME"]})
         raise AssertionError(f"unexpected request: {request.method} {request.url}")

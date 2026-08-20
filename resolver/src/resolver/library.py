@@ -100,9 +100,9 @@ async def store_resolved(
 ) -> str | None:
     """Store one resolved artifact on its source-native storage plane.
 
-    Runtime HTML is still pinned or fetched, while its public resolution status
-    remains ``live-dependent`` because the shell's network dependencies are not
-    thereby captured.
+    Runtime HTML is pinned or fetched like any artifact. Its public resolution
+    status comes from the markup audit in resolve: relative-only bundles are
+    ``ready``, externally-referencing shells stay ``live-dependent``.
     """
     if not result.resolved:
         return None
