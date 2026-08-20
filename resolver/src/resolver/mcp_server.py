@@ -22,7 +22,22 @@ _INSTRUCTIONS = (
     "trusted household or studio network and must not be exposed directly "
     "to the public internet. Binary media upload is REST-only (multipart "
     "POST /resolve); media bytes are served on REST routes /media, /ipfs, "
-    "/arweave."
+    "/arweave.\n\n"
+    "Ref spelling: every tool that takes a ref matches ANY spelling of the "
+    "same content — ipfs://CID, /ipfs/CID, and IPFS gateway URLs are one "
+    "identity; likewise ar://txid and arweave.net URLs. Ordinary HTTP URLs "
+    "remain distinct identities.\n\n"
+    "Wallet scopes (wallet_tokens and seed_wallet; ref is 0x…, name.eth, "
+    "tz1…, or name.tez): 'held' lists holdings. 'published' (Tezos only) "
+    "lists the works the wallet FIRST-MINTED — its published catalog. "
+    "'created' (Tezos only) lists what the wallet AUTHORED — tokens "
+    "crediting it in creators/authors metadata; the robust authorship "
+    "index, since first-minter over-captures collected fxhash editions and "
+    "under-captures collector-minted editions. Fully-burned created works "
+    "are dropped unless include_burned=true — a work burned to nothing was "
+    "destroyed on purpose. Ethereum has no keyless creator index, so both "
+    "are Tezos-only. 'contract' lists every token of a literal 0x…/KT1… "
+    "token-contract address, on either chain."
 )
 
 mcp = FastMCP(
@@ -69,16 +84,10 @@ async def resolve(ref: str, ctx: Context = None) -> dict[str, Any]:
     """Resolve and store an IPFS, Arweave, HTTP, `data:` metadata or media,
     or Verse reference (artwork page or /items/ URL).
 
-    Both Verse URL forms resolve chain-first. An artwork page
-    (verse.works/artworks/<id>) has its contract address and token id read
-    from the page; an /items/ethereum/<contract>/<tokenId> URL already names
-    them and skips page scraping entirely. Either way, a tokenURI/uri chain
-    call fetches the canonical metadata and its media is resolved
-    recursively. Only when on-chain resolution is impossible (no
-    coordinates, RPC disabled or unreachable, chain metadata unreachable)
-    does it fall back to scraping the page directly — and a
-    chain-found-but-dead canonical ref is disclosed in `note` even when a
-    scrape fallback plays instead.
+    Verse URLs resolve chain-first: a tokenURI/uri call fetches the
+    canonical metadata and its media is resolved recursively. Page scraping
+    is only a fallback, and a chain-found-but-dead canonical ref is
+    disclosed in `note` even when a scrape fallback plays instead.
 
     A successful response has status `ready` or `live-dependent`, plus the
     reference to pass to `lookup` or HTTP `GET /resolve?ref=...`. `failed`
@@ -125,29 +134,17 @@ async def wallet_tokens(
 ) -> dict[str, Any]:
     """List a wallet's NFTs live from discovery services (browse/pick step).
 
-    Ethereum holdings and coordinates come from Blockscout, but current
-    tokenURI/uri metadata comes directly from Ethereum RPC; cached Blockscout
-    metadata is used only as a labeled fallback. Call this to choose something
-    to display: ref is 0x…, name.eth, tz1…, or name.tez. Each token carries
-    name, contract, token_id, token_uri, metadata_source, mime, refs, and
-    primary_ref — pass primary_ref to resolve for a playable URL.
-    Use seed_wallet to store every listed work. scope="published" (Tezos
-    only) lists the works the wallet FIRST-MINTED — its published
-    catalog — instead of its holdings. scope="created" (Tezos only) lists
-    what the wallet AUTHORED — tokens crediting it in creators/authors
-    metadata — the robust authorship index (first-minter over-captures
-    collected fxhash editions and under-captures collector-minted editions);
-    fully-burned creations are dropped unless include_burned=true, since a
-    work burned to nothing was destroyed on purpose. ETH has no keyless
-    creator index, so created is Tezos-only. scope="contract" lists every
-    token of a token-contract address (ref must be the literal 0x…/KT1…
-    contract address, both chains) — the way to sweep a publication contract
-    on ETH. status=true is the AUDIT view: every token's primary_ref is
-    resolved and classified in place — status is 'ok', 'substituted' (already
-    repaired via the override registry), 'unreachable' (dead content),
-    'unresolvable', or 'no-ref' — plus a status_counts summary. Use it to
-    find rot without a per-token loop; expect the call to take roughly the
-    probe timeout when dead refs exist.
+    Scope semantics and ref shapes are in the server instructions. Ethereum
+    coordinates come from Blockscout, but current tokenURI/uri metadata
+    comes directly from Ethereum RPC; cached indexer metadata is only a
+    labeled fallback. Each token carries name, contract, token_id,
+    token_uri, metadata_source, mime, refs, and primary_ref — pass
+    primary_ref to resolve for a playable URL, or use seed_wallet to store
+    every listed work. status=true is the AUDIT view: every token's
+    primary_ref is resolved and classified in place ('ok', 'substituted',
+    'unreachable', 'unresolvable', or 'no-ref') plus a status_counts
+    summary — the way to find rot without a per-token loop; expect the call
+    to take roughly the probe timeout when dead refs exist.
     """
     result = await list_wallet_tokens(
         ref, get_settings(), _require_client(),
@@ -166,11 +163,9 @@ async def seed_wallet(
 
     It pins final IPFS artifacts, fetches final Arweave artifacts through the
     persistent Core, and stores final HTTP/data artifacts in Curio. Ordinary
-    bytes never enter IPFS implicitly. Poll
-    with seed_status. Re-running is safe; use limit for a partial run.
-    scope="published" and "created" are Tezos-only; "contract" accepts a
-    literal Ethereum or Tezos token-contract address on either supported
-    chain. Fully burned authored works are omitted unless include_burned=true.
+    bytes never enter IPFS implicitly. Poll with seed_status. Re-running is
+    safe; use limit for a partial run. Scopes are the wallet_tokens scopes
+    (see the server instructions).
     """
     job = await start_seed(
         ref, get_settings(), _require_client(),
@@ -202,21 +197,14 @@ def _require_registry() -> OverrideRegistry:
 
 
 @mcp.tool()
-async def list_overrides(raw: bool = False) -> dict[str, Any]:
+async def list_overrides() -> dict[str, Any]:
     """List the operator's override registry: dead canonical refs mapped to
     replacement refs, each disclosing a provenance status
     (canonical-recovered, captured-original, operator-attested, or
     alternate-master). Empty until the operator records the first exception;
-    everything ordinary resolves without it. raw=true returns the registry
-    file verbatim (TOML) under "raw", for snapshots — matches REST
-    `GET /override?raw=1`."""
-    registry = _require_registry()
-    if raw:
-        try:
-            return {"raw": registry.raw_text()}
-        except OverrideError as exc:
-            raise ValueError(str(exc)) from exc
-    return operations.override_listing(registry)
+    everything ordinary resolves without it. A verbatim TOML snapshot is a
+    REST operation: `GET /override?raw=1`."""
+    return operations.override_listing(_require_registry())
 
 
 @mcp.tool()
@@ -234,11 +222,9 @@ async def add_override(
     """Point a dead canonical ref at replacement content — an operator
     decision, always disclosed in resolve results (substituted=true).
 
-    ref matches ANY spelling of the same content (ipfs://CID, /ipfs/CID,
-    gateway URLs; ar://txid, arweave.net URLs). replacement must already
-    resolve through Curio — a multipart `POST /resolve` stores an uploaded
-    replacement; binary upload is not an MCP tool. status is the
-    provenance tier: 'canonical-recovered' (bytes
+    replacement must already resolve through Curio — a multipart
+    `POST /resolve` stores an uploaded replacement; binary upload is not an
+    MCP tool. status is the provenance tier: 'canonical-recovered' (bytes
     reproduce the recorded CID), 'captured-original' (fetched from the
     canonical URL while it answered), 'operator-attested' (no hash ever
     existed; operator stands behind the copy), 'alternate-master' (different
@@ -270,10 +256,9 @@ async def add_override(
 
 @mcp.tool()
 async def remove_override(ref: str) -> dict[str, Any]:
-    """Remove the override for a ref (any spelling of it). The dead canonical
-    ref goes back to resolving as itself — i.e. failing — so only remove an
-    entry when the canonical content is available again or the substitution
-    was wrong."""
+    """Remove the override for a ref. The dead canonical ref goes back to
+    resolving as itself — i.e. failing — so only remove an entry when the
+    canonical content is available again or the substitution was wrong."""
     try:
         removed = _require_registry().remove(ref)
     except OverrideError as exc:
@@ -307,13 +292,12 @@ async def add_favorite(
 ) -> dict[str, Any]:
     """Mark a media reference as a household favorite.
 
-    ref accepts any spelling of the content (ipfs://CID, /ipfs/CID, gateway
-    URLs; ar://txid, arweave.net URLs; or a direct URL) — respellings of the
-    same content count as the same favorite, so adding it twice errors. The
-    resolver is consulted once to record a title for the browse list
-    (enrichment only, never a gate — the response's `resolved` field says
-    whether the ref resolves right now). Favorites organize the library; use
-    POST /resolve or seed_wallet to store media. Use note for why it was picked.
+    Respellings of the same content count as the same favorite, so adding
+    it twice errors. The resolver is consulted once to record a title for
+    the browse list (enrichment only, never a gate — the response's
+    `resolved` field says whether the ref resolves right now). Favorites
+    organize the library; use resolve or seed_wallet to store media. Use
+    note for why it was picked.
     """
     try:
         created = await operations.create_favorite(
@@ -331,8 +315,8 @@ async def add_favorite(
 
 @mcp.tool()
 async def remove_favorite(ref: str) -> dict[str, Any]:
-    """Remove a favorite by its ref (any spelling of the same content
-    matches). Only unmarks the pick — nothing is unpinned or deleted."""
+    """Remove a favorite by its ref. Only unmarks the pick — nothing is
+    unpinned or deleted."""
     try:
         removed = _require_favorites().remove(ref)
     except FavoriteError as exc:
@@ -365,20 +349,19 @@ async def dp1_playlist(
 
 
 @mcp.tool()
-async def health() -> dict[str, Any]:
-    """Reachability of the box's own IPFS and Arweave gateways."""
-    return await gateway_health(get_settings(), _require_client())
-
-
-@mcp.tool()
 async def library_status() -> dict[str, Any]:
-    """What the box holds, plane by plane.
+    """What the box holds, plane by plane, and whether its gateways answer.
 
-    `ipfs.pinned` counts recursive Kubo pins. Arweave `known_warmed` and
-    `currently_cached` describe the one persistent Core cache. Resolution and
-    playback populate that same Core.
-    This is not an Arweave-network replication claim. Registry counts cover
-    operator state. A failed plane gets its own error
-    rather than failing the complete response.
+    `gateways` is the /healthz answer: reachability of the box's own IPFS
+    and Arweave gateways. `ipfs.pinned` counts recursive Kubo pins. Arweave
+    `known_warmed` and `currently_cached` describe the one persistent Core
+    cache — not an Arweave-network replication claim. Registry counts cover
+    operator state. A failed plane gets its own error rather than failing
+    the complete response.
     """
-    return await _library_status(get_settings(), _require_client())
+    settings = get_settings()
+    client = _require_client()
+    return {
+        "gateways": await gateway_health(settings, client),
+        **(await _library_status(settings, client)),
+    }
