@@ -414,6 +414,12 @@ async def _resolve_ipfs(
     # means Kubo can serve the requested artifact now.
     headers = await probe_headers(client, internal)
     if headers is None:
+        # Kubo answers an unslashed directory HEAD with a 301, which the
+        # non-redirecting shared client reports as a failed probe. Ask the
+        # API-side listing before concluding the artifact is unavailable.
+        descended = await _resolve_ipfs_dir(ref, cid, path, settings, client, depth)
+        if descended is not None:
+            return descended
         return Resolved(
             ref, public, "play", "ipfs", False, source_kind="ipfs", final_ref=native_ref,
             note="local IPFS backend cannot serve this artifact",
@@ -464,14 +470,19 @@ async def _resolve_ipfs(
 async def _resolve_ipfs_dir(
     ref: str, cid: str, path: str, settings: Settings, client, depth: int
 ) -> Resolved | None:
-    """Descend into a UnixFS directory: pick its largest file child and recurse.
+    """Descend into a UnixFS directory: index.html when present, else the
+    largest file child, and recurse.
 
     A bare directory CID otherwise reaches renderers as the gateway's listing
-    page — the original iframe bug. Uses Kubo's machine-readable `ls` (the
-    seeding surface already requires the API), whose links carry sizes, so no
-    per-child probing is needed. Returns None when the listing can't be
-    fetched or looks like more than a media wrapper; the caller falls back to
-    the plain gateway URL.
+    page — the original iframe bug. An index.html marks a web bundle (the
+    fxhash generator shape) and always wins, whatever its size; the
+    largest-child heuristic and its child cap only apply to plain media
+    wrappers. Uses Kubo's machine-readable `ls` (the seeding surface already
+    requires the API), whose links carry sizes, so no per-child probing is
+    needed. The submitted query string (an fxhash seed, say) rides along into
+    the descended ref. Returns None when the listing can't be fetched or
+    looks like more than a media wrapper; the caller falls back to the plain
+    gateway URL.
     """
     try:
         response = await client.post(
@@ -485,11 +496,18 @@ async def _resolve_ipfs_dir(
         return None
 
     files = [link for link in links if link.get("Type") == 2 and link.get("Name")]
-    if not files or len(files) > _MAX_DIR_CHILDREN:
+    if not files:
         return None
 
-    largest = max(files, key=lambda link: link.get("Size") or 0)
-    target = f"ipfs://{cid}{path.rstrip('/')}/{quote(str(largest['Name']))}"
+    index = next((link for link in files if link["Name"] == "index.html"), None)
+    if index is None and len(files) > _MAX_DIR_CHILDREN:
+        return None
+
+    chosen = index or max(files, key=lambda link: link.get("Size") or 0)
+    target = f"ipfs://{cid}{path.rstrip('/')}/{quote(str(chosen['Name']))}"
+    query = urlparse(ref).query
+    if query:
+        target = f"{target}?{query}"
     inner = await resolve_ref(target, settings, client, depth + 1)
     return replace(inner, original_ref=ref)
 
