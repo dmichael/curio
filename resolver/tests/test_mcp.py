@@ -46,7 +46,6 @@ async def test_mcp_exposes_the_curated_tools():
         "wallet_tokens",
         "seed_wallet",
         "seed_status",
-        "health",
         "library_status",
         "list_overrides",
         "add_override",
@@ -208,7 +207,9 @@ async def test_mcp_override_tools_round_trip(override_env):
         assert (await call("list_overrides", {}))["count"] == 0
 
 
-async def test_mcp_list_overrides_raw_matches_rest(override_env):
+async def test_mcp_list_overrides_reports_the_recorded_mapping(override_env):
+    # The verbatim TOML snapshot is REST-only (`GET /override?raw=1`); the
+    # MCP listing carries the structured mapping.
     async with no_net() as client:
         mcp_server.set_client(client)
         await call(
@@ -219,9 +220,11 @@ async def test_mcp_list_overrides_raw_matches_rest(override_env):
                 "status": "alternate-master",
             },
         )
-        raw = await call("list_overrides", {"raw": True})
-    assert "ipfs://bafyDEAD/art.png" in raw["raw"]
-    assert "ipfs://bafyALT/master.png" in raw["raw"]
+        listing = await call("list_overrides", {})
+    assert listing["count"] == 1
+    entry = listing["entries"][0]
+    assert entry["ref"] == "ipfs://bafyDEAD/art.png"
+    assert entry["replacement"] == "ipfs://bafyALT/master.png"
 
 
 @pytest.fixture
@@ -277,6 +280,10 @@ async def test_mcp_library_status_smoke(tmp_path, monkeypatch):
             return httpx.Response(200, json={"Keys": {"bafyA": {"Type": "recursive"}}})
         if request.url.path == "/api/v0/repo/stat":
             return httpx.Response(200, json={"RepoSize": 4096, "NumObjects": 12})
+        if request.url.path == "/api/v0/id":
+            return httpx.Response(200, json={"Addresses": []})
+        if request.method == "GET" and request.url.host == "127.0.0.1":
+            return httpx.Response(200)  # gateway reachability probes
         if request.method == "HEAD" and request.url.host == "127.0.0.1":
             return httpx.Response(200, headers={"x-cache": "HIT"})
         raise AssertionError(f"unexpected network call: {request.url}")
@@ -290,6 +297,7 @@ async def test_mcp_library_status_smoke(tmp_path, monkeypatch):
     assert payload["ipfs"] == {"pinned": 1, "repo_size_bytes": 4096, "repo_objects": 12}
     assert payload["arweave"] == {"known_warmed": 0, "currently_cached": 0}
     assert payload["registry"] == {"overrides": None, "favorites": None}
+    assert payload["gateways"]["healthy"] is True
 
 
 async def test_mcp_override_tools_error_when_disabled(monkeypatch):
