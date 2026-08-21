@@ -72,132 +72,41 @@ the durable library. Select **Save to Curio** before resolving to store it with
 the same semantics as the REST and MCP APIs. Both paths open the result at
 `/display`.
 
-## Store a reference
+## What your agent can do
 
-`POST /resolve` expresses storage intent:
+Give Curio an artwork reference, a wallet, or a local file. It follows metadata
+to final media and keeps the result on the appliance:
 
-```bash
-curl -X POST --get 'http://localhost:8090/resolve' \
-  --data-urlencode 'ref=ipfs://bafy.../artwork'
-```
-
-JSON input is also accepted:
-
-```bash
-curl -X POST 'http://localhost:8090/resolve' \
-  -H 'Content-Type: application/json' \
-  -d '{"ref":"ar://transaction-id"}'
-```
-
-A successful response has status `ready` or `live-dependent` and includes a
-`media_url`. Players fetch that URL with GET; Curio redirects it to the stored
-source-native media path. A reference that has not been submitted successfully
-returns 404 from GET `/resolve`.
-
-Curio understands:
-
-| Input | Storage |
+| Source | Curio retains it as |
 |---|---|
-| IPFS URI, path, or gateway URL | Pinned in Kubo and served at `/ipfs/...` |
-| Arweave transaction or manifest path | Fetched through AR.IO Core and served at `/arweave/...` |
-| HTTP media | Stored locally by SHA-256 and served at `/media/...` |
-| HTTP or inline JSON metadata | Followed to its selected media reference |
-| Other `data:` media | Decoded into the static store |
-| Small UnixFS wrappers | Followed to the selected media |
-| Verse artwork pages and /items/ URLs | Chain-first: on-chain tokenURI resolved recursively; scrape fallback only when chain resolution is impossible |
+| IPFS URI, path, or gateway URL | A recursive Kubo pin, served from Curio |
+| Arweave transaction or manifest path | Content warmed in the appliance's AR.IO Core, served from Curio |
+| HTTP or `data:` media, metadata, or an uploaded file | A SHA-256-addressed local object |
+| Verse artwork page or `/items/` URL | On-chain token metadata first; page scraping only as a fallback |
 
-HTML works can depend on uncaptured scripts, APIs, or other resources. Curio
-stores the primary artifact but reports these results as `live-dependent`.
+It can inventory Ethereum and Tezos wallets, seed a collection in the
+background, record favorites and disclosed replacement provenance, and report
+what the appliance holds. Runtime HTML is retained as its primary artifact but
+is marked `live-dependent` when it still needs uncaptured network resources.
 
-## Store a file
+Curio also emits unsigned [DP-1](https://github.com/display-protocol/dp1)
+playlists for catalogued works. Use the display operator's tooling to sign and
+deliver them; see [DP-1 player operation](docs/dp1-players.md).
 
-The same endpoint accepts an upload:
+## REST and appliance details
 
-```bash
-curl -X POST -F 'file=@master.mp4' 'http://localhost:8090/resolve'
-```
+MCP is the normal control surface. REST exists for integrations, browser use,
+and multipart file uploads; its complete schema is served by the appliance at
+`/docs` and `/openapi.json`.
 
-Uploads remain in Curio's static store. Curio does not add them to IPFS.
+Curio runs the resolver, Kubo, and AR.IO Core. Port 8090 is its public HTTP
+origin; Kubo's peer port 4001 is also published for IPFS traffic. Curio has no
+user authentication and belongs on a trusted household or studio network, not
+the public internet. Back up `curio.env` and the state directory.
 
-## Wallets
-
-Curio uses Blockscout and BENS to discover Ethereum mainnet holdings and token
-coordinates, then reads each token's current `tokenURI` or `uri` through
-Ethereum RPC. Blockscout's cached metadata is only a disclosed fallback. Tezos
-mainnet inventory comes from TzKT:
-
-```bash
-curl --get 'http://localhost:8090/wallet' \
-  --data-urlencode 'ref=name.eth'
-```
-
-`POST /seed` starts a background storage job for a wallet or contract; poll
-`/seed/<job-id>`. Wallet and seed requests support these scopes:
-
-| Scope | Availability | Meaning |
-|---|---|---|
-| `held` | Ethereum and Tezos | Works currently held by the wallet |
-| `published` | Tezos | Works first minted by the wallet |
-| `created` | Tezos | Works crediting the wallet in creator/author metadata |
-| `contract` | Ethereum and Tezos | Every token in a literal token-contract address |
-
-Add `status=true` to `/wallet` (or `status=True` to the MCP `wallet_tokens`
-tool) to audit every primary reference in place: Curio classifies it as `ok`,
-`substituted`, `unreachable`, `unresolvable`, or `no-ref`. Fully burned Tezos
-creations are excluded from the `created` scope unless `include_burned=true`.
-Ethereum creator lookup is not implemented.
-
-Curio can also export catalogued works as an unsigned DP-1 playlist for
-DP-1 players such as the Feral File FF1. Install Feral File's official
-`@feralfile/cli` (`ff-cli`) locally for signing and playback; see
-[docs/dp1-players.md](docs/dp1-players.md) for operation and orientation checks.
-
-## API and services
-
-OpenAPI is available at `/docs` and `/openapi.json`; MCP is mounted at `/mcp`.
-The REST interface includes `/resolve`, `/wallet`, `/seed`, `/favorites`,
-`/override`, `/library`, `/playlist/dp1`, and `/healthz`. Curio serves retained
-media through `/media/...`, `/ipfs/...`, and `/arweave/...` on the same origin.
-
-The appliance runs three local services:
-
-- Curio resolver
-- Kubo
-- AR.IO Core
-
-### External dependencies
-
-Curio is self-hosted, but source discovery and retrieval necessarily contact
-external networks. The default dependencies and their trust boundaries are:
-
-| Dependency | Used for | Not trusted for |
-|---|---|---|
-| Ethereum JSON-RPC (`ethereum.publicnode.com` by default) | Current ERC-721 `tokenURI` and ERC-1155 `uri` reads | Wallet enumeration or authorship |
-| Blockscout (`eth.blockscout.com`) | Ethereum holding and contract/token discovery | Current token metadata or media identity |
-| BENS (`bens.services.blockscout.com`) | Resolving `.eth` names for wallet discovery | Token metadata |
-| TzKT (`api.tzkt.io`) | Tezos names, balances, contracts, creator indexes, and indexed token metadata | Proof of authorship, authenticity, or ownership history |
-| IPFS network | Retrieving content addressed by an IPFS CID | Availability guarantees |
-| Public IPFS gateways (`ipfs.io`, `dweb.link`) | Recovery copies when normal IPFS retrieval fails | Canonical identity without CID verification |
-| AR.IO trusted gateways (`arweave.net`, `ar-io.dev`, `turbo-gateway.com`, `permagate.io`) | Retrieving Arweave transactions into the local Core | Proof that Curio created an Arweave replica |
-| Referenced HTTP origins | Fetching ordinary metadata and media | Permanence or content identity unless the reference supplies a hash |
-
-Installation and updates may also contact GitHub Releases, Docker Hub, and the
-GitHub Container Registry; they are not runtime media dependencies. See [the design](docs/design.md) and
-[the indexer trust decision](docs/decisions/0002-indexers-discover-chain-defines-ethereum-media.md).
-
-Port 8090 is the only public HTTP port. Kubo also publishes port 4001 over TCP
-and UDP for IPFS peers. Kubo's HTTP interfaces and AR.IO Core stay on the
-private Compose network.
-
-Curio is designed for a trusted household or studio network and has no user
-authentication. Do not expose it directly to the public internet. Returned URLs
-normally use the request origin. Reverse-proxy deployments can set
-`CURIO_PUBLIC_BASE_URL` or allowlist the immediate proxy with
-`CURIO_TRUSTED_PROXY_CIDRS`.
-
-Back up `curio.env` and the state directory. See [the design](docs/design.md),
-[appliance notes](docs/appliance.md), [testing guide](docs/appliance-testing.md),
-and [security policy](SECURITY.md).
+For architecture, trust boundaries, appliance operations, and security, see
+[the design](docs/design.md), [appliance notes](docs/appliance.md), and the
+[security policy](SECURITY.md).
 
 ## Development
 
