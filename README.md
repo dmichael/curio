@@ -108,18 +108,5 @@ For architecture, trust boundaries, appliance operations, and security, see
 [the design](docs/design.md), [appliance notes](docs/appliance.md), and the
 [security policy](SECURITY.md).
 
-## Development
-
-```bash
-cd resolver
-python -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
-pytest
-ruff check .
-cd ..
-./appliance/tests/test-appliance.sh
-```
-
 Curio is available under the [MIT License](LICENSE). Third-party components
 retain their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
