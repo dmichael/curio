@@ -20,6 +20,8 @@ for ordinary files.</p>
 
 ## Install
 
+<img src="docs/pine64-sbc.png" align="left" width="360" alt="Pine64 single-board computer">
+
 Curio needs Linux, Docker Engine, and the Docker Compose plugin. Install the
 latest release as the user who will run it:
 
@@ -39,6 +41,8 @@ curio logs resolver --follow
 
 Configuration defaults to `~/.config/curio/curio.env`; state defaults to
 `~/.local/share/curio/state`.
+
+<br clear="left">
 
 ## Connect your agent
 
