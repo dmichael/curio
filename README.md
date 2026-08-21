@@ -119,21 +119,43 @@ curl --get 'http://localhost:8090/wallet' \
 ```
 
 `POST /seed` starts a background storage job for a wallet or contract; poll
-`/seed/<job-id>`. Ethereum creator lookup is not implemented.
+`/seed/<job-id>`. Wallet and seed requests support these scopes:
+
+| Scope | Availability | Meaning |
+|---|---|---|
+| `held` | Ethereum and Tezos | Works currently held by the wallet |
+| `published` | Tezos | Works first minted by the wallet |
+| `created` | Tezos | Works crediting the wallet in creator/author metadata |
+| `contract` | Ethereum and Tezos | Every token in a literal token-contract address |
+
+Add `status=true` to `/wallet` (or `status=True` to the MCP `wallet_tokens`
+tool) to audit every primary reference in place: Curio classifies it as `ok`,
+`substituted`, `unreachable`, `unresolvable`, or `no-ref`. Fully burned Tezos
+creations are excluded from the `created` scope unless `include_burned=true`.
+Ethereum creator lookup is not implemented.
 
 ## Connect your agent
 
-Curio serves MCP at `http://<host>:8090/mcp` (streamable HTTP); the tool
-descriptions carry the same semantics as the REST routes below. Register it
-with Claude Code:
+Curio has a first-class [Model Context Protocol](https://modelcontextprotocol.io/)
+(MCP) server at `http://<host>:8090/mcp` using streamable HTTP. It lets an
+agent browse wallet inventories, resolve and look up works, seed a collection,
+manage favorites and provenance overrides, inspect library health, and produce
+DP-1 playlists. Binary file uploads remain REST-only (`multipart POST
+/resolve`).
+
+Register it with Claude Code:
 
 ```bash
 claude mcp add --transport http curio http://<host>:8090/mcp
 ```
 
 Any other MCP-capable tool — Codex, OpenCode, Gemini, Cursor, and the rest —
-registers the same URL through its own config. REST callers use the schema
-at `/openapi.json` instead.
+registers the same streamable-HTTP URL through its own configuration. The MCP
+tool surface is `resolve`, `lookup`, `wallet_tokens`, `seed_wallet`,
+`seed_status`, `list_overrides`, `add_override`, `remove_override`,
+`list_favorites`, `add_favorite`, `remove_favorite`, `dp1_playlist`, and
+`library_status`. REST callers can use the OpenAPI schema at `/openapi.json`
+instead.
 
 Curio can also export catalogued works as an unsigned DP-1 playlist for
 DP-1 players such as the Feral File FF1. Install Feral File's official
@@ -142,9 +164,10 @@ DP-1 players such as the Feral File FF1. Install Feral File's official
 
 ## API and services
 
-OpenAPI is available at `/docs` and `/openapi.json`. MCP is mounted at `/mcp`.
-The main routes are `/resolve`, `/wallet`, `/seed`, `/favorites`, `/override`,
-`/library`, and `/healthz`.
+OpenAPI is available at `/docs` and `/openapi.json`; MCP is mounted at `/mcp`.
+The REST interface includes `/resolve`, `/wallet`, `/seed`, `/favorites`,
+`/override`, `/library`, `/playlist/dp1`, and `/healthz`. Curio serves retained
+media through `/media/...`, `/ipfs/...`, and `/arweave/...` on the same origin.
 
 The appliance runs three local services:
 
